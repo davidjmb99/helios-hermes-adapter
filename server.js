@@ -24,7 +24,6 @@ const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
 const SESSION_STORE_PATH =
   process.env.HERMES_SESSION_STORE_PATH || "/tmp/helios-hermes-sessions.json";
 
-// Opcional. Si no existen, Hermes usará el modelo principal del perfil helios.
 const HERMES_MODEL = process.env.HERMES_MODEL || "";
 const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 
@@ -173,16 +172,15 @@ function conversationKey(normalized) {
 }
 
 function buildHermesMessage(normalized) {
-  // IMPORTANTE:
-  // El adapter NO agrega instrucciones clínicas.
+  // El adapter no agrega instrucciones clínicas.
   // Hermes perfil helios es el cerebro.
-  // Aquí pasamos el evento del gateway como JSON para que Hermes lo procese.
+  // Aquí se pasa el payload original del gateway.
   return JSON.stringify(normalized.raw || {}, null, 2);
 }
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = HERMES_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), HERMES_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     return await fetch(url, {
@@ -262,7 +260,7 @@ function createHermesHttpError(path, response, text) {
   return error;
 }
 
-async function hermesRequest(path, body, retryLogin = true) {
+async function hermesPost(path, body, retryLogin = true) {
   if (!hermesCookie) {
     await hermesLogin();
   }
@@ -289,7 +287,7 @@ async function hermesRequest(path, body, retryLogin = true) {
   ) {
     hermesCookie = "";
     await hermesLogin();
-    return hermesRequest(path, body, false);
+    return hermesPost(path, body, false);
   }
 
   let data = {};
@@ -321,7 +319,7 @@ function withOptionalModel(body) {
 }
 
 async function createHermesSession(normalized) {
-  const data = await hermesRequest(
+  const data = await hermesPost(
     "/api/session/new",
     withOptionalModel({
       workspace: HERMES_CWD,
@@ -383,19 +381,199 @@ function isProviderErrorText(text) {
     value.startsWith("api call failed") ||
     value.includes("api call failed after") ||
     value.includes("http 429") ||
-    value.includes("the usage limit has been reached")
+    value.includes("the usage limit has been reached") ||
+    value.includes("model is not supported") ||
+    value.includes("provider") && value.includes("failed")
   );
 }
 
-async function sendChatToHermes(sessionId, normalized) {
-  const body = withOptionalModel({
-    session_id: sessionId,
-    workspace: HERMES_CWD,
-    profile: HERMES_PROFILE,
-    message: buildHermesMessage(normalized)
-  });
+function parseSseBlock(block) {
+  const lines = String(block || "").split(/\r?\n/);
 
-  return hermesRequest("/api/chat", body);
+  let event = "message";
+  const dataLines = [];
+
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) continue;
+
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim() || "message";
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  const dataRaw = dataLines.join("\n");
+
+  let data = dataRaw;
+  try {
+    data = JSON.parse(dataRaw);
+  } catch (_) {}
+
+  return {
+    event,
+    dataRaw,
+    data
+  };
+}
+
+function extractTextFromSseEvent(parsed) {
+  const data = parsed.data;
+
+  if (typeof data === "string") {
+    return data;
+  }
+
+  if (data && typeof data === "object") {
+    return String(
+      data.text ||
+        data.content ||
+        data.delta ||
+        data.message ||
+        data.answer ||
+        data.final_response ||
+        ""
+    );
+  }
+
+  return "";
+}
+
+async function readHermesSseStream(streamId) {
+  if (!hermesCookie) {
+    await hermesLogin();
+  }
+
+  const streamTimeoutMs = Math.max(HERMES_TIMEOUT_MS, 90000);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), streamTimeoutMs);
+
+  let response;
+
+  try {
+    response = await fetch(`${HERMES_WEBUI_BASE_URL}/api/chat/stream?stream_id=${encodeURIComponent(streamId)}`, {
+      method: "GET",
+      headers: {
+        cookie: hermesCookie,
+        accept: "text/event-stream"
+      },
+      redirect: "manual",
+      signal: controller.signal
+    });
+
+    updateCookieFromResponse(response);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw createHermesHttpError("/api/chat/stream", response, text);
+    }
+
+    if (!response.body) {
+      throw new Error("Hermes stream no devolvió body");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    let buffer = "";
+    let answer = "";
+    let terminalEvent = "";
+    let lastError = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || "";
+
+      for (const block of parts) {
+        const parsed = parseSseBlock(block);
+
+        if (!parsed.event) continue;
+
+        if (parsed.event === "token") {
+          answer += extractTextFromSseEvent(parsed);
+          continue;
+        }
+
+        if (parsed.event === "interim_assistant") {
+          const visible = extractTextFromSseEvent(parsed).trim();
+          const alreadyStreamed =
+            parsed.data &&
+            typeof parsed.data === "object" &&
+            parsed.data.already_streamed;
+
+          if (visible && !alreadyStreamed) {
+            answer += answer ? `\n\n${visible}` : visible;
+          }
+
+          continue;
+        }
+
+        if (parsed.event === "error") {
+          lastError =
+            extractTextFromSseEvent(parsed) ||
+            parsed.dataRaw ||
+            "Hermes stream error";
+          terminalEvent = "error";
+          break;
+        }
+
+        if (
+          parsed.event === "done" ||
+          parsed.event === "complete" ||
+          parsed.event === "completed"
+        ) {
+          terminalEvent = parsed.event;
+          break;
+        }
+      }
+
+      if (terminalEvent) {
+        break;
+      }
+    }
+
+    if (lastError) {
+      const error = new Error(lastError);
+      error.provider_error = isProviderErrorText(lastError);
+      throw error;
+    }
+
+    return {
+      answer: answer.trim(),
+      terminal_event: terminalEvent || "stream_closed"
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`Hermes stream timeout después de ${streamTimeoutMs}ms`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function startHermesChat(sessionId, normalized) {
+  return hermesPost(
+    "/api/chat/start",
+    withOptionalModel({
+      session_id: sessionId,
+      workspace: HERMES_CWD,
+      profile: HERMES_PROFILE,
+      message: buildHermesMessage(normalized)
+    })
+  );
 }
 
 async function sendMessageToHermes(payload) {
@@ -420,10 +598,10 @@ async function sendMessageToHermes(payload) {
     })
   );
 
-  let data;
+  let startData;
 
   try {
-    data = await sendChatToHermes(sessionId, normalized);
+    startData = await startHermesChat(sessionId, normalized);
   } catch (error) {
     if (!isSessionMissingError(error)) {
       throw error;
@@ -442,24 +620,18 @@ async function sendMessageToHermes(payload) {
     saveSessionMap();
 
     sessionId = await createHermesSession(normalized);
-    data = await sendChatToHermes(sessionId, normalized);
+    startData = await startHermesChat(sessionId, normalized);
   }
 
-  if (data?.error && isSessionMissingError(data)) {
-    console.warn(
-      JSON.stringify({
-        event: "hermes_session_missing_recreate_from_body",
-        session_key_hash: hashShort(key),
-        old_hermes_session_id: sessionId
-      })
+  const streamId = startData?.stream_id;
+
+  if (!streamId) {
+    throw new Error(
+      `Hermes /api/chat/start no devolvió stream_id: ${JSON.stringify(startData).slice(0, 500)}`
     );
-
-    delete sessionMap[key];
-    saveSessionMap();
-
-    sessionId = await createHermesSession(normalized);
-    data = await sendChatToHermes(sessionId, normalized);
   }
+
+  const streamResult = await readHermesSseStream(streamId);
 
   if (sessionMap[key]) {
     sessionMap[key].updated_at = new Date().toISOString();
@@ -468,8 +640,12 @@ async function sendMessageToHermes(payload) {
 
   return {
     sessionId,
-    answer: data.answer || data?.result?.final_response || "",
-    raw: data
+    streamId,
+    answer: streamResult.answer,
+    raw: {
+      start: startData,
+      stream: streamResult
+    }
   };
 }
 
@@ -492,15 +668,37 @@ function normalizeAdapterResponse(result) {
       metadata: {
         profile: HERMES_PROFILE,
         hermes_session_id: result.sessionId,
+        hermes_stream_id: result.streamId,
         provider_error: true
+      }
+    };
+  }
+
+  if (!reply) {
+    return {
+      ok: false,
+      reply:
+        "Ahora mismo no pude generar una respuesta completa. Te voy a derivar con el equipo para ayudarte mejor.",
+      route: "handoff",
+      intent: "empty_hermes_response",
+      requires_handoff: true,
+      tool_calls: [],
+      case_tracking: {
+        requires_case_tracking: true,
+        reason: "empty_hermes_response"
+      },
+      metadata: {
+        profile: HERMES_PROFILE,
+        hermes_session_id: result.sessionId,
+        hermes_stream_id: result.streamId,
+        empty_response: true
       }
     };
   }
 
   return {
     ok: true,
-    reply:
-      reply || "Hola, encantado de ayudarte. ¿En qué puedo ayudarte hoy?",
+    reply,
     route: "hermes",
     intent: "respuesta_hermes",
     requires_handoff: false,
@@ -510,7 +708,8 @@ function normalizeAdapterResponse(result) {
     },
     metadata: {
       profile: HERMES_PROFILE,
-      hermes_session_id: result.sessionId
+      hermes_session_id: result.sessionId,
+      hermes_stream_id: result.streamId
     }
   };
 }
@@ -527,9 +726,9 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.2.0",
+    version: "2.3.0",
     profile: HERMES_PROFILE,
-    mode: "HERMES_WEBUI_API",
+    mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
     hermes_webui_password_configured: Boolean(HERMES_WEBUI_PASSWORD),
     using_model_override: Boolean(HERMES_MODEL || HERMES_MODEL_PROVIDER),
@@ -583,5 +782,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.2 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.3 listening on port ${PORT}`);
 });
