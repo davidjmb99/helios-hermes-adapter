@@ -2,12 +2,19 @@ const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+const app = reportExpressErrorsAndConfigure();
+
+function reportExpressErrorsAndConfigure() {
+  const expressApp = express();
+  expressApp.use(express.json({ limit: "2mb" }));
+  return expressApp;
+}
 
 const PORT = process.env.PORT || 3000;
 
 const ADAPTER_API_KEY = process.env.HERMES_API_KEY || "";
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
+const NODE_ENV = process.env.NODE_ENV || "development";
 
 const HERMES_PROFILE = process.env.HERMES_PROFILE || "helios";
 const HERMES_CWD =
@@ -24,11 +31,22 @@ const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
 const SESSION_STORE_PATH =
   process.env.HERMES_SESSION_STORE_PATH || "/tmp/helios-hermes-sessions.json";
 
+// Opcional. Si no existen, Hermes usará el modelo principal del perfil helios.
 const HERMES_MODEL = process.env.HERMES_MODEL || "";
 const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 
 let hermesCookie = "";
 let sessionMap = {};
+
+// Memoria para Debugging (Últimos 50 requests)
+const recentRequests = [];
+
+function addRecentRequest(reqData) {
+  recentRequests.unshift(reqData);
+  if (recentRequests.length > 50) {
+    recentRequests.pop();
+  }
+}
 
 function loadSessionMap() {
   try {
@@ -63,7 +81,6 @@ function firstNonEmpty(...values) {
     const text = String(value).trim();
     if (text) return text;
   }
-
   return "";
 }
 
@@ -73,6 +90,53 @@ function hashShort(value) {
     .update(String(value || ""))
     .digest("hex")
     .slice(0, 12);
+}
+
+function maskPhone(phone) {
+  if (!phone) return "";
+  const str = String(phone).trim();
+  if (str.length <= 5) return "*****";
+  const prefix = str.slice(0, 4);
+  const suffix = str.slice(-4);
+  return `${prefix}*****${suffix}`;
+}
+
+function checkDebugAuth(req, res, next) {
+  let token = "";
+  
+  if (DEBUG_TOKEN) {
+    token = getBearerToken(req);
+    if (!token && req.query.token) {
+      token = String(req.query.token).trim();
+    }
+  }
+
+  const isAuthorized = DEBUG_TOKEN ? (token === DEBUG_TOKEN) : (NODE_ENV !== "production");
+
+  if (!isAuthorized) {
+    const status = DEBUG_TOKEN ? 401 : 403;
+    const errorMsg = DEBUG_TOKEN 
+      ? "No autorizado: Token de debug inválido o ausente." 
+      : "Acceso prohibido: El panel de debug está desactivado en producción.";
+
+    if (req.path === "/debug/events") {
+      return res.status(status).json({ ok: false, error: errorMsg });
+    } else {
+      return res.status(status).send(`
+        <html>
+          <head><title>Acceso Denegado</title></head>
+          <body style="background:#09090b; color:#ef4444; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
+            <div style="text-align:center; border:1px solid #ef4444; padding:2rem; border-radius:8px; background:rgba(239,68,68,0.1); max-width: 400px; width: 90%;">
+              <h2 style="margin: 0 0 0.5rem 0; font-size: 1.5rem;">${status === 401 ? '401 - No Autorizado' : '403 - Acceso Prohibido'}</h2>
+              <p style="color:#a1a1aa; margin: 0 0 1rem 0; font-size: 0.95rem;">${errorMsg}</p>
+              ${status === 401 ? '<p style="color:#71717a; font-size: 0.8rem; margin: 0;">Para ingresar usa: <br/><code>/debug?token=TU_DEBUG_TOKEN</code></p>' : ''}
+            </div>
+          </body>
+        </html>
+      `);
+    }
+  }
+  next();
 }
 
 function normalizeGatewayPayload(payload = {}) {
@@ -172,15 +236,13 @@ function conversationKey(normalized) {
 }
 
 function buildHermesMessage(normalized) {
-  // El adapter no agrega instrucciones clínicas.
-  // Hermes perfil helios es el cerebro.
-  // Aquí se pasa el payload original del gateway.
+  // IMPORTANTE: El adapter NO agrega instrucciones clínicas.
   return JSON.stringify(normalized.raw || {}, null, 2);
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = HERMES_TIMEOUT_MS) {
+async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), HERMES_TIMEOUT_MS);
 
   try {
     return await fetch(url, {
@@ -260,7 +322,7 @@ function createHermesHttpError(path, response, text) {
   return error;
 }
 
-async function hermesPost(path, body, retryLogin = true) {
+async function hermesRequest(path, body, retryLogin = true) {
   if (!hermesCookie) {
     await hermesLogin();
   }
@@ -287,7 +349,7 @@ async function hermesPost(path, body, retryLogin = true) {
   ) {
     hermesCookie = "";
     await hermesLogin();
-    return hermesPost(path, body, false);
+    return hermesRequest(path, body, false);
   }
 
   let data = {};
@@ -319,7 +381,7 @@ function withOptionalModel(body) {
 }
 
 async function createHermesSession(normalized) {
-  const data = await hermesPost(
+  const data = await hermesRequest(
     "/api/session/new",
     withOptionalModel({
       workspace: HERMES_CWD,
@@ -381,199 +443,144 @@ function isProviderErrorText(text) {
     value.startsWith("api call failed") ||
     value.includes("api call failed after") ||
     value.includes("http 429") ||
-    value.includes("the usage limit has been reached") ||
-    value.includes("model is not supported") ||
-    value.includes("provider") && value.includes("failed")
+    value.includes("the usage limit has been reached")
   );
 }
 
-function parseSseBlock(block) {
-  const lines = String(block || "").split(/\r?\n/);
+async function startHermesStream(sessionId, normalized) {
+  const body = withOptionalModel({
+    session_id: sessionId,
+    workspace: HERMES_CWD,
+    profile: HERMES_PROFILE,
+    message: buildHermesMessage(normalized)
+  });
 
-  let event = "message";
-  const dataLines = [];
-
-  for (const line of lines) {
-    if (!line || line.startsWith(":")) continue;
-
-    if (line.startsWith("event:")) {
-      event = line.slice("event:".length).trim() || "message";
-      continue;
-    }
-
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-
-  const dataRaw = dataLines.join("\n");
-
-  let data = dataRaw;
-  try {
-    data = JSON.parse(dataRaw);
-  } catch (_) {}
-
-  return {
-    event,
-    dataRaw,
-    data
-  };
+  return hermesRequest("/api/chat/start", body);
 }
 
-function extractTextFromSseEvent(parsed) {
-  const data = parsed.data;
-
-  if (typeof data === "string") {
-    return data;
-  }
-
-  if (data && typeof data === "object") {
-    return String(
-      data.text ||
-        data.content ||
-        data.delta ||
-        data.message ||
-        data.answer ||
-        data.final_response ||
-        ""
-    );
-  }
-
-  return "";
-}
-
-async function readHermesSseStream(streamId) {
+async function consumeHermesStream(streamId) {
   if (!hermesCookie) {
     await hermesLogin();
   }
 
-  const streamTimeoutMs = Math.max(HERMES_TIMEOUT_MS, 90000);
+  const url = `${HERMES_WEBUI_BASE_URL}/api/chat/stream?stream_id=${streamId}`;
+  
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), streamTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), HERMES_TIMEOUT_MS);
 
   let response;
-
   try {
-    response = await fetch(`${HERMES_WEBUI_BASE_URL}/api/chat/stream?stream_id=${encodeURIComponent(streamId)}`, {
+    response = await fetch(url, {
       method: "GET",
       headers: {
-        cookie: hermesCookie,
-        accept: "text/event-stream"
+        cookie: hermesCookie
       },
-      redirect: "manual",
       signal: controller.signal
     });
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
 
-    updateCookieFromResponse(response);
+  if (!response.ok) {
+    clearTimeout(timeout);
+    const text = await response.text();
+    throw new Error(`Hermes stream connection failed HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw createHermesHttpError("/api/chat/stream", response, text);
-    }
+  let accumulatedAnswer = "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let currentEvent = "";
 
-    if (!response.body) {
-      throw new Error("Hermes stream no devolvió body");
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-
-    let buffer = "";
-    let answer = "";
-    let terminalEvent = "";
-    let lastError = "";
-
+  try {
     while (true) {
       const { value, done } = await reader.read();
-
-      if (done) {
-        break;
-      }
+      if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop(); // Mantener línea incompleta en el buffer
 
-      const parts = buffer.split(/\r?\n\r?\n/);
-      buffer = parts.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
 
-      for (const block of parts) {
-        const parsed = parseSseBlock(block);
-
-        if (!parsed.event) continue;
-
-        if (parsed.event === "token") {
-          answer += extractTextFromSseEvent(parsed);
-          continue;
-        }
-
-        if (parsed.event === "interim_assistant") {
-          const visible = extractTextFromSseEvent(parsed).trim();
-          const alreadyStreamed =
-            parsed.data &&
-            typeof parsed.data === "object" &&
-            parsed.data.already_streamed;
-
-          if (visible && !alreadyStreamed) {
-            answer += answer ? `\n\n${visible}` : visible;
+        if (trimmed.startsWith("event:")) {
+          currentEvent = trimmed.slice("event:".length).trim();
+        } else if (trimmed.startsWith("data:")) {
+          const dataStr = trimmed.slice("data:".length).trim();
+          if (dataStr === "[DONE]" || dataStr === "done") {
+            break;
           }
 
-          continue;
-        }
+          let parsed = {};
+          let isJson = false;
+          try {
+            parsed = JSON.parse(dataStr);
+            isJson = true;
+          } catch (_) {}
 
-        if (parsed.event === "error") {
-          lastError =
-            extractTextFromSseEvent(parsed) ||
-            parsed.dataRaw ||
-            "Hermes stream error";
-          terminalEvent = "error";
-          break;
-        }
+          const eventName = currentEvent || (isJson ? parsed.event : "") || "";
 
-        if (
-          parsed.event === "done" ||
-          parsed.event === "complete" ||
-          parsed.event === "completed"
-        ) {
-          terminalEvent = parsed.event;
-          break;
+          if (eventName === "token") {
+            const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
+            accumulatedAnswer += token;
+          } else if (eventName === "reasoning") {
+            // Ignorar razonamiento
+          } else if (eventName === "error") {
+            const errorMsg = isJson ? (parsed.error || parsed.message || dataStr) : dataStr;
+            throw new Error(`Hermes stream reported error: ${errorMsg}`);
+          } else if (["done", "complete", "completed"].includes(eventName)) {
+            break;
+          }
         }
-      }
-
-      if (terminalEvent) {
-        break;
       }
     }
 
-    if (lastError) {
-      const error = new Error(lastError);
-      error.provider_error = isProviderErrorText(lastError);
-      throw error;
+    // Procesar buffer restante
+    if (buffer.trim()) {
+      const trimmed = buffer.trim();
+      if (trimmed.startsWith("data:")) {
+        const dataStr = trimmed.slice("data:".length).trim();
+        if (dataStr !== "[DONE]" && dataStr !== "done") {
+          let parsed = {};
+          let isJson = false;
+          try {
+            parsed = JSON.parse(dataStr);
+            isJson = true;
+          } catch (_) {}
+          const eventName = currentEvent || (isJson ? parsed.event : "") || "";
+          if (eventName === "token") {
+            const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
+            accumulatedAnswer += token;
+          }
+        }
+      }
     }
-
-    return {
-      answer: answer.trim(),
-      terminal_event: terminalEvent || "stream_closed"
-    };
-  } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error(`Hermes stream timeout después de ${streamTimeoutMs}ms`);
-    }
-
-    throw error;
   } finally {
     clearTimeout(timeout);
+    try {
+      reader.cancel();
+    } catch (_) {}
   }
+
+  return accumulatedAnswer;
 }
 
-async function startHermesChat(sessionId, normalized) {
-  return hermesPost(
-    "/api/chat/start",
-    withOptionalModel({
-      session_id: sessionId,
-      workspace: HERMES_CWD,
-      profile: HERMES_PROFILE,
-      message: buildHermesMessage(normalized)
-    })
-  );
+async function consumeHermesStreamWithRetry(streamId) {
+  try {
+    return await consumeHermesStream(streamId);
+  } catch (error) {
+    if (error.message.includes("HTTP 401") || error.message.includes("HTTP 403")) {
+      console.warn("Stream connection returned unauthorized/forbidden, retrying login...");
+      hermesCookie = "";
+      await hermesLogin();
+      return await consumeHermesStream(streamId);
+    }
+    throw error;
+  }
 }
 
 async function sendMessageToHermes(payload) {
@@ -598,10 +605,52 @@ async function sendMessageToHermes(payload) {
     })
   );
 
-  let startData;
+  let streamId = "";
+  let answer = "";
+  let conflict = false;
+  let activeStreamId = "";
+
+  const runStreamFlow = async (sid) => {
+    let startData;
+    try {
+      startData = await startHermesStream(sid, normalized);
+    } catch (error) {
+      if (error.status === 409) {
+        console.error(
+          JSON.stringify({
+            event: "active_stream_conflict_detected",
+            hermes_session_id: sid,
+            status: error.status,
+            error_body: error.body
+          })
+        );
+        let activeId = "";
+        try {
+          const parsedBody = JSON.parse(error.body);
+          activeId = parsedBody.active_stream_id || parsedBody.stream_id || "";
+        } catch (_) {}
+        
+        conflict = true;
+        activeStreamId = activeId;
+        return;
+      }
+      throw error;
+    }
+
+    if (startData?.error && isSessionMissingError(startData)) {
+      throw createHermesHttpError("/api/chat/start", { status: 404, headers: new Headers() }, JSON.stringify(startData));
+    }
+
+    streamId = startData?.stream_id;
+    if (!streamId) {
+      throw new Error("Hermes did not return stream_id on chat start");
+    }
+
+    answer = await consumeHermesStreamWithRetry(streamId);
+  };
 
   try {
-    startData = await startHermesChat(sessionId, normalized);
+    await runStreamFlow(sessionId);
   } catch (error) {
     if (!isSessionMissingError(error)) {
       throw error;
@@ -620,18 +669,8 @@ async function sendMessageToHermes(payload) {
     saveSessionMap();
 
     sessionId = await createHermesSession(normalized);
-    startData = await startHermesChat(sessionId, normalized);
+    await runStreamFlow(sessionId);
   }
-
-  const streamId = startData?.stream_id;
-
-  if (!streamId) {
-    throw new Error(
-      `Hermes /api/chat/start no devolvió stream_id: ${JSON.stringify(startData).slice(0, 500)}`
-    );
-  }
-
-  const streamResult = await readHermesSseStream(streamId);
 
   if (sessionMap[key]) {
     sessionMap[key].updated_at = new Date().toISOString();
@@ -641,18 +680,89 @@ async function sendMessageToHermes(payload) {
   return {
     sessionId,
     streamId,
-    answer: streamResult.answer,
-    raw: {
-      start: startData,
-      stream: streamResult
-    }
+    answer,
+    conflict,
+    activeStreamId
   };
 }
 
-function normalizeAdapterResponse(result) {
-  const reply = String(result.answer || "").trim();
+function sanitizePatientReply(text) {
+  if (!text) return "";
 
-  if (isProviderErrorText(reply)) {
+  // 1. Quitar bloques de pensamiento tipo <think>...</think>
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+
+  // 2. Separar por líneas para analizar mejor
+  let lines = cleaned.split(/\r?\n/);
+  let filteredLines = [];
+
+  // Frases prohibidas / patrones de ruido interno (insensibles a mayúsculas)
+  const forbiddenPatterns = [
+    /^\s*bueno,\s*empecemos/i,
+    /^\s*el\s+paciente\s+ha/i,
+    /^\s*voy\s+a\s+responder/i,
+    /^\s*ahora\s+mismo\s+no\s+tengo\s+conectado/i,
+    /^\s*responder[eé]\s+directamente\s+como\s+helios/i
+  ];
+
+  for (let line of lines) {
+    let trimmedLine = line.trim();
+    if (!trimmedLine) continue;
+
+    // Verificar si la línea coincide con algún patrón prohibido
+    let matchForbidden = false;
+    for (const pattern of forbiddenPatterns) {
+      if (pattern.test(trimmedLine)) {
+        matchForbidden = true;
+        break;
+      }
+    }
+
+    if (!matchForbidden) {
+      // Limpiar frases específicas dentro de la línea
+      let cleanedLine = trimmedLine;
+      cleanedLine = cleanedLine.replace(/bueno,\s*empecemos\.?\s*/gi, "");
+      cleanedLine = cleanedLine.replace(/el\s+paciente\s+ha\s+[^.!?]*[.!?]\s*/gi, "");
+      cleanedLine = cleanedLine.replace(/voy\s+a\s+responder\s+[^.!?]*[.!?]\s*/gi, "");
+      cleanedLine = cleanedLine.replace(/ahora\s+mismo\s+no\s+tengo\s+conectado[^.!?]*[.!?]\s*/gi, "");
+      cleanedLine = cleanedLine.replace(/responder[eé]\s+directamente\s+como\s+helios\.?\s*/gi, "");
+      
+      if (cleanedLine.trim()) {
+        filteredLines.push(cleanedLine.trim());
+      }
+    }
+  }
+
+  let finalCandidate = filteredLines.join("\n").trim();
+
+  // 3. Priorizar contenido que empiece con saludos o frases clave
+  const priorityTriggers = [
+    "¡hola", "hola", "buenas tardes", "buenos días", "buenas noches", "claro", "con gusto", "para ayudarte"
+  ];
+
+  let firstTriggerIndex = -1;
+  const lowercaseCandidate = finalCandidate.toLowerCase();
+
+  for (const trigger of priorityTriggers) {
+    const index = lowercaseCandidate.indexOf(trigger);
+    if (index !== -1) {
+      if (firstTriggerIndex === -1 || index < firstTriggerIndex) {
+        firstTriggerIndex = index;
+      }
+    }
+  }
+
+  if (firstTriggerIndex !== -1) {
+    finalCandidate = finalCandidate.substring(firstTriggerIndex).trim();
+  }
+
+  return finalCandidate;
+}
+
+function normalizeAdapterResponse(result) {
+  const rawAnswer = result.answer || "";
+  
+  if (isProviderErrorText(rawAnswer)) {
     return {
       ok: false,
       reply:
@@ -668,17 +778,18 @@ function normalizeAdapterResponse(result) {
       metadata: {
         profile: HERMES_PROFILE,
         hermes_session_id: result.sessionId,
-        hermes_stream_id: result.streamId,
         provider_error: true
       }
     };
   }
 
+  const reply = sanitizePatientReply(rawAnswer);
+
   if (!reply) {
     return {
       ok: false,
       reply:
-        "Ahora mismo no pude generar una respuesta completa. Te voy a derivar con el equipo para ayudarte mejor.",
+        "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
       route: "handoff",
       intent: "empty_hermes_response",
       requires_handoff: true,
@@ -689,16 +800,14 @@ function normalizeAdapterResponse(result) {
       },
       metadata: {
         profile: HERMES_PROFILE,
-        hermes_session_id: result.sessionId,
-        hermes_stream_id: result.streamId,
-        empty_response: true
+        hermes_session_id: result.sessionId
       }
     };
   }
 
   return {
     ok: true,
-    reply,
+    reply: reply,
     route: "hermes",
     intent: "respuesta_hermes",
     requires_handoff: false,
@@ -708,8 +817,7 @@ function normalizeAdapterResponse(result) {
     },
     metadata: {
       profile: HERMES_PROFILE,
-      hermes_session_id: result.sessionId,
-      hermes_stream_id: result.streamId
+      hermes_session_id: result.sessionId
     }
   };
 }
@@ -718,7 +826,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    routes: ["/health", "POST /helios/message"]
+    routes: ["/health", "/debug", "POST /helios/message"]
   });
 });
 
@@ -726,7 +834,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.3.0",
+    version: "2.4.0",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -736,37 +844,677 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Endpoint para el historial de eventos recientes en JSON
+app.get("/debug/events", checkDebugAuth, (req, res) => {
+  res.json(recentRequests);
+});
+
+// Panel de Monitoreo HTML
+app.get("/debug", checkDebugAuth, (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Helios Hermes Adapter - Debug Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #09090b;
+      --card-bg: rgba(20, 20, 25, 0.6);
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --primary: #6366f1;
+      --primary-glow: rgba(99, 102, 241, 0.15);
+      --success: #10b981;
+      --success-glow: rgba(16, 185, 129, 0.1);
+      --warning: #f59e0b;
+      --warning-glow: rgba(245, 158, 11, 0.1);
+      --danger: #ef4444;
+      --danger-glow: rgba(239, 68, 68, 0.1);
+    }
+    
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', sans-serif;
+      padding: 2rem;
+      min-height: 100vh;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.1) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.05) 0px, transparent 50%);
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+    }
+
+    .title-area h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(to right, #ffffff, var(--text-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.25rem;
+    }
+
+    .title-area p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--success-glow);
+      border: 1px solid var(--success);
+      color: var(--success);
+      padding: 0.4rem 1rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      background-color: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+      animation: pulse 1.6s infinite;
+    }
+
+    @keyframes pulse {
+      0% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+      }
+      70% {
+        transform: scale(1);
+        box-shadow: 0 0 0 6px rgba(16, 185, 129, 0);
+      }
+      100% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+      }
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2.5rem;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+    }
+
+    .stat-label {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .stat-value {
+      font-size: 1.6rem;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .stat-detail {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+
+    .section-title {
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .controls {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.8rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.85rem;
+      transition: all 0.2s;
+    }
+
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .btn.active {
+      background: var(--primary-glow);
+      border-color: var(--primary);
+      color: #a5b4fc;
+    }
+
+    .requests-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .request-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      transition: border-color 0.2s, transform 0.2s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .request-card:hover {
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .request-card.status-ok {
+      border-left: 4px solid var(--success);
+    }
+
+    .request-card.status-handoff {
+      border-left: 4px solid var(--warning);
+    }
+
+    .request-card.status-error {
+      border-left: 4px solid var(--danger);
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .card-meta {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .timestamp {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .badge {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      text-transform: uppercase;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .badge-ok {
+      background: var(--success-glow);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .badge-handoff {
+      background: var(--warning-glow);
+      color: var(--warning);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .badge-error {
+      background: var(--danger-glow);
+      color: var(--danger);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .ids-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 0.75rem;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      border: 1px solid rgba(255, 255, 255, 0.03);
+    }
+
+    .id-item span {
+      color: var(--text-muted);
+      margin-right: 0.25rem;
+    }
+
+    .id-item code {
+      font-family: 'JetBrains Mono', monospace;
+      color: #e4e4e7;
+    }
+
+    .payload-section {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+
+    @media (min-width: 768px) {
+      .payload-section {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    .payload-box {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .payload-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+
+    .payload-content {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      padding: 0.75rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 180px;
+      overflow-y: auto;
+      color: #d4d4d8;
+    }
+
+    .error-msg {
+      background: var(--danger-glow);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      color: var(--danger);
+      padding: 0.75rem;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      margin-top: 1rem;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 4rem;
+      color: var(--text-muted);
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+      background: var(--card-bg);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="title-area">
+      <h1>Helios Hermes Adapter</h1>
+      <p>Panel de Control y Monitoreo en Tiempo Real</p>
+    </div>
+    <div class="status-badge">
+      <div class="pulse"></div>
+      Servicio Activo
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Versión</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.0</div>
+      <div class="stat-detail">Node.js 20+</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Modo</div>
+      <div class="stat-value" style="font-size: 1.1rem; padding-top: 0.5rem; word-break: break-all;">STREAM_API</div>
+      <div class="stat-detail">Conexión directa SSE</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sesiones Hermes</div>
+      <div class="stat-value" id="session-count">-</div>
+      <div class="stat-detail">Mapeadas en memoria</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Último Evento</div>
+      <div class="stat-value" id="last-event-time" style="font-size: 0.95rem; padding-top: 0.5rem;">Ninguno</div>
+      <div class="stat-detail">Procesado recientemente</div>
+    </div>
+  </div>
+
+  <div class="section-title">
+    <span>Historial Reciente (Últimos 50 Requests)</span>
+    <div class="controls">
+      <button class="btn active" id="btn-auto">Auto-refrescar (5s)</button>
+      <button class="btn" id="btn-manual">Refrescar Ahora</button>
+    </div>
+  </div>
+
+  <div class="requests-list" id="requests-container">
+    <div class="empty-state">Cargando eventos...</div>
+  </div>
+
+  <script>
+    let autoRefresh = true;
+    let refreshInterval = null;
+
+    const btnAuto = document.getElementById('btn-auto');
+    const btnManual = document.getElementById('btn-manual');
+    const container = document.getElementById('requests-container');
+    const sessionCountEl = document.getElementById('session-count');
+    const lastEventTimeEl = document.getElementById('last-event-time');
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const token = urlParams.get('token') || '';
+
+    async function loadData() {
+      try {
+        const queryParam = token ? '?token=' + encodeURIComponent(token) : '';
+        
+        const healthRes = await fetch('/health' + queryParam);
+        if (healthRes.ok) {
+          const healthData = await healthRes.json();
+          sessionCountEl.textContent = healthData.session_count || 0;
+        }
+
+        const res = await fetch('/debug/events' + queryParam);
+        if (!res.ok) throw new Error('Error cargando eventos');
+        const events = await res.json();
+
+        if (events.length === 0) {
+          container.innerHTML = '<div class="empty-state">No se han procesado solicitudes todavía. Envía un mensaje desde helios-gateway para ver los logs aquí.</div>';
+          return;
+        }
+
+        const first = events[0];
+        const date = new Date(first.timestamp);
+        lastEventTimeEl.textContent = date.toLocaleTimeString();
+
+        container.innerHTML = events.map(ev => {
+          const statusClass = 'status-' + ev.status;
+          const badgeClass = 'badge-' + ev.status;
+          const formattedDate = new Date(ev.timestamp).toLocaleString();
+          
+          return '<div class="request-card ' + statusClass + '">' +
+            '<div class="card-header">' +
+              '<div class="card-meta">' +
+                '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
+                '<span class="timestamp">' + formattedDate + '</span>' +
+              '</div>' +
+              '<div style="font-size: 0.8rem; color: var(--text-muted);">' +
+                'Trace: <code style="font-family: monospace; color: #fff;">' + (ev.trace_id || 'N/A') + '</code>' +
+              '</div>' +
+            '</div>' +
+            '<div class="ids-grid">' +
+              '<div class="id-item"><span>Conv ID:</span><code>' + (ev.conversation_id || 'N/A') + '</code></div>' +
+              '<div class="id-item"><span>Contact ID:</span><code>' + (ev.contact_id || 'N/A') + '</code></div>' +
+              '<div class="id-item"><span>Tenant:</span><code>' + (ev.tenant_id || 'default') + '</code></div>' +
+              '<div class="id-item"><span>Clinic:</span><code>' + (ev.clinic_id || 'default') + '</code></div>' +
+              '<div class="id-item"><span>Teléfono:</span><code>' + (ev.phone_masked || 'N/A') + '</code></div>' +
+              '<div class="id-item"><span>Sesión:</span><code>' + (ev.hermes_session_id || 'N/A') + '</code></div>' +
+              '<div class="id-item"><span>Stream:</span><code>' + (ev.hermes_stream_id || 'N/A') + '</code></div>' +
+            '</div>' +
+            '<div class="payload-section">' +
+              '<div class="payload-box">' +
+                '<span class="payload-label">Vista Previa Cruda Hermes</span>' +
+                '<div class="payload-content">' + escapeHtml(ev.raw_hermes_preview || '(Vacío)') + '</div>' +
+              '</div>' +
+              '<div class="payload-box">' +
+                '<span class="payload-label">Vista Previa Sanitizada</span>' +
+                '<div class="payload-content" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.final_reply_preview || '(Vacío)') + '</div>' +
+              '</div>' +
+            '</div>' +
+            (ev.error ? '<div class="error-msg"><strong>Error / Intent / Ruta:</strong> ' + escapeHtml(ev.error) + ' | Ruta: ' + escapeHtml(ev.route || '') + ' | Intent: ' + escapeHtml(ev.intent || '') + '</div>' : '') +
+          '</div>';
+        }).join('');
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text
+        .toString()
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function startInterval() {
+      if (refreshInterval) clearInterval(refreshInterval);
+      refreshInterval = setInterval(loadData, 5000);
+    }
+
+    function stopInterval() {
+      if (refreshInterval) clearInterval(refreshInterval);
+      refreshInterval = null;
+    }
+
+    btnAuto.addEventListener('click', () => {
+      autoRefresh = !autoRefresh;
+      if (autoRefresh) {
+        btnAuto.classList.add('active');
+        btnAuto.textContent = 'Auto-refrescar (5s)';
+        startInterval();
+      } else {
+        btnAuto.classList.remove('active');
+        btnAuto.textContent = 'Auto-refrescar: OFF';
+        stopInterval();
+      }
+    });
+
+    btnManual.addEventListener('click', () => {
+      loadData();
+    });
+
+    loadData();
+    startInterval();
+  </script>
+</body>
+</html>`);
+});
+
 app.post("/helios/message", async (req, res) => {
+  const payload = req.body || {};
+  const normalized = normalizeGatewayPayload(payload);
+
+  let sessionId = "";
+  let streamId = "";
+  let rawResponseText = "";
+  let finalReply = "";
+  let finalStatus = "ok";
+  let errorMsg = "";
+  let finalRoute = "hermes";
+  let finalIntent = "respuesta_hermes";
+
   try {
     if (!ADAPTER_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "HERMES_API_KEY no está configurada en el adapter"
+      const errText = "HERMES_API_KEY no está configurada en el adapter";
+      res.status(500).json({ ok: false, error: errText });
+      
+      addRecentRequest({
+        timestamp: new Date().toISOString(),
+        trace_id: normalized.trace_id,
+        tenant_id: normalized.tenant_id,
+        clinic_id: normalized.clinic_id,
+        conversation_id: normalized.conversation_id,
+        contact_id: normalized.contact_id,
+        phone_masked: maskPhone(normalized.phone),
+        hermes_session_id: "",
+        hermes_stream_id: "",
+        status: "error",
+        route: "handoff",
+        intent: "error_configuracion",
+        raw_hermes_preview: "",
+        final_reply_preview: "",
+        error: errText.slice(0, 500)
       });
+      return;
     }
 
     const receivedToken = getBearerToken(req);
-
     if (receivedToken !== ADAPTER_API_KEY) {
-      return res.status(401).json({
-        ok: false,
-        error: "Unauthorized"
+      res.status(401).json({ ok: false, error: "Unauthorized" });
+      
+      addRecentRequest({
+        timestamp: new Date().toISOString(),
+        trace_id: normalized.trace_id,
+        tenant_id: normalized.tenant_id,
+        clinic_id: normalized.clinic_id,
+        conversation_id: normalized.conversation_id,
+        contact_id: normalized.contact_id,
+        phone_masked: maskPhone(normalized.phone),
+        hermes_session_id: "",
+        hermes_stream_id: "",
+        status: "error",
+        route: "handoff",
+        intent: "unauthorized",
+        raw_hermes_preview: "",
+        final_reply_preview: "",
+        error: "Intento de acceso no autorizado"
       });
+      return;
     }
 
-    const payload = req.body || {};
     const result = await sendMessageToHermes(payload);
+    sessionId = result.sessionId || "";
+    streamId = result.streamId || "";
+    rawResponseText = result.answer || "";
 
-    return res.json(normalizeAdapterResponse(result));
+    if (result.conflict) {
+      finalStatus = "handoff";
+      finalRoute = "handoff";
+      finalIntent = "active_stream_conflict";
+      
+      const conflictResponse = {
+        ok: false,
+        reply:
+          "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
+        route: finalRoute,
+        intent: finalIntent,
+        requires_handoff: true,
+        tool_calls: [],
+        case_tracking: {
+          requires_case_tracking: true,
+          reason: "active_stream_conflict"
+        },
+        metadata: {
+          profile: HERMES_PROFILE,
+          hermes_session_id: sessionId,
+          active_stream_id: result.activeStreamId || "",
+          reason: "active_stream_conflict"
+        }
+      };
+      
+      addRecentRequest({
+        timestamp: new Date().toISOString(),
+        trace_id: normalized.trace_id,
+        tenant_id: normalized.tenant_id,
+        clinic_id: normalized.clinic_id,
+        conversation_id: normalized.conversation_id,
+        contact_id: normalized.contact_id,
+        phone_masked: maskPhone(normalized.phone),
+        hermes_session_id: sessionId,
+        hermes_stream_id: streamId,
+        status: finalStatus,
+        route: finalRoute,
+        intent: finalIntent,
+        raw_hermes_preview: "",
+        final_reply_preview: conflictResponse.reply.slice(0, 1000),
+        error: "session already has an active stream conflict"
+      });
+
+      return res.json(conflictResponse);
+    }
+
+    const normalizedResponse = normalizeAdapterResponse(result);
+    finalReply = normalizedResponse.reply || "";
+    finalStatus = normalizedResponse.ok ? "ok" : "handoff";
+    finalRoute = normalizedResponse.route || "hermes";
+    finalIntent = normalizedResponse.intent || "respuesta_hermes";
+    
+    addRecentRequest({
+      timestamp: new Date().toISOString(),
+      trace_id: normalized.trace_id,
+      tenant_id: normalized.tenant_id,
+      clinic_id: normalized.clinic_id,
+      conversation_id: normalized.conversation_id,
+      contact_id: normalized.contact_id,
+      phone_masked: maskPhone(normalized.phone),
+      hermes_session_id: sessionId,
+      hermes_stream_id: streamId,
+      status: finalStatus,
+      route: finalRoute,
+      intent: finalIntent,
+      raw_hermes_preview: rawResponseText.slice(0, 1000),
+      final_reply_preview: finalReply.slice(0, 1000),
+      error: normalizedResponse.ok ? null : normalizedResponse.intent
+    });
+
+    return res.json(normalizedResponse);
+
   } catch (error) {
     console.error("Adapter error:", error);
+    finalStatus = "error";
+    finalRoute = "handoff";
+    finalIntent = "error_tecnico";
+    errorMsg = error.message;
 
-    return res.status(502).json({
+    const errorResponse = {
       ok: false,
       reply:
         "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
-      route: "handoff",
-      intent: "error_tecnico",
+      route: finalRoute,
+      intent: finalIntent,
       requires_handoff: true,
       tool_calls: [],
       case_tracking: {
@@ -777,10 +1525,30 @@ app.post("/helios/message", async (req, res) => {
         profile: HERMES_PROFILE,
         error: error.message
       }
+    };
+
+    addRecentRequest({
+      timestamp: new Date().toISOString(),
+      trace_id: normalized.trace_id,
+      tenant_id: normalized.tenant_id,
+      clinic_id: normalized.clinic_id,
+      conversation_id: normalized.conversation_id,
+      contact_id: normalized.contact_id,
+      phone_masked: maskPhone(normalized.phone),
+      hermes_session_id: sessionId,
+      hermes_stream_id: streamId,
+      status: finalStatus,
+      route: finalRoute,
+      intent: finalIntent,
+      raw_hermes_preview: rawResponseText.slice(0, 1000),
+      final_reply_preview: errorResponse.reply.slice(0, 1000),
+      error: errorMsg.slice(0, 500)
     });
+
+    return res.status(502).json(errorResponse);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.3 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.0 listening on port ${PORT}`);
 });
