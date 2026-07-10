@@ -24,7 +24,7 @@ const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
 const SESSION_STORE_PATH =
   process.env.HERMES_SESSION_STORE_PATH || "/tmp/helios-hermes-sessions.json";
 
-// Opcionales. Si no existen, Hermes usa el modelo por defecto del perfil helios.
+// Opcional. Si no existen, Hermes usará el modelo principal del perfil helios.
 const HERMES_MODEL = process.env.HERMES_MODEL || "";
 const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 
@@ -64,7 +64,16 @@ function firstNonEmpty(...values) {
     const text = String(value).trim();
     if (text) return text;
   }
+
   return "";
+}
+
+function hashShort(value) {
+  return crypto
+    .createHash("sha256")
+    .update(String(value || ""))
+    .digest("hex")
+    .slice(0, 12);
 }
 
 function normalizeGatewayPayload(payload = {}) {
@@ -129,67 +138,46 @@ function normalizeGatewayPayload(payload = {}) {
   };
 }
 
-function hashShort(value) {
-  return crypto
-    .createHash("sha256")
-    .update(String(value || ""))
-    .digest("hex")
-    .slice(0, 12);
+function getSessionIdentity(normalized) {
+  if (normalized.conversation_id) {
+    return `conversation:${normalized.conversation_id}:contact:${normalized.contact_id || "none"}`;
+  }
+
+  if (normalized.contact_id) {
+    return `contact:${normalized.contact_id}`;
+  }
+
+  if (normalized.phone) {
+    return `phone_hash:${hashShort(normalized.phone)}`;
+  }
+
+  if (normalized.trace_id) {
+    return `trace:${normalized.trace_id}`;
+  }
+
+  return "";
 }
 
 function conversationKey(normalized) {
   const tenant = normalized.tenant_id || "default";
   const clinic = normalized.clinic_id || "default";
+  const identity = getSessionIdentity(normalized);
 
-  const conversation =
-    normalized.conversation_id ||
-    normalized.contact_id ||
-    normalized.phone ||
-    normalized.trace_id;
-
-  if (!conversation) {
+  if (!identity) {
     throw new Error(
       "No se pudo construir session key: faltan conversation_id, contact_id, phone y trace_id"
     );
   }
 
-  return `${tenant}:${clinic}:${conversation}`;
+  return `${tenant}:${clinic}:${identity}`;
 }
 
 function buildHermesMessage(normalized) {
-  const eventPayload = {
-    source: "helios_gateway",
-    event: normalized.event,
-    trace_id: normalized.trace_id,
-    tenant_id: normalized.tenant_id,
-    clinic_id: normalized.clinic_id,
-    channel: normalized.channel,
-
-    conversation: {
-      conversation_id: normalized.conversation_id,
-      contact_id: normalized.contact_id,
-      inbox_id: normalized.inbox_id,
-      phone: normalized.phone
-    },
-
-    patient: normalized.patient,
-    state: normalized.state,
-
-    message: {
-      text: normalized.message_text,
-      message_count: normalized.message_count,
-      messages: normalized.message_items
-    },
-
-    clinic_context: normalized.clinic_context,
-    signals: normalized.signals,
-    metadata: normalized.metadata
-  };
-
   // IMPORTANTE:
   // El adapter NO agrega instrucciones clínicas.
-  // Hermes perfil helios es el cerebro. Aquí solo pasamos el evento estructurado.
-  return JSON.stringify(eventPayload, null, 2);
+  // Hermes perfil helios es el cerebro.
+  // Aquí pasamos el evento del gateway como JSON para que Hermes lo procese.
+  return JSON.stringify(normalized.raw || {}, null, 2);
 }
 
 async function fetchWithTimeout(url, options = {}) {
@@ -261,6 +249,19 @@ async function hermesLogin() {
   return true;
 }
 
+function createHermesHttpError(path, response, text) {
+  const error = new Error(
+    `Hermes ${path} HTTP ${response.status}: ${String(text || "").slice(0, 500)}`
+  );
+
+  error.status = response.status;
+  error.path = path;
+  error.body = text || "";
+  error.location = response.headers.get("location") || "";
+
+  return error;
+}
+
 async function hermesRequest(path, body, retryLogin = true) {
   if (!hermesCookie) {
     await hermesLogin();
@@ -299,7 +300,7 @@ async function hermesRequest(path, body, retryLogin = true) {
   }
 
   if (!response.ok) {
-    throw new Error(`Hermes ${path} HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw createHermesHttpError(path, response, text);
   }
 
   return data;
@@ -357,6 +358,24 @@ async function getHermesSessionId(normalized) {
   return createHermesSession(normalized);
 }
 
+function isSessionMissingError(errorOrData) {
+  const text = String(
+    errorOrData?.body ||
+      errorOrData?.message ||
+      errorOrData?.error ||
+      ""
+  ).toLowerCase();
+
+  return (
+    errorOrData?.status === 404 ||
+    text.includes("session not found") ||
+    text.includes("session_not_found") ||
+    text.includes("not found") ||
+    text.includes("no such session") ||
+    text.includes("missing session")
+  );
+}
+
 function isProviderErrorText(text) {
   const value = String(text || "").toLowerCase();
 
@@ -368,8 +387,21 @@ function isProviderErrorText(text) {
   );
 }
 
+async function sendChatToHermes(sessionId, normalized) {
+  const body = withOptionalModel({
+    session_id: sessionId,
+    workspace: HERMES_CWD,
+    profile: HERMES_PROFILE,
+    message: buildHermesMessage(normalized)
+  });
+
+  return hermesRequest("/api/chat", body);
+}
+
 async function sendMessageToHermes(payload) {
   const normalized = normalizeGatewayPayload(payload);
+  const key = conversationKey(normalized);
+
   let sessionId = await getHermesSessionId(normalized);
 
   console.log(
@@ -382,31 +414,52 @@ async function sendMessageToHermes(payload) {
       normalized_contact_id: normalized.contact_id || null,
       normalized_phone_exists: Boolean(normalized.phone),
       message_count: normalized.message_count,
-      session_key_hash: hashShort(conversationKey(normalized)),
+      session_key_hash: hashShort(key),
       hermes_session_id: sessionId,
       using_model_override: Boolean(HERMES_MODEL || HERMES_MODEL_PROVIDER)
     })
   );
 
-  const body = withOptionalModel({
-    session_id: sessionId,
-    workspace: HERMES_CWD,
-    profile: HERMES_PROFILE,
-    message: buildHermesMessage(normalized)
-  });
+  let data;
 
-  let data = await hermesRequest("/api/chat", body);
+  try {
+    data = await sendChatToHermes(sessionId, normalized);
+  } catch (error) {
+    if (!isSessionMissingError(error)) {
+      throw error;
+    }
 
-  if (data?.error && String(data.error).toLowerCase().includes("session")) {
+    console.warn(
+      JSON.stringify({
+        event: "hermes_session_missing_recreate",
+        session_key_hash: hashShort(key),
+        old_hermes_session_id: sessionId,
+        reason: error.message
+      })
+    );
+
+    delete sessionMap[key];
+    saveSessionMap();
+
     sessionId = await createHermesSession(normalized);
-
-    data = await hermesRequest("/api/chat", {
-      ...body,
-      session_id: sessionId
-    });
+    data = await sendChatToHermes(sessionId, normalized);
   }
 
-  const key = conversationKey(normalized);
+  if (data?.error && isSessionMissingError(data)) {
+    console.warn(
+      JSON.stringify({
+        event: "hermes_session_missing_recreate_from_body",
+        session_key_hash: hashShort(key),
+        old_hermes_session_id: sessionId
+      })
+    );
+
+    delete sessionMap[key];
+    saveSessionMap();
+
+    sessionId = await createHermesSession(normalized);
+    data = await sendChatToHermes(sessionId, normalized);
+  }
 
   if (sessionMap[key]) {
     sessionMap[key].updated_at = new Date().toISOString();
@@ -474,7 +527,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.1.0",
+    version: "2.2.0",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -530,5 +583,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.1 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.2 listening on port ${PORT}`);
 });
