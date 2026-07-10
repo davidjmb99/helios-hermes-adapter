@@ -13,6 +13,8 @@ function reportExpressErrorsAndConfigure() {
 const PORT = process.env.PORT || 3000;
 
 const ADAPTER_API_KEY = process.env.HERMES_API_KEY || "";
+const DEBUG_USERNAME = process.env.DEBUG_USERNAME || "";
+const DEBUG_PASSWORD = process.env.DEBUG_PASSWORD || "";
 const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
 
@@ -101,42 +103,119 @@ function maskPhone(phone) {
   return `${prefix}*****${suffix}`;
 }
 
-function checkDebugAuth(req, res, next) {
-  let token = "";
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  try {
+    const aBuf = Buffer.from(a);
+    const bBuf = Buffer.from(b);
+    if (aBuf.length !== bBuf.length) {
+      crypto.timingSafeEqual(aBuf, aBuf);
+      return false;
+    }
+    return crypto.timingSafeEqual(aBuf, bBuf);
+  } catch (_) {
+    return false;
+  }
+}
+
+function getBasicAuthCredentials(req) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Basic ")) return null;
   
-  if (DEBUG_TOKEN) {
-    token = getBearerToken(req);
-    if (!token && req.query.token) {
-      token = String(req.query.token).trim();
+  try {
+    const credentialsBase64 = header.slice("Basic ".length).trim();
+    const decoded = Buffer.from(credentialsBase64, 'base64').toString('utf8');
+    const index = decoded.indexOf(':');
+    if (index === -1) return null;
+    return {
+      username: decoded.slice(0, index),
+      password: decoded.slice(index + 1)
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function isDebugAuthorized(req) {
+  // A) Verificar credenciales Basic Auth
+  if (DEBUG_USERNAME && DEBUG_PASSWORD) {
+    const basic = getBasicAuthCredentials(req);
+    if (basic && safeCompare(basic.username, DEBUG_USERNAME) && safeCompare(basic.password, DEBUG_PASSWORD)) {
+      return true;
     }
   }
 
-  const isAuthorized = DEBUG_TOKEN ? (token === DEBUG_TOKEN) : (NODE_ENV !== "production");
+  // B y C) Verificar token Bearer o parámetro query
+  if (DEBUG_TOKEN) {
+    let token = getBearerToken(req);
+    if (!token && req.query.token) {
+      token = String(req.query.token).trim();
+    }
+    if (token && safeCompare(token, DEBUG_TOKEN)) {
+      return true;
+    }
+  }
 
-  if (!isAuthorized) {
-    const status = DEBUG_TOKEN ? 401 : 403;
-    const errorMsg = DEBUG_TOKEN 
-      ? "No autorizado: Token de debug inválido o ausente." 
-      : "Acceso prohibido: El panel de debug está desactivado en producción.";
+  // Si no hay configuración de debug en absoluto, permitir acceso solo en desarrollo
+  if (!DEBUG_USERNAME && !DEBUG_PASSWORD && !DEBUG_TOKEN) {
+    return NODE_ENV !== "production";
+  }
 
+  return false;
+}
+
+function requireDebugAuth(req, res, next) {
+  if (isDebugAuthorized(req)) {
+    return next();
+  }
+
+  const isProduction = NODE_ENV === "production";
+  const hasCredsConfigured = Boolean(DEBUG_USERNAME && DEBUG_PASSWORD);
+  const hasTokenConfigured = Boolean(DEBUG_TOKEN);
+
+  // Si está en producción y no se ha configurado ninguna autenticación
+  if (isProduction && !hasCredsConfigured && !hasTokenConfigured) {
+    const status = 403;
+    const errorMsg = "Dashboard protegido. Configura DEBUG_USERNAME y DEBUG_PASSWORD.";
+    
     if (req.path === "/debug/events") {
       return res.status(status).json({ ok: false, error: errorMsg });
     } else {
       return res.status(status).send(`
         <html>
-          <head><title>Acceso Denegado</title></head>
+          <head><title>Acceso Prohibido</title></head>
           <body style="background:#09090b; color:#ef4444; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
-            <div style="text-align:center; border:1px solid #ef4444; padding:2rem; border-radius:8px; background:rgba(239,68,68,0.1); max-width: 400px; width: 90%;">
-              <h2 style="margin: 0 0 0.5rem 0; font-size: 1.5rem;">${status === 401 ? '401 - No Autorizado' : '403 - Acceso Prohibido'}</h2>
-              <p style="color:#a1a1aa; margin: 0 0 1rem 0; font-size: 0.95rem;">${errorMsg}</p>
-              ${status === 401 ? '<p style="color:#71717a; font-size: 0.8rem; margin: 0;">Para ingresar usa: <br/><code>/debug?token=TU_DEBUG_TOKEN</code></p>' : ''}
+            <div style="text-align:center; border:1px solid #ef4444; padding:2rem; border-radius:8px; background:rgba(239,68,68,0.1); max-width: 500px; width: 90%;">
+              <h2 style="margin: 0 0 0.5rem 0; font-size: 1.5rem;">403 - Acceso Prohibido</h2>
+              <p style="color:#a1a1aa; margin: 0; font-size: 0.95rem;">${errorMsg}</p>
             </div>
           </body>
         </html>
       `);
     }
   }
-  next();
+
+  // Exigir Basic Auth challenge
+  res.setHeader("WWW-Authenticate", 'Basic realm="Helios Hermes Adapter"');
+  const status = 401;
+  const errorMsg = "No autorizado: Autenticación requerida para acceder al panel de debug.";
+
+  if (req.path === "/debug/events") {
+    return res.status(status).json({ ok: false, error: errorMsg });
+  } else {
+    return res.status(status).send(`
+      <html>
+        <head><title>Acceso Denegado</title></head>
+        <body style="background:#09090b; color:#f59e0b; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
+          <div style="text-align:center; border:1px solid #f59e0b; padding:2rem; border-radius:8px; background:rgba(245,158,11,0.1); max-width: 500px; width: 90%;">
+            <h2 style="margin: 0 0 0.5rem 0; font-size: 1.5rem;">401 - No Autorizado</h2>
+            <p style="color:#a1a1aa; margin: 0 0 1rem 0; font-size: 0.95rem;">${errorMsg}</p>
+            <p style="color:#71717a; font-size: 0.8rem; margin: 0;">Inicia sesión con tus credenciales de depuración.</p>
+          </div>
+        </body>
+      </html>
+    `);
+  }
 }
 
 function normalizeGatewayPayload(payload = {}) {
@@ -822,35 +901,29 @@ function normalizeAdapterResponse(result) {
   };
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "helios-hermes-adapter",
-    routes: ["/health", "/debug", "POST /helios/message"]
-  });
-});
-
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.0",
+    version: "2.4.1",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
     hermes_webui_password_configured: Boolean(HERMES_WEBUI_PASSWORD),
     using_model_override: Boolean(HERMES_MODEL || HERMES_MODEL_PROVIDER),
-    session_count: Object.keys(sessionMap).length
+    session_count: Object.keys(sessionMap).length,
+    debug_credentials_configured: Boolean(DEBUG_USERNAME && DEBUG_PASSWORD),
+    debug_token_configured: Boolean(DEBUG_TOKEN)
   });
 });
 
 // Endpoint para el historial de eventos recientes en JSON
-app.get("/debug/events", checkDebugAuth, (req, res) => {
+app.get("/debug/events", requireDebugAuth, (req, res) => {
   res.json(recentRequests);
 });
 
-// Panel de Monitoreo HTML
-app.get("/debug", checkDebugAuth, (req, res) => {
+// Servir Dashboard HTML común
+function serveDashboard(req, res) {
   res.send(`<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1208,7 +1281,7 @@ app.get("/debug", checkDebugAuth, (req, res) => {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.0</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.1</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1361,7 +1434,11 @@ app.get("/debug", checkDebugAuth, (req, res) => {
   </script>
 </body>
 </html>`);
-});
+}
+
+// Rutas protegidas para servir el Dashboard y los Eventos
+app.get("/", requireDebugAuth, serveDashboard);
+app.get("/debug", requireDebugAuth, serveDashboard);
 
 app.post("/helios/message", async (req, res) => {
   const payload = req.body || {};
@@ -1550,5 +1627,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.0 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.1 listening on port ${PORT}`);
 });

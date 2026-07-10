@@ -85,6 +85,10 @@ HERMES_WEBUI_PASSWORD=
 
 HERMES_TIMEOUT_MS=30000
 HERMES_SESSION_STORE_PATH=/tmp/helios-hermes-sessions.json
+
+DEBUG_USERNAME=democoi1
+DEBUG_PASSWORD=democoi1
+DEBUG_TOKEN=
 ```
 
 ## Modelo de IA
