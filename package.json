@@ -1,0 +1,15 @@
+{
+  "name": "helios-hermes-adapter",
+  "version": "2.0.0",
+  "description": "Adapter service between Helios Gateway and Hermes WebUI profile helios.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
