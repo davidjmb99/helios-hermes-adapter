@@ -60,7 +60,7 @@ const recentRequests = [];
 function addRecentRequest(reqData) {
   recentRequests.unshift(reqData);
   if (recentRequests.length > 50) {
-    recentRequests.pop();
+    recentRequests.length = 50;
   }
 }
 
@@ -1210,7 +1210,10 @@ function serveLoginPage(req, res) {
 
 // Endpoint para el historial de eventos recientes en JSON
 app.get("/debug/events", requireDebugAuth, (req, res) => {
-  res.json(recentRequests);
+  res.json({
+    events: recentRequests,
+    count: recentRequests.length
+  });
 });
 
 // Servir Dashboard HTML común
@@ -1652,7 +1655,14 @@ function serveDashboard(req, res) {
 
         const res = await fetch('/debug/events' + queryParam);
         if (!res.ok) throw new Error('Error cargando eventos');
-        const events = await res.json();
+        const data = await res.json();
+        
+        let events = [];
+        if (Array.isArray(data)) {
+          events = data;
+        } else if (data && Array.isArray(data.events)) {
+          events = data.events;
+        }
 
         if (events.length === 0) {
           container.innerHTML = '<div class="empty-state">No se han procesado solicitudes todavía. Envía un mensaje desde helios-gateway para ver los logs aquí.</div>';
