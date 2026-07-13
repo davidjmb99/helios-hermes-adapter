@@ -905,7 +905,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.1",
+    version: "2.4.2",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -1272,16 +1272,21 @@ function serveDashboard(req, res) {
       <h1>Helios Hermes Adapter</h1>
       <p>Panel de Control y Monitoreo en Tiempo Real</p>
     </div>
-    <div class="status-badge">
-      <div class="pulse"></div>
-      Servicio Activo
+    <div style="display: flex; align-items: center; gap: 1rem;">
+      <div class="status-badge">
+        <div class="pulse"></div>
+        Servicio Activo
+      </div>
+      <button class="btn" onclick="logout()" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: var(--danger); font-weight: 500;">
+        Cerrar Sesión
+      </button>
     </div>
   </header>
 
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.1</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.2</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1325,6 +1330,19 @@ function serveDashboard(req, res) {
 
     const urlParams = new URLSearchParams(window.location.search);
     const token = urlParams.get('token') || '';
+
+    function logout() {
+      const ajax = new XMLHttpRequest();
+      // Enviar credenciales incorrectas para forzar al navegador a limpiar la caché de Basic Auth
+      ajax.open("GET", "/debug/events", true, "logout", "logout");
+      ajax.send();
+      ajax.onreadystatechange = function() {
+        if (ajax.readyState == 4) {
+          // Redirigir a la ruta raíz para forzar la petición de login limpia
+          window.location.href = "/";
+        }
+      }
+    }
 
     async function loadData() {
       try {
@@ -1627,5 +1645,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.1 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.2 listening on port ${PORT}`);
 });
