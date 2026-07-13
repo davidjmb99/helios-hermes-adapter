@@ -18,6 +18,20 @@ const DEBUG_PASSWORD = process.env.DEBUG_PASSWORD || "";
 const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
 
+const sessionSecret = crypto.randomBytes(32).toString('hex');
+
+function getCookie(req, name) {
+  const list = {};
+  const rc = req.headers.cookie;
+  if (rc) {
+    rc.split(';').forEach(cookie => {
+      const parts = cookie.split('=');
+      list[parts.shift().trim()] = decodeURI(parts.join('='));
+    });
+  }
+  return list[name];
+}
+
 const HERMES_PROFILE = process.env.HERMES_PROFILE || "helios";
 const HERMES_CWD =
   process.env.HERMES_CWD ||
@@ -137,8 +151,17 @@ function getBasicAuthCredentials(req) {
 }
 
 function isDebugAuthorized(req) {
-  // A) Verificar credenciales Basic Auth
+  // A) Verificar cookie de sesión personalizada
   if (DEBUG_USERNAME && DEBUG_PASSWORD) {
+    const cookieToken = getCookie(req, "debug_token");
+    const expectedToken = crypto.createHmac('sha256', sessionSecret)
+      .update(`${DEBUG_USERNAME}:${DEBUG_PASSWORD}`)
+      .digest('hex');
+    if (cookieToken && safeCompare(cookieToken, expectedToken)) {
+      return true;
+    }
+    
+    // Mantener compatibilidad con Basic Auth si se provee
     const basic = getBasicAuthCredentials(req);
     if (basic && safeCompare(basic.username, DEBUG_USERNAME) && safeCompare(basic.password, DEBUG_PASSWORD)) {
       return true;
@@ -195,27 +218,13 @@ function requireDebugAuth(req, res, next) {
     }
   }
 
-  // Exigir Basic Auth challenge
-  res.setHeader("WWW-Authenticate", 'Basic realm="Helios Hermes Adapter"');
-  const status = 401;
-  const errorMsg = "No autorizado: Autenticación requerida para acceder al panel de debug.";
-
+  // Si es el endpoint de eventos JSON, devolvemos un 401 limpio
   if (req.path === "/debug/events") {
-    return res.status(status).json({ ok: false, error: errorMsg });
-  } else {
-    return res.status(status).send(`
-      <html>
-        <head><title>Acceso Denegado</title></head>
-        <body style="background:#09090b; color:#f59e0b; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
-          <div style="text-align:center; border:1px solid #f59e0b; padding:2rem; border-radius:8px; background:rgba(245,158,11,0.1); max-width: 500px; width: 90%;">
-            <h2 style="margin: 0 0 0.5rem 0; font-size: 1.5rem;">401 - No Autorizado</h2>
-            <p style="color:#a1a1aa; margin: 0 0 1rem 0; font-size: 0.95rem;">${errorMsg}</p>
-            <p style="color:#71717a; font-size: 0.8rem; margin: 0;">Inicia sesión con tus credenciales de depuración.</p>
-          </div>
-        </body>
-      </html>
-    `);
+    return res.status(401).json({ ok: false, error: "No autorizado: Autenticación requerida." });
   }
+
+  // Para las páginas html (/ o /debug), servimos la interfaz de Login personalizada
+  return serveLoginPage(req, res);
 }
 
 function normalizeGatewayPayload(payload = {}) {
@@ -905,7 +914,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.2",
+    version: "2.4.3",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -916,6 +925,288 @@ app.get("/health", (req, res) => {
     debug_token_configured: Boolean(DEBUG_TOKEN)
   });
 });
+
+// Endpoint para procesar el Login (POST)
+app.post("/login", (req, res) => {
+  const { username, password } = req.body || {};
+  
+  if (!DEBUG_USERNAME || !DEBUG_PASSWORD) {
+    return res.status(403).json({ ok: false, error: "Servicio no configurado para autenticación." });
+  }
+
+  if (safeCompare(username, DEBUG_USERNAME) && safeCompare(password, DEBUG_PASSWORD)) {
+    const expectedToken = crypto.createHmac('sha256', sessionSecret)
+      .update(`${DEBUG_USERNAME}:${DEBUG_PASSWORD}`)
+      .digest('hex');
+    
+    const isProd = NODE_ENV === "production";
+    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isProd ? "Secure;" : ""} SameSite=Lax; Max-Age=86400`);
+    
+    return res.json({ ok: true });
+  }
+
+  return res.status(401).json({ ok: false, error: "Usuario o contraseña incorrectos." });
+});
+
+// Endpoint para cerrar sesión (GET)
+app.get("/logout", (req, res) => {
+  res.setHeader("Set-Cookie", "debug_token=; Path=/; HttpOnly; Max-Age=0");
+  res.json({ ok: true });
+});
+
+// Servir la página de inicio de sesión personalizada
+function serveLoginPage(req, res) {
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Helios Hermes Adapter - Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #09090b;
+      --card-bg: rgba(20, 20, 25, 0.6);
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --primary: #6366f1;
+      --primary-glow: rgba(99, 102, 241, 0.15);
+      --danger: #ef4444;
+    }
+    
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.1) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.05) 0px, transparent 50%);
+      padding: 1rem;
+    }
+
+    .login-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.5rem;
+      width: 100%;
+      max-width: 420px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .logo-area {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+
+    .logo-area h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(to right, #ffffff, var(--text-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.5rem;
+    }
+
+    .logo-area p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .form-group {
+      margin-bottom: 1.25rem;
+      position: relative;
+    }
+
+    .form-group label {
+      display: block;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      margin-bottom: 0.5rem;
+      font-weight: 500;
+    }
+
+    .input-wrapper {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .form-control {
+      width: 100%;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.95rem;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .form-control:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-glow);
+    }
+
+    .eye-btn {
+      position: absolute;
+      right: 1rem;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.25rem;
+      transition: color 0.2s;
+    }
+
+    .eye-btn:hover {
+      color: var(--text);
+    }
+
+    .btn-submit {
+      width: 100%;
+      background: var(--primary);
+      color: #ffffff;
+      border: none;
+      font-family: inherit;
+      font-size: 1rem;
+      font-weight: 600;
+      padding: 0.85rem;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 1rem;
+      transition: opacity 0.2s, box-shadow 0.2s;
+      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+    }
+
+    .btn-submit:hover {
+      opacity: 0.9;
+    }
+
+    .error-msg {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      color: var(--danger);
+      padding: 0.75rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      margin-bottom: 1.5rem;
+      text-align: center;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="login-card">
+    <div class="logo-area">
+      <h1>Panel de Debug</h1>
+      <p>Inicia sesión para acceder al monitoreo</p>
+    </div>
+
+    <div class="error-msg" id="error-box"></div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label for="username">Usuario</label>
+        <input type="text" id="username" class="form-control" placeholder="Ingresa tu usuario" autocomplete="username" required>
+      </div>
+
+      <div class="form-group">
+        <label for="password">Contraseña</label>
+        <div class="input-wrapper">
+          <input type="password" id="password" class="form-control" placeholder="Ingresa tu contraseña" autocomplete="current-password" required>
+          <button type="button" class="eye-btn" id="toggle-password" aria-label="Mostrar contraseña">
+            <svg id="eye-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <button type="submit" class="btn-submit">Iniciar Sesión</button>
+    </form>
+  </div>
+
+  <script>
+    const passwordInput = document.getElementById('password');
+    const togglePasswordBtn = document.getElementById('toggle-password');
+    const eyeIcon = document.getElementById('eye-icon');
+    const form = document.getElementById('login-form');
+    const errorBox = document.getElementById('error-box');
+
+    // Toggle de visibilidad de contraseña (ojito)
+    togglePasswordBtn.addEventListener('click', () => {
+      const type = passwordInput.getAttribute('type') === 'password' ? 'text' : 'password';
+      passwordInput.setAttribute('type', type);
+      
+      if (type === 'text') {
+        eyeIcon.innerHTML = \`
+          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+          <line x1="1" y1="1" x2="23" y2="23"></line>
+        \`;
+      } else {
+        eyeIcon.innerHTML = \`
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+          <circle cx="12" cy="12" r="3"></circle>
+        \`;
+      }
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorBox.style.display = 'none';
+
+      const username = document.getElementById('username').value;
+      const password = passwordInput.value;
+
+      try {
+        const response = await fetch('/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ username, password })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.ok) {
+          window.location.reload();
+        } else {
+          errorBox.textContent = data.error || 'Credenciales inválidas.';
+          errorBox.style.display = 'block';
+        }
+      } catch (err) {
+        errorBox.textContent = 'Error de conexión con el servidor.';
+        errorBox.style.display = 'block';
+      }
+    });
+  </script>
+</body>
+</html>`);
+}
 
 // Endpoint para el historial de eventos recientes en JSON
 app.get("/debug/events", requireDebugAuth, (req, res) => {
@@ -1286,7 +1577,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.2</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.3</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1332,16 +1623,11 @@ function serveDashboard(req, res) {
     const token = urlParams.get('token') || '';
 
     function logout() {
-      const ajax = new XMLHttpRequest();
-      // Enviar credenciales incorrectas para forzar al navegador a limpiar la caché de Basic Auth
-      ajax.open("GET", "/debug/events", true, "logout", "logout");
-      ajax.send();
-      ajax.onreadystatechange = function() {
-        if (ajax.readyState == 4) {
-          // Redirigir a la ruta raíz para forzar la petición de login limpia
-          window.location.href = "/";
-        }
-      }
+      // Borrar la cookie y llamar al API de desconexión
+      document.cookie = "debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;";
+      fetch('/logout').then(() => {
+        window.location.href = "/";
+      });
     }
 
     async function loadData() {
@@ -1645,5 +1931,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.2 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.3 listening on port ${PORT}`);
 });
