@@ -914,7 +914,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.3",
+    version: "2.4.4",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -1416,6 +1416,10 @@ function serveDashboard(req, res) {
       border-left: 4px solid var(--success);
     }
 
+    .request-card.status-started {
+      border-left: 4px solid var(--primary);
+    }
+
     .request-card.status-handoff {
       border-left: 4px solid var(--warning);
     }
@@ -1453,6 +1457,12 @@ function serveDashboard(req, res) {
       border-radius: 4px;
       text-transform: uppercase;
       font-family: 'JetBrains Mono', monospace;
+    }
+
+    .badge-started {
+      background: var(--primary-glow);
+      color: var(--primary);
+      border: 1px solid rgba(99, 102, 241, 0.3);
     }
 
     .badge-ok {
@@ -1577,7 +1587,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.3</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.4</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1746,7 +1756,33 @@ app.get("/debug", requireDebugAuth, serveDashboard);
 
 app.post("/helios/message", async (req, res) => {
   const payload = req.body || {};
-  const normalized = normalizeGatewayPayload(payload);
+  
+  let normalized;
+  try {
+    normalized = normalizeGatewayPayload(payload);
+  } catch (err) {
+    normalized = { raw: payload };
+  }
+
+  // Crear debugEvent al inicio y agregarlo inmediatamente
+  const debugEvent = {
+    timestamp: new Date().toISOString(),
+    trace_id: normalized.trace_id || "",
+    tenant_id: normalized.tenant_id || "",
+    clinic_id: normalized.clinic_id || "",
+    conversation_id: normalized.conversation_id || "",
+    contact_id: normalized.contact_id || "",
+    phone_masked: maskPhone(normalized.phone),
+    hermes_session_id: "",
+    hermes_stream_id: "",
+    status: "started",
+    route: "",
+    intent: "",
+    raw_hermes_preview: "",
+    final_reply_preview: "",
+    error: null
+  };
+  addRecentRequest(debugEvent);
 
   let sessionId = "";
   let streamId = "";
@@ -1760,50 +1796,23 @@ app.post("/helios/message", async (req, res) => {
   try {
     if (!ADAPTER_API_KEY) {
       const errText = "HERMES_API_KEY no está configurada en el adapter";
-      res.status(500).json({ ok: false, error: errText });
+      debugEvent.status = "error";
+      debugEvent.route = "handoff";
+      debugEvent.intent = "error_configuracion";
+      debugEvent.error = errText.slice(0, 500);
       
-      addRecentRequest({
-        timestamp: new Date().toISOString(),
-        trace_id: normalized.trace_id,
-        tenant_id: normalized.tenant_id,
-        clinic_id: normalized.clinic_id,
-        conversation_id: normalized.conversation_id,
-        contact_id: normalized.contact_id,
-        phone_masked: maskPhone(normalized.phone),
-        hermes_session_id: "",
-        hermes_stream_id: "",
-        status: "error",
-        route: "handoff",
-        intent: "error_configuracion",
-        raw_hermes_preview: "",
-        final_reply_preview: "",
-        error: errText.slice(0, 500)
-      });
-      return;
+      return res.status(500).json({ ok: false, error: errText });
     }
 
     const receivedToken = getBearerToken(req);
     if (receivedToken !== ADAPTER_API_KEY) {
-      res.status(401).json({ ok: false, error: "Unauthorized" });
+      const errText = "Unauthorized access attempt";
+      debugEvent.status = "error";
+      debugEvent.route = "handoff";
+      debugEvent.intent = "unauthorized";
+      debugEvent.error = errText;
       
-      addRecentRequest({
-        timestamp: new Date().toISOString(),
-        trace_id: normalized.trace_id,
-        tenant_id: normalized.tenant_id,
-        clinic_id: normalized.clinic_id,
-        conversation_id: normalized.conversation_id,
-        contact_id: normalized.contact_id,
-        phone_masked: maskPhone(normalized.phone),
-        hermes_session_id: "",
-        hermes_stream_id: "",
-        status: "error",
-        route: "handoff",
-        intent: "unauthorized",
-        raw_hermes_preview: "",
-        final_reply_preview: "",
-        error: "Intento de acceso no autorizado"
-      });
-      return;
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
     const result = await sendMessageToHermes(payload);
@@ -1811,15 +1820,24 @@ app.post("/helios/message", async (req, res) => {
     streamId = result.streamId || "";
     rawResponseText = result.answer || "";
 
+    debugEvent.hermes_session_id = sessionId;
+    debugEvent.hermes_stream_id = streamId;
+
     if (result.conflict) {
       finalStatus = "handoff";
       finalRoute = "handoff";
       finalIntent = "active_stream_conflict";
-      
+      errorMsg = "session already has an active stream conflict";
+
+      debugEvent.status = finalStatus;
+      debugEvent.route = finalRoute;
+      debugEvent.intent = finalIntent;
+      debugEvent.error = errorMsg;
+      debugEvent.final_reply_preview = "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.";
+
       const conflictResponse = {
         ok: false,
-        reply:
-          "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
+        reply: debugEvent.final_reply_preview,
         route: finalRoute,
         intent: finalIntent,
         requires_handoff: true,
@@ -1835,24 +1853,6 @@ app.post("/helios/message", async (req, res) => {
           reason: "active_stream_conflict"
         }
       };
-      
-      addRecentRequest({
-        timestamp: new Date().toISOString(),
-        trace_id: normalized.trace_id,
-        tenant_id: normalized.tenant_id,
-        clinic_id: normalized.clinic_id,
-        conversation_id: normalized.conversation_id,
-        contact_id: normalized.contact_id,
-        phone_masked: maskPhone(normalized.phone),
-        hermes_session_id: sessionId,
-        hermes_stream_id: streamId,
-        status: finalStatus,
-        route: finalRoute,
-        intent: finalIntent,
-        raw_hermes_preview: "",
-        final_reply_preview: conflictResponse.reply.slice(0, 1000),
-        error: "session already has an active stream conflict"
-      });
 
       return res.json(conflictResponse);
     }
@@ -1862,24 +1862,15 @@ app.post("/helios/message", async (req, res) => {
     finalStatus = normalizedResponse.ok ? "ok" : "handoff";
     finalRoute = normalizedResponse.route || "hermes";
     finalIntent = normalizedResponse.intent || "respuesta_hermes";
-    
-    addRecentRequest({
-      timestamp: new Date().toISOString(),
-      trace_id: normalized.trace_id,
-      tenant_id: normalized.tenant_id,
-      clinic_id: normalized.clinic_id,
-      conversation_id: normalized.conversation_id,
-      contact_id: normalized.contact_id,
-      phone_masked: maskPhone(normalized.phone),
-      hermes_session_id: sessionId,
-      hermes_stream_id: streamId,
-      status: finalStatus,
-      route: finalRoute,
-      intent: finalIntent,
-      raw_hermes_preview: rawResponseText.slice(0, 1000),
-      final_reply_preview: finalReply.slice(0, 1000),
-      error: normalizedResponse.ok ? null : normalizedResponse.intent
-    });
+
+    debugEvent.status = finalStatus;
+    debugEvent.route = finalRoute;
+    debugEvent.intent = finalIntent;
+    debugEvent.raw_hermes_preview = rawResponseText.slice(0, 1000);
+    debugEvent.final_reply_preview = finalReply.slice(0, 1000);
+    if (!normalizedResponse.ok) {
+      debugEvent.error = normalizedResponse.intent;
+    }
 
     return res.json(normalizedResponse);
 
@@ -1890,10 +1881,18 @@ app.post("/helios/message", async (req, res) => {
     finalIntent = "error_tecnico";
     errorMsg = error.message;
 
+    const isAbortError = error.name === "AbortError" || error.message.includes("aborted") || error.message.includes("AbortError");
+
+    debugEvent.status = finalStatus;
+    debugEvent.route = finalRoute;
+    debugEvent.intent = finalIntent;
+    debugEvent.error = errorMsg.slice(0, 500);
+    debugEvent.raw_hermes_preview = rawResponseText.slice(0, 1000);
+    debugEvent.final_reply_preview = "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.";
+
     const errorResponse = {
       ok: false,
-      reply:
-        "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
+      reply: debugEvent.final_reply_preview,
       route: finalRoute,
       intent: finalIntent,
       requires_handoff: true,
@@ -1904,32 +1903,19 @@ app.post("/helios/message", async (req, res) => {
       },
       metadata: {
         profile: HERMES_PROFILE,
-        error: error.message
+        error: error.message,
+        ...(isAbortError ? {
+          error_type: "timeout_or_stream_abort",
+          timeout_ms: HERMES_TIMEOUT_MS,
+          reason: "Hermes stream or request aborted"
+        } : {})
       }
     };
-
-    addRecentRequest({
-      timestamp: new Date().toISOString(),
-      trace_id: normalized.trace_id,
-      tenant_id: normalized.tenant_id,
-      clinic_id: normalized.clinic_id,
-      conversation_id: normalized.conversation_id,
-      contact_id: normalized.contact_id,
-      phone_masked: maskPhone(normalized.phone),
-      hermes_session_id: sessionId,
-      hermes_stream_id: streamId,
-      status: finalStatus,
-      route: finalRoute,
-      intent: finalIntent,
-      raw_hermes_preview: rawResponseText.slice(0, 1000),
-      final_reply_preview: errorResponse.reply.slice(0, 1000),
-      error: errorMsg.slice(0, 500)
-    });
 
     return res.status(502).json(errorResponse);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.3 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.4 listening on port ${PORT}`);
 });
