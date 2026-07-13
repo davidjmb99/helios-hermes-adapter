@@ -117,6 +117,20 @@ function maskPhone(phone) {
   return `${prefix}*****${suffix}`;
 }
 
+function maskEmail(email) {
+  if (!email) return "";
+  const str = String(email).trim();
+  const parts = str.split("@");
+  if (parts.length !== 2) return "*****";
+  const name = parts[0];
+  const domain = parts[1];
+  if (name.length <= 2) {
+    return name + "***@" + domain;
+  }
+  const prefix = name.slice(0, 2);
+  return prefix + "***@" + domain;
+}
+
 function safeCompare(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   try {
@@ -914,7 +928,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.4",
+    version: "2.4.5",
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -1207,7 +1221,6 @@ function serveLoginPage(req, res) {
 </body>
 </html>`);
 }
-
 // Endpoint para el historial de eventos recientes en JSON
 app.get("/debug/events", requireDebugAuth, (req, res) => {
   res.json({
@@ -1223,7 +1236,7 @@ function serveDashboard(req, res) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Helios Hermes Adapter - Debug Panel</title>
+  <title>Helios Hermes Adapter - Tracing Panel</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1358,6 +1371,56 @@ function serveDashboard(req, res) {
       margin-top: 0.25rem;
     }
 
+    /* Barra de filtros y buscador */
+    .filter-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin-bottom: 1.5rem;
+      backdrop-filter: blur(10px);
+    }
+
+    @media (min-width: 768px) {
+      .filter-bar {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+      }
+    }
+
+    .search-input-wrapper {
+      position: relative;
+      flex: 1;
+      max-width: 450px;
+    }
+
+    .search-input {
+      width: 100%;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.9rem;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .search-input:focus {
+      border-color: var(--primary);
+    }
+
+    .filter-buttons {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
     .section-title {
       font-size: 1.2rem;
       font-weight: 600;
@@ -1405,14 +1468,17 @@ function serveDashboard(req, res) {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 1.5rem;
+      padding: 1.25rem 1.5rem;
       transition: border-color 0.2s, transform 0.2s;
       position: relative;
       overflow: hidden;
+      cursor: pointer;
     }
 
     .request-card:hover {
-      border-color: rgba(255, 255, 255, 0.15);
+      border-color: rgba(255, 255, 255, 0.18);
+      transform: translateY(-2px);
+      background: rgba(25, 25, 30, 0.7);
     }
 
     .request-card.status-ok {
@@ -1435,14 +1501,14 @@ function serveDashboard(req, res) {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      margin-bottom: 1rem;
+      margin-bottom: 0.75rem;
       flex-wrap: wrap;
       gap: 0.5rem;
     }
 
     .card-meta {
       display: flex;
-      gap: 1rem;
+      gap: 0.75rem;
       align-items: center;
       flex-wrap: wrap;
     }
@@ -1486,77 +1552,47 @@ function serveDashboard(req, res) {
       border: 1px solid rgba(239, 68, 68, 0.3);
     }
 
-    .ids-grid {
+    .card-grid-info {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 0.75rem;
-      margin-bottom: 1rem;
-      background: rgba(0, 0, 0, 0.2);
-      padding: 0.75rem;
-      border-radius: 8px;
+      gap: 0.5rem;
       font-size: 0.8rem;
-      border: 1px solid rgba(255, 255, 255, 0.03);
-    }
-
-    .id-item span {
       color: var(--text-muted);
-      margin-right: 0.25rem;
+      margin-bottom: 0.75rem;
     }
 
-    .id-item code {
+    .info-line span {
+      font-weight: 500;
+    }
+
+    .info-line code {
       font-family: 'JetBrains Mono', monospace;
       color: #e4e4e7;
     }
 
-    .payload-section {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 1rem;
-    }
-
-    @media (min-width: 768px) {
-      .payload-section {
-        grid-template-columns: 1fr 1fr;
-      }
-    }
-
-    .payload-box {
+    .card-message-previews {
+      background: rgba(0, 0, 0, 0.2);
+      padding: 0.75rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
       display: flex;
       flex-direction: column;
-      gap: 0.35rem;
+      gap: 0.5rem;
+      border: 1px solid rgba(255, 255, 255, 0.02);
     }
 
-    .payload-label {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      font-weight: 500;
-      text-transform: uppercase;
-      letter-spacing: 0.02em;
-    }
-
-    .payload-content {
-      background: rgba(0, 0, 0, 0.3);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      border-radius: 6px;
-      padding: 0.75rem;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.8rem;
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 180px;
-      overflow-y: auto;
+    .preview-box {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       color: #d4d4d8;
     }
 
-    .error-msg {
-      background: var(--danger-glow);
-      border: 1px solid rgba(239, 68, 68, 0.2);
-      color: var(--danger);
-      padding: 0.75rem;
-      border-radius: 6px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.8rem;
-      margin-top: 1rem;
+    .preview-box strong {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-right: 0.5rem;
     }
 
     .empty-state {
@@ -1567,6 +1603,162 @@ function serveDashboard(req, res) {
       border-radius: 12px;
       background: var(--card-bg);
     }
+
+    /* Estilos del Drawer */
+    .drawer-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(4px);
+      z-index: 999;
+      display: none;
+    }
+    .drawer-overlay.open {
+      display: block;
+    }
+
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 100%;
+      max-width: 650px;
+      height: 100%;
+      background: #09090b;
+      border-left: 1px solid var(--border);
+      box-shadow: -10px 0 35px rgba(0, 0, 0, 0.6);
+      z-index: 1000;
+      transform: translateX(100%);
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      display: flex;
+      flex-direction: column;
+      backdrop-filter: blur(20px);
+    }
+
+    .drawer.open {
+      transform: translateX(0);
+    }
+
+    .drawer-header {
+      padding: 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(20, 20, 25, 0.4);
+    }
+
+    .drawer-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .drawer-close-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 1.75rem;
+      display: flex;
+      align-items: center;
+      transition: color 0.2s;
+    }
+
+    .drawer-close-btn:hover {
+      color: #fff;
+    }
+
+    .drawer-body {
+      padding: 1.5rem;
+      overflow-y: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    .detail-section {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      position: relative;
+    }
+
+    .detail-section-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--primary);
+      margin-bottom: 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .btn-copy {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-copy:hover {
+      background: var(--primary-glow);
+      color: var(--primary);
+      border-color: var(--primary);
+    }
+
+    .detail-pre {
+      background: #040405;
+      border: 1px solid rgba(255, 255, 255, 0.03);
+      padding: 0.75rem;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #e2e2e7;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+
+    .grid-2col {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 0.75rem;
+    }
+
+    .grid-item {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .grid-item span {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+
+    .grid-item div {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: #fff;
+    }
   </style>
 </head>
 <body>
@@ -1574,7 +1766,7 @@ function serveDashboard(req, res) {
   <header>
     <div class="title-area">
       <h1>Helios Hermes Adapter</h1>
-      <p>Panel de Control y Monitoreo en Tiempo Real</p>
+      <p>Panel de Control y Monitoreo de Trazas</p>
     </div>
     <div style="display: flex; align-items: center; gap: 1rem;">
       <div class="status-badge">
@@ -1590,7 +1782,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.4</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.5</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1610,6 +1802,20 @@ function serveDashboard(req, res) {
     </div>
   </div>
 
+  <!-- Barra de Filtros y Búsqueda -->
+  <div class="filter-bar">
+    <div class="search-input-wrapper">
+      <input type="text" id="search-box" class="search-input" placeholder="Buscar por Trace ID, Conv ID, Contact ID..." oninput="applyFiltersAndSearch()">
+    </div>
+    <div class="filter-buttons">
+      <button class="btn active" id="filter-all" onclick="setFilter('all')">Todos</button>
+      <button class="btn" id="filter-ok" onclick="setFilter('ok')">OK</button>
+      <button class="btn" id="filter-started" onclick="setFilter('started')">Procesando</button>
+      <button class="btn" id="filter-handoff" onclick="setFilter('handoff')">Derivados</button>
+      <button class="btn" id="filter-error" onclick="setFilter('error')">Errores</button>
+    </div>
+  </div>
+
   <div class="section-title">
     <span>Historial Reciente (Últimos 50 Requests)</span>
     <div class="controls">
@@ -1622,21 +1828,37 @@ function serveDashboard(req, res) {
     <div class="empty-state">Cargando eventos...</div>
   </div>
 
+  <!-- Estructura del Drawer Lateral -->
+  <div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
+  <div class="drawer" id="drawer">
+    <div class="drawer-header">
+      <div class="drawer-title" id="drawer-title-area">
+        <span>Detalle de Traza</span>
+      </div>
+      <button class="drawer-close-btn" onclick="closeDrawer()">&times;</button>
+    </div>
+    <div class="drawer-body" id="drawer-body-area">
+      <!-- Se llena dinámicamente -->
+    </div>
+  </div>
+
   <script>
     let autoRefresh = true;
     let refreshInterval = null;
+    let currentFilter = 'all';
+    let rawEventsList = [];
 
     const btnAuto = document.getElementById('btn-auto');
     const btnManual = document.getElementById('btn-manual');
     const container = document.getElementById('requests-container');
     const sessionCountEl = document.getElementById('session-count');
     const lastEventTimeEl = document.getElementById('last-event-time');
+    const searchBox = document.getElementById('search-box');
 
     const urlParams = new URLSearchParams(window.location.search);
     const token = urlParams.get('token') || '';
 
     function logout() {
-      // Borrar la cookie y llamar al API de desconexión
       document.cookie = "debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;";
       fetch('/logout').then(() => {
         window.location.href = "/";
@@ -1657,62 +1879,217 @@ function serveDashboard(req, res) {
         if (!res.ok) throw new Error('Error cargando eventos');
         const data = await res.json();
         
-        let events = [];
         if (Array.isArray(data)) {
-          events = data;
+          rawEventsList = data;
         } else if (data && Array.isArray(data.events)) {
-          events = data.events;
+          rawEventsList = data.events;
+        } else {
+          rawEventsList = [];
         }
 
-        if (events.length === 0) {
-          container.innerHTML = '<div class="empty-state">No se han procesado solicitudes todavía. Envía un mensaje desde helios-gateway para ver los logs aquí.</div>';
-          return;
-        }
-
-        const first = events[0];
-        const date = new Date(first.timestamp);
-        lastEventTimeEl.textContent = date.toLocaleTimeString();
-
-        container.innerHTML = events.map(ev => {
-          const statusClass = 'status-' + ev.status;
-          const badgeClass = 'badge-' + ev.status;
-          const formattedDate = new Date(ev.timestamp).toLocaleString();
-          
-          return '<div class="request-card ' + statusClass + '">' +
-            '<div class="card-header">' +
-              '<div class="card-meta">' +
-                '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
-                '<span class="timestamp">' + formattedDate + '</span>' +
-              '</div>' +
-              '<div style="font-size: 0.8rem; color: var(--text-muted);">' +
-                'Trace: <code style="font-family: monospace; color: #fff;">' + (ev.trace_id || 'N/A') + '</code>' +
-              '</div>' +
-            '</div>' +
-            '<div class="ids-grid">' +
-              '<div class="id-item"><span>Conv ID:</span><code>' + (ev.conversation_id || 'N/A') + '</code></div>' +
-              '<div class="id-item"><span>Contact ID:</span><code>' + (ev.contact_id || 'N/A') + '</code></div>' +
-              '<div class="id-item"><span>Tenant:</span><code>' + (ev.tenant_id || 'default') + '</code></div>' +
-              '<div class="id-item"><span>Clinic:</span><code>' + (ev.clinic_id || 'default') + '</code></div>' +
-              '<div class="id-item"><span>Teléfono:</span><code>' + (ev.phone_masked || 'N/A') + '</code></div>' +
-              '<div class="id-item"><span>Sesión:</span><code>' + (ev.hermes_session_id || 'N/A') + '</code></div>' +
-              '<div class="id-item"><span>Stream:</span><code>' + (ev.hermes_stream_id || 'N/A') + '</code></div>' +
-            '</div>' +
-            '<div class="payload-section">' +
-              '<div class="payload-box">' +
-                '<span class="payload-label">Vista Previa Cruda Hermes</span>' +
-                '<div class="payload-content">' + escapeHtml(ev.raw_hermes_preview || '(Vacío)') + '</div>' +
-              '</div>' +
-              '<div class="payload-box">' +
-                '<span class="payload-label">Vista Previa Sanitizada</span>' +
-                '<div class="payload-content" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.final_reply_preview || '(Vacío)') + '</div>' +
-              '</div>' +
-            '</div>' +
-            (ev.error ? '<div class="error-msg"><strong>Error / Intent / Ruta:</strong> ' + escapeHtml(ev.error) + ' | Ruta: ' + escapeHtml(ev.route || '') + ' | Intent: ' + escapeHtml(ev.intent || '') + '</div>' : '') +
-          '</div>';
-        }).join('');
+        applyFiltersAndSearch();
       } catch (err) {
         console.error(err);
       }
+    }
+
+    function setFilter(filterType) {
+      currentFilter = filterType;
+      
+      const buttons = ['all', 'ok', 'started', 'handoff', 'error'];
+      buttons.forEach(b => {
+        const btn = document.getElementById('filter-' + b);
+        if (b === filterType) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
+        }
+      });
+
+      applyFiltersAndSearch();
+    }
+
+    function applyFiltersAndSearch() {
+      const searchTerm = searchBox.value.trim().toLowerCase();
+      
+      let filtered = rawEventsList;
+
+      // Aplicar filtro de estado
+      if (currentFilter !== 'all') {
+        filtered = filtered.filter(ev => ev.status === currentFilter);
+      }
+
+      // Aplicar búsqueda
+      if (searchTerm) {
+        filtered = filtered.filter(ev => {
+          return (ev.trace_id && ev.trace_id.toLowerCase().includes(searchTerm)) ||
+                 (ev.conversation_id && ev.conversation_id.toString().toLowerCase().includes(searchTerm)) ||
+                 (ev.contact_id && ev.contact_id.toString().toLowerCase().includes(searchTerm));
+        });
+      }
+
+      renderList(filtered);
+    }
+
+    function renderList(events) {
+      if (events.length === 0) {
+        container.innerHTML = '<div class="empty-state">No se encontraron eventos con los filtros seleccionados.</div>';
+        return;
+      }
+
+      const date = new Date(rawEventsList[0].timestamp);
+      lastEventTimeEl.textContent = date.toLocaleTimeString();
+
+      container.innerHTML = events.map(ev => {
+        const statusClass = 'status-' + ev.status;
+        const badgeClass = 'badge-' + ev.status;
+        const formattedDate = new Date(ev.timestamp).toLocaleString();
+        const durationText = ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + 'ms' : 'N/A';
+        const traceShort = ev.trace_id ? ev.trace_id.slice(0, 8) + '...' : 'N/A';
+        
+        return '<div class="request-card ' + statusClass + '" onclick="openEventDetail(\'' + ev.id + '\')">' +
+          '<div class="card-header">' +
+            '<div class="card-meta">' +
+              '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
+              '<span class="timestamp">' + formattedDate + '</span>' +
+              '<span class="timestamp" style="color: var(--primary); font-weight: 500;">⏱️ ' + durationText + '</span>' +
+            '</div>' +
+            '<div style="font-size: 0.8rem; color: var(--text-muted);">' +
+              'Trace: <code style="font-family: monospace; color: #fff;">' + traceShort + '</code>' +
+            '</div>' +
+          '</div>' +
+          '<div class="card-grid-info">' +
+            '<div class="info-line">Conv: <code>' + (ev.conversation_id || 'N/A') + '</code></div>' +
+            '<div class="info-line">Contact: <code>' + (ev.contact_id || 'N/A') + '</code></div>' +
+            '<div class="info-line">Tel: <code>' + (ev.phone_masked || 'N/A') + '</code></div>' +
+            '<div class="info-line">Sesión: <code>' + (ev.hermes_session_id ? ev.hermes_session_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
+            '<div class="info-line">Stream: <code>' + (ev.hermes_stream_id ? ev.hermes_stream_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
+          '</div>' +
+          '<div class="card-message-previews">' +
+            '<div class="preview-box"><strong>Entrada:</strong>' + escapeHtml(ev.input_preview || '(Vacío)') + '</div>' +
+            '<div class="preview-box"><strong style="color: #a5b4fc;">Salida:</strong>' + escapeHtml(ev.final_reply_preview || '(Vacío)') + '</div>' +
+          '</div>' +
+          (ev.error ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error) + '</div>' : '') +
+        '</div>';
+      }).join('');
+    }
+
+    function openEventDetail(eventId) {
+      const ev = rawEventsList.find(e => e.id === eventId);
+      if (!ev) return;
+
+      const overlay = document.getElementById('drawer-overlay');
+      const drawer = document.getElementById('drawer');
+      const titleArea = document.getElementById('drawer-title-area');
+      const bodyArea = document.getElementById('drawer-body-area');
+
+      const badgeClass = 'badge-' + ev.status;
+      titleArea.innerHTML = '<span class="badge ' + badgeClass + '">' + ev.status + '</span> <span>Detalle de Traza</span>';
+
+      let bodyHtml = '';
+
+      // A. Resumen Grid
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">A. Resumen de la Traza</div>' +
+        '<div class="grid-2col">' +
+          '<div class="grid-item"><span>Timestamp</span><div>' + new Date(ev.timestamp).toLocaleString() + '</div></div>' +
+          '<div class="grid-item"><span>Trace ID Completo</span><div>' + (ev.trace_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Tenant ID</span><div>' + (ev.tenant_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Clinic ID</span><div>' + (ev.clinic_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Conv ID</span><div>' + (ev.conversation_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Contact ID</span><div>' + (ev.contact_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Teléfono</span><div>' + (ev.phone_masked || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Duración</span><div>' + (ev.duration_ms !== null ? ev.duration_ms + ' ms' : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Ruta</span><div>' + (ev.route || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Intent</span><div>' + (ev.intent || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Requiere Derivación</span><div>' + (ev.requires_handoff ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Sesión Hermes</span><div>' + (ev.hermes_session_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Stream Hermes</span><div>' + (ev.hermes_stream_id || 'N/A') + '</div></div>' +
+        '</div>' +
+      '</div>';
+
+      // B. Entrada Gateway
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>B. Entrada Gateway → Adapter</span>' +
+          '<button class="btn-copy" onclick="copyContent(\'payload-gate\')">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-gate">' + escapeHtml(ev.input_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      // C. Adapter a Hermes
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>C. Adapter → Hermes</span>' +
+          '<button class="btn-copy" onclick="copyContent(\'payload-herm-req\')">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-herm-req">' + escapeHtml(ev.hermes_request_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      // D. Respuesta Cruda Hermes
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>D. Hermes → Adapter / Crudo</span>' +
+          '<button class="btn-copy" onclick="copyContent(\'payload-herm-raw\')">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-herm-raw">' + escapeHtml(ev.raw_hermes_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      // E. Respuesta Sanitizada
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>E. Respuesta Sanitizada</span>' +
+          '<button class="btn-copy" onclick="copyContent(\'payload-sanit\')">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-sanit" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.sanitized_reply || 'N/A') + '</pre>' +
+      '</div>';
+
+      // F. Respuesta enviada al Gateway
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>F. Adapter → Gateway</span>' +
+          '<button class="btn-copy" onclick="copyContent(\'payload-out-gate\')">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-out-gate">' + escapeHtml(ev.adapter_response_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      // G. Errores (si existe)
+      if (ev.status === 'error' || ev.error) {
+        bodyHtml += '<div class="detail-section" style="background: rgba(239, 68, 68, 0.05); border-color: rgba(239, 68, 68, 0.2);">' +
+          '<div class="detail-section-title" style="color: var(--danger);">G. Errores</div>' +
+          '<div class="grid-2col">' +
+            '<div class="grid-item"><span>Mensaje Error</span><div style="color: var(--danger);">' + escapeHtml(ev.error || 'N/A') + '</div></div>' +
+            '<div class="grid-item"><span>Error Type</span><div>' + escapeHtml(ev.error_type || 'N/A') + '</div></div>' +
+            '<div class="grid-item"><span>Timeout Configurado</span><div>' + (ev.timeout_ms ? ev.timeout_ms + ' ms' : 'N/A') + '</div></div>' +
+          '</div>' +
+        '</div>';
+      }
+
+      bodyArea.innerHTML = bodyHtml;
+
+      overlay.classList.add('open');
+      drawer.classList.add('open');
+    }
+
+    function closeDrawer() {
+      document.getElementById('drawer-overlay').classList.remove('open');
+      document.getElementById('drawer').classList.remove('open');
+    }
+
+    function copyContent(elementId) {
+      const text = document.getElementById(elementId).textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector('[onclick="copyContent(\'' + elementId + '\')"]');
+        const origText = btn.textContent;
+        btn.textContent = '¡Copiado!';
+        btn.style.color = 'var(--success)';
+        btn.style.borderColor = 'var(--success)';
+        setTimeout(() => {
+          btn.textContent = origText;
+          btn.style.color = '';
+          btn.style.borderColor = '';
+        }, 1500);
+      });
     }
 
     function escapeHtml(text) {
@@ -1744,7 +2121,7 @@ function serveDashboard(req, res) {
         startInterval();
       } else {
         btnAuto.classList.remove('active');
-        btnAuto.textContent = 'Auto-refrescar: OFF';
+        btnAuto.textContent = 'Auto-refrescar (Apagado)';
         stopInterval();
       }
     });
@@ -1753,6 +2130,7 @@ function serveDashboard(req, res) {
       loadData();
     });
 
+    // Iniciar
     loadData();
     startInterval();
   </script>
@@ -1762,9 +2140,10 @@ function serveDashboard(req, res) {
 
 // Rutas protegidas para servir el Dashboard y los Eventos
 app.get("/", requireDebugAuth, serveDashboard);
-app.get("/debug", requireDebugAuth, serveDashboard);
 
 app.post("/helios/message", async (req, res) => {
+  const startTime = Date.now();
+  const uniqueEventId = crypto.randomUUID();
   const payload = req.body || {};
   
   let normalized;
@@ -1776,6 +2155,7 @@ app.post("/helios/message", async (req, res) => {
 
   // Crear debugEvent al inicio y agregarlo inmediatamente
   const debugEvent = {
+    id: uniqueEventId,
     timestamp: new Date().toISOString(),
     trace_id: normalized.trace_id || "",
     tenant_id: normalized.tenant_id || "",
@@ -1783,15 +2163,66 @@ app.post("/helios/message", async (req, res) => {
     conversation_id: normalized.conversation_id || "",
     contact_id: normalized.contact_id || "",
     phone_masked: maskPhone(normalized.phone),
-    hermes_session_id: "",
-    hermes_stream_id: "",
     status: "started",
-    route: "",
-    intent: "",
-    raw_hermes_preview: "",
-    final_reply_preview: "",
-    error: null
+    route: null,
+    intent: null,
+    hermes_session_id: null,
+    hermes_stream_id: null,
+    requires_handoff: false,
+    duration_ms: null,
+
+    input_preview: normalized.message_text ? normalized.message_text.slice(0, 1000) : "",
+    input_detail: null,
+
+    hermes_request_preview: null,
+    hermes_request_detail: null,
+
+    raw_hermes_preview: null,
+    raw_hermes_detail: null,
+
+    sanitized_reply_preview: null,
+    sanitized_reply: null,
+
+    adapter_response_preview: null,
+    adapter_response_detail: null,
+
+    error: null,
+    error_type: null,
+    timeout_ms: null
   };
+
+  try {
+    const input_detail = {
+      event: normalized.event,
+      tenant_id: normalized.tenant_id,
+      clinic_id: normalized.clinic_id,
+      channel: normalized.channel,
+      conversation: {
+        conversation_id: normalized.conversation_id,
+        contact_id: normalized.contact_id,
+        inbox_id: normalized.inbox_id,
+        phone: maskPhone(normalized.phone)
+      },
+      patient: {
+        profile_exists: normalized.patient?.profile_exists,
+        profile_complete: normalized.patient?.profile_complete,
+        name: normalized.patient?.name,
+        email: normalized.patient?.email ? maskEmail(normalized.patient.email) : undefined
+      },
+      state: normalized.state,
+      message: {
+        text: normalized.message_text,
+        message_count: normalized.message_count,
+        messages: normalized.message_items
+      }
+    };
+    debugEvent.input_detail = JSON.stringify(input_detail, null, 2);
+
+    const messageToHermes = buildHermesMessage(normalized);
+    debugEvent.hermes_request_preview = messageToHermes.slice(0, 1000);
+    debugEvent.hermes_request_detail = messageToHermes;
+  } catch (_) {}
+
   addRecentRequest(debugEvent);
 
   let sessionId = "";
@@ -1810,8 +2241,13 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.route = "handoff";
       debugEvent.intent = "error_configuracion";
       debugEvent.error = errText.slice(0, 500);
+      debugEvent.duration_ms = Date.now() - startTime;
       
-      return res.status(500).json({ ok: false, error: errText });
+      const configErrorResponse = { ok: false, error: errText };
+      debugEvent.adapter_response_preview = JSON.stringify(configErrorResponse).slice(0, 1000);
+      debugEvent.adapter_response_detail = JSON.stringify(configErrorResponse, null, 2);
+
+      return res.status(500).json(configErrorResponse);
     }
 
     const receivedToken = getBearerToken(req);
@@ -1821,8 +2257,13 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.route = "handoff";
       debugEvent.intent = "unauthorized";
       debugEvent.error = errText;
-      
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
+      debugEvent.duration_ms = Date.now() - startTime;
+
+      const authErrorResponse = { ok: false, error: "Unauthorized" };
+      debugEvent.adapter_response_preview = JSON.stringify(authErrorResponse).slice(0, 1000);
+      debugEvent.adapter_response_detail = JSON.stringify(authErrorResponse, null, 2);
+
+      return res.status(401).json(authErrorResponse);
     }
 
     const result = await sendMessageToHermes(payload);
@@ -1843,7 +2284,10 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.route = finalRoute;
       debugEvent.intent = finalIntent;
       debugEvent.error = errorMsg;
+      debugEvent.duration_ms = Date.now() - startTime;
       debugEvent.final_reply_preview = "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.";
+      debugEvent.sanitized_reply_preview = debugEvent.final_reply_preview;
+      debugEvent.sanitized_reply = debugEvent.final_reply_preview;
 
       const conflictResponse = {
         ok: false,
@@ -1864,6 +2308,9 @@ app.post("/helios/message", async (req, res) => {
         }
       };
 
+      debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
+      debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
+
       return res.json(conflictResponse);
     }
 
@@ -1876,11 +2323,19 @@ app.post("/helios/message", async (req, res) => {
     debugEvent.status = finalStatus;
     debugEvent.route = finalRoute;
     debugEvent.intent = finalIntent;
+    debugEvent.requires_handoff = !normalizedResponse.ok;
+    debugEvent.duration_ms = Date.now() - startTime;
     debugEvent.raw_hermes_preview = rawResponseText.slice(0, 1000);
+    debugEvent.raw_hermes_detail = rawResponseText;
+    debugEvent.sanitized_reply_preview = finalReply.slice(0, 1000);
+    debugEvent.sanitized_reply = finalReply;
     debugEvent.final_reply_preview = finalReply.slice(0, 1000);
     if (!normalizedResponse.ok) {
       debugEvent.error = normalizedResponse.intent;
     }
+
+    debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
+    debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
 
     return res.json(normalizedResponse);
 
@@ -1896,9 +2351,16 @@ app.post("/helios/message", async (req, res) => {
     debugEvent.status = finalStatus;
     debugEvent.route = finalRoute;
     debugEvent.intent = finalIntent;
+    debugEvent.requires_handoff = true;
+    debugEvent.duration_ms = Date.now() - startTime;
     debugEvent.error = errorMsg.slice(0, 500);
+    debugEvent.error_type = isAbortError ? "timeout_or_stream_abort" : "exception";
+    debugEvent.timeout_ms = isAbortError ? HERMES_TIMEOUT_MS : null;
     debugEvent.raw_hermes_preview = rawResponseText.slice(0, 1000);
+    debugEvent.raw_hermes_detail = rawResponseText;
     debugEvent.final_reply_preview = "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.";
+    debugEvent.sanitized_reply_preview = debugEvent.final_reply_preview;
+    debugEvent.sanitized_reply = debugEvent.final_reply_preview;
 
     const errorResponse = {
       ok: false,
@@ -1922,10 +2384,13 @@ app.post("/helios/message", async (req, res) => {
       }
     };
 
+    debugEvent.adapter_response_preview = JSON.stringify(errorResponse).slice(0, 1000);
+    debugEvent.adapter_response_detail = JSON.stringify(errorResponse, null, 2);
+
     return res.status(502).json(errorResponse);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.4 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.5 listening on port ${PORT}`);
 });
