@@ -17,6 +17,8 @@ const DEBUG_USERNAME = process.env.DEBUG_USERNAME || "";
 const DEBUG_PASSWORD = process.env.DEBUG_PASSWORD || "";
 const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
+const TOKEN_ESTIMATION_ENABLED = process.env.TOKEN_ESTIMATION_ENABLED === "true";
+const TOKEN_ESTIMATION_CHARS_PER_TOKEN = Number(process.env.TOKEN_ESTIMATION_CHARS_PER_TOKEN || 4);
 
 const sessionSecret = crypto.randomBytes(32).toString('hex');
 
@@ -466,6 +468,140 @@ async function hermesRequest(path, body, retryLogin = true) {
   }
 
   return data;
+}
+
+async function hermesGetRequest(path, retryLogin = true) {
+  if (!hermesCookie) {
+    await hermesLogin();
+  }
+
+  const response = await fetchWithTimeout(`${HERMES_WEBUI_BASE_URL}${path}`, {
+    method: "GET",
+    headers: {
+      cookie: hermesCookie
+    }
+  });
+
+  updateCookieFromResponse(response);
+
+  const text = await response.text();
+
+  if (
+    retryLogin &&
+    (response.status === 401 ||
+      response.status === 403 ||
+      response.status === 302 ||
+      (response.headers.get("location") || "").includes("login"))
+  ) {
+    hermesCookie = "";
+    await hermesLogin();
+    return hermesGetRequest(path, false);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    data = { raw: text };
+  }
+
+  if (!response.ok) {
+    throw createHermesHttpError(path, response, text);
+  }
+
+  return data;
+}
+
+async function fetchHermesSessionData(sessionId) {
+  if (!sessionId) return null;
+  
+  const pathsToTry = [
+    `/api/session?session_id=${encodeURIComponent(sessionId)}`,
+    `/api/session/${encodeURIComponent(sessionId)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}`
+  ];
+
+  for (const path of pathsToTry) {
+    try {
+      const data = await hermesGetRequest(path);
+      if (data && (data.session || data.session_id || data.id)) {
+        return data;
+      }
+    } catch (err) {
+      console.warn(`Falló GET ${path}:`, err.message);
+    }
+  }
+  return null;
+}
+
+function extractTokenUsage(sessionData) {
+  if (!sessionData) return null;
+
+  const s = sessionData.session || sessionData;
+  const tokenUsage = s.token_usage || {};
+  const model = s.model || s.model_id || null;
+  const model_provider = s.model_provider || null;
+
+  const input_tokens = typeof tokenUsage.input_tokens === 'number' ? tokenUsage.input_tokens : 
+                       (typeof tokenUsage.prompt_tokens === 'number' ? tokenUsage.prompt_tokens : null);
+  const output_tokens = typeof tokenUsage.output_tokens === 'number' ? tokenUsage.output_tokens : 
+                        (typeof tokenUsage.completion_tokens === 'number' ? tokenUsage.completion_tokens : null);
+  const total_tokens = typeof tokenUsage.total_tokens === 'number' ? tokenUsage.total_tokens : 
+                       (input_tokens !== null && output_tokens !== null ? input_tokens + output_tokens : null);
+  const cache_read_tokens = typeof tokenUsage.cache_read_tokens === 'number' ? tokenUsage.cache_read_tokens : null;
+  const cache_write_tokens = typeof tokenUsage.cache_write_tokens === 'number' ? tokenUsage.cache_write_tokens : null;
+  const estimated_cost = typeof tokenUsage.estimated_cost === 'number' ? tokenUsage.estimated_cost : null;
+
+  if (input_tokens === null && output_tokens === null) {
+    return null;
+  }
+
+  return {
+    model,
+    model_provider,
+    input_tokens,
+    output_tokens,
+    total_tokens,
+    cache_read_tokens,
+    cache_write_tokens,
+    estimated_cost,
+    token_source: "hermes_session_api",
+    cost_source: estimated_cost !== null ? "hermes_session_api" : "not_calculated"
+  };
+}
+
+function estimateTokensLocally(inputText, outputText) {
+  if (!TOKEN_ESTIMATION_ENABLED) {
+    return {
+      model: null,
+      model_provider: null,
+      input_tokens: null,
+      output_tokens: null,
+      total_tokens: null,
+      cache_read_tokens: null,
+      cache_write_tokens: null,
+      estimated_cost: null,
+      token_source: "not_available_from_hermes",
+      cost_source: "not_available_from_hermes"
+    };
+  }
+
+  const estimated_input_tokens = Math.ceil((inputText || "").length / TOKEN_ESTIMATION_CHARS_PER_TOKEN);
+  const estimated_output_tokens = Math.ceil((outputText || "").length / TOKEN_ESTIMATION_CHARS_PER_TOKEN);
+  const estimated_total_tokens = estimated_input_tokens + estimated_output_tokens;
+
+  return {
+    model: HERMES_MODEL || null,
+    model_provider: HERMES_MODEL_PROVIDER || null,
+    input_tokens: estimated_input_tokens,
+    output_tokens: estimated_output_tokens,
+    total_tokens: estimated_total_tokens,
+    cache_read_tokens: null,
+    cache_write_tokens: null,
+    estimated_cost: null,
+    token_source: "local_estimate_chars_per_token",
+    cost_source: "not_calculated"
+  };
 }
 
 function withOptionalModel(body) {
@@ -928,7 +1064,8 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.5",
+    version: "2.4.6",
+    token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
@@ -1782,7 +1919,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.5</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.6</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1947,12 +2084,18 @@ function serveDashboard(req, res) {
         const durationText = ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + 'ms' : 'N/A';
         const traceShort = ev.trace_id ? ev.trace_id.slice(0, 8) + '...' : 'N/A';
         
+        const usage = ev.token_usage || {};
+        const tokenText = (usage.input_tokens !== null ? usage.input_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (usage.output_tokens !== null ? usage.output_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (usage.total_tokens !== null ? usage.total_tokens.toLocaleString() : 'N/A');
+
         return '<div class="request-card ' + statusClass + '" onclick="openEventDetail(\'' + ev.id + '\')">' +
           '<div class="card-header">' +
             '<div class="card-meta">' +
               '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
               '<span class="timestamp">' + formattedDate + '</span>' +
               '<span class="timestamp" style="color: var(--primary); font-weight: 500;">⏱️ ' + durationText + '</span>' +
+              '<span class="timestamp" style="color: #818cf8; font-weight: 500;">🪙 Tokens: ' + tokenText + '</span>' +
             '</div>' +
             '<div style="font-size: 0.8rem; color: var(--text-muted);">' +
               'Trace: <code style="font-family: monospace; color: #fff;">' + traceShort + '</code>' +
@@ -2005,6 +2148,24 @@ function serveDashboard(req, res) {
           '<div class="grid-item"><span>Requiere Derivación</span><div>' + (ev.requires_handoff ? 'SÍ' : 'NO') + '</div></div>' +
           '<div class="grid-item"><span>Sesión Hermes</span><div>' + (ev.hermes_session_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Stream Hermes</span><div>' + (ev.hermes_stream_id || 'N/A') + '</div></div>' +
+        '</div>' +
+      '</div>';
+
+      // H. Uso de tokens
+      const usage = ev.token_usage || {};
+      bodyHtml += '<div class="detail-section" style="border-color: rgba(99, 102, 241, 0.2);">' +
+        '<div class="detail-section-title" style="color: #818cf8;">H. Uso de Tokens</div>' +
+        '<div class="grid-2col">' +
+          '<div class="grid-item"><span>Modelo</span><div>' + (usage.model || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Model Provider</span><div>' + (usage.model_provider || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Input Tokens</span><div>' + (usage.input_tokens !== null ? usage.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Output Tokens</span><div>' + (usage.output_tokens !== null ? usage.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Total Tokens</span><div>' + (usage.total_tokens !== null ? usage.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Cache Read Tokens</span><div>' + (usage.cache_read_tokens !== null ? usage.cache_read_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Cache Write Tokens</span><div>' + (usage.cache_write_tokens !== null ? usage.cache_write_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Costo Estimado</span><div>' + (usage.estimated_cost !== null ? '$' + usage.estimated_cost.toFixed(6) : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Fuente Medición Tokens</span><div>' + (usage.token_source || 'not_available_from_hermes') + '</div></div>' +
+          '<div class="grid-item"><span>Fuente Medición Costos</span><div>' + (usage.cost_source || 'not_available_from_hermes') + '</div></div>' +
         '</div>' +
       '</div>';
 
@@ -2188,7 +2349,20 @@ app.post("/helios/message", async (req, res) => {
 
     error: null,
     error_type: null,
-    timeout_ms: null
+    timeout_ms: null,
+
+    token_usage: {
+      model: null,
+      model_provider: null,
+      input_tokens: null,
+      output_tokens: null,
+      total_tokens: null,
+      cache_read_tokens: null,
+      cache_write_tokens: null,
+      estimated_cost: null,
+      token_source: "not_available_from_hermes",
+      cost_source: "not_available_from_hermes"
+    }
   };
 
   try {
@@ -2247,6 +2421,9 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.adapter_response_preview = JSON.stringify(configErrorResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(configErrorResponse, null, 2);
 
+      // Calcular tokens localmente si aplica
+      debugEvent.token_usage = estimateTokensLocally(normalized.message_text, "");
+
       return res.status(500).json(configErrorResponse);
     }
 
@@ -2262,6 +2439,9 @@ app.post("/helios/message", async (req, res) => {
       const authErrorResponse = { ok: false, error: "Unauthorized" };
       debugEvent.adapter_response_preview = JSON.stringify(authErrorResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(authErrorResponse, null, 2);
+
+      // Calcular tokens localmente si aplica
+      debugEvent.token_usage = estimateTokensLocally(normalized.message_text, "");
 
       return res.status(401).json(authErrorResponse);
     }
@@ -2311,6 +2491,19 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
 
+      // Consultar tokens finales de Hermes o estimar localmente
+      let tokenUsageData = null;
+      if (sessionId) {
+        try {
+          const sessionData = await fetchHermesSessionData(sessionId);
+          tokenUsageData = extractTokenUsage(sessionData);
+        } catch (_) {}
+      }
+      if (!tokenUsageData) {
+        tokenUsageData = estimateTokensLocally(normalized.message_text, debugEvent.final_reply_preview);
+      }
+      debugEvent.token_usage = tokenUsageData;
+
       return res.json(conflictResponse);
     }
 
@@ -2336,6 +2529,19 @@ app.post("/helios/message", async (req, res) => {
 
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
+
+    // Consultar tokens finales de Hermes o estimar localmente
+    let tokenUsageData = null;
+    if (sessionId) {
+      try {
+        const sessionData = await fetchHermesSessionData(sessionId);
+        tokenUsageData = extractTokenUsage(sessionData);
+      } catch (_) {}
+    }
+    if (!tokenUsageData) {
+      tokenUsageData = estimateTokensLocally(normalized.message_text, finalReply);
+    }
+    debugEvent.token_usage = tokenUsageData;
 
     return res.json(normalizedResponse);
 
@@ -2387,10 +2593,23 @@ app.post("/helios/message", async (req, res) => {
     debugEvent.adapter_response_preview = JSON.stringify(errorResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(errorResponse, null, 2);
 
+    // Consultar tokens finales de Hermes o estimar localmente
+    let tokenUsageData = null;
+    if (sessionId) {
+      try {
+        const sessionData = await fetchHermesSessionData(sessionId);
+        tokenUsageData = extractTokenUsage(sessionData);
+      } catch (_) {}
+    }
+    if (!tokenUsageData) {
+      tokenUsageData = estimateTokensLocally(normalized.message_text, debugEvent.final_reply_preview);
+    }
+    debugEvent.token_usage = tokenUsageData;
+
     return res.status(502).json(errorResponse);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.5 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.6 listening on port ${PORT}`);
 });
