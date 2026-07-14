@@ -583,7 +583,10 @@ function extractTokenUsage(sessionData, attempts = []) {
   const input_tokens = Number.isFinite(session.input_tokens) ? session.input_tokens : null;
   const output_tokens = Number.isFinite(session.output_tokens) ? session.output_tokens : null;
 
-  if (input_tokens === null && output_tokens === null) {
+  const hasInputTokens = typeof input_tokens === 'number' && input_tokens > 0;
+  const hasOutputTokens = typeof output_tokens === 'number' && output_tokens > 0;
+
+  if (!hasInputTokens && !hasOutputTokens) {
     fallback.token_source = "webui_session_no_token_usage";
     fallback.cost_source = "webui_session_no_token_usage";
     return fallback;
