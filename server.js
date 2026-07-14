@@ -523,20 +523,44 @@ async function hermesGetRequest(path, retryLogin = true) {
 }
 
 async function fetchHermesSessionData(sessionId) {
-  if (!sessionId) return null;
-  const path = `/api/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(HERMES_PROFILE)}`;
-  try {
-    const data = await hermesGetRequest(path);
-    if (data && (data.session || data.session_id || data.id)) {
-      return data;
+  if (!sessionId) return { sessionData: null, attempts: [] };
+
+  const pathsToTry = [
+    `/api/session?session_id=${encodeURIComponent(sessionId)}&messages=0&resolve_model=1`,
+    `/api/session?session_id=${encodeURIComponent(sessionId)}&messages=1&resolve_model=1&msg_limit=5`,
+    `/api/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(HERMES_PROFILE)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}`
+  ];
+
+  const attempts = [];
+
+  for (const path of pathsToTry) {
+    try {
+      const data = await hermesGetRequest(path);
+      const isSuccess = data && (data.session || data.session_id || data.id);
+      
+      attempts.push({
+        path,
+        status: 200,
+        found_tokens: Boolean(isSuccess)
+      });
+      
+      if (isSuccess) {
+        return { sessionData: data, attempts };
+      }
+    } catch (err) {
+      console.warn(`Falló GET ${path}:`, err.message);
+      attempts.push({
+        path,
+        status: err.status || 500,
+        found_tokens: false
+      });
     }
-  } catch (err) {
-    console.warn(`Falló GET ${path}:`, err.message);
   }
-  return null;
+  return { sessionData: null, attempts };
 }
 
-function extractTokenUsage(sessionData) {
+function extractTokenUsage(sessionData, attempts = []) {
   const fallback = {
     exact: false,
     model: null,
@@ -548,39 +572,46 @@ function extractTokenUsage(sessionData) {
     cache_write_tokens: null,
     estimated_cost: null,
     token_source: "not_available_from_hermes",
-    cost_source: "not_available_from_hermes"
+    cost_source: "not_available_from_hermes",
+    token_lookup_attempts: attempts
   };
 
   if (!sessionData) return fallback;
 
-  const s = sessionData.session || sessionData;
-  if (!s.token_usage) return fallback;
-
-  const usage = s.token_usage;
-  const input_tokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 
-                       (typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : null);
-  const output_tokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 
-                        (typeof usage.completion_tokens === 'number' ? usage.completion_tokens : null);
+  const session = sessionData.session || sessionData;
+  
+  const input_tokens = Number.isFinite(session.input_tokens) ? session.input_tokens : null;
+  const output_tokens = Number.isFinite(session.output_tokens) ? session.output_tokens : null;
 
   if (input_tokens === null && output_tokens === null) {
+    fallback.token_source = "webui_session_no_token_usage";
+    fallback.cost_source = "webui_session_no_token_usage";
     return fallback;
   }
 
-  const total_tokens = typeof usage.total_tokens === 'number' ? usage.total_tokens : 
-                       (input_tokens !== null && output_tokens !== null ? input_tokens + output_tokens : null);
+  const total_tokens = (input_tokens !== null && output_tokens !== null)
+    ? input_tokens + output_tokens
+    : null;
+
+  const estimated_cost = Number.isFinite(session.estimated_cost)
+    ? session.estimated_cost
+    : Number.isFinite(session.estimated_cost_usd)
+      ? session.estimated_cost_usd
+      : null;
 
   return {
     exact: true,
-    model: s.model || s.model_id || null,
-    model_provider: s.model_provider || null,
+    model: session.model || null,
+    model_provider: session.model_provider || session.billing_provider || null,
     input_tokens,
     output_tokens,
     total_tokens,
-    cache_read_tokens: typeof usage.cache_read_tokens === 'number' ? usage.cache_read_tokens : null,
-    cache_write_tokens: typeof usage.cache_write_tokens === 'number' ? usage.cache_write_tokens : null,
-    estimated_cost: typeof usage.estimated_cost === 'number' ? usage.estimated_cost : null,
-    token_source: "hermes_session_endpoint",
-    cost_source: "hermes_session_endpoint"
+    cache_read_tokens: Number.isFinite(session.cache_read_tokens) ? session.cache_read_tokens : null,
+    cache_write_tokens: Number.isFinite(session.cache_write_tokens) ? session.cache_write_tokens : null,
+    estimated_cost,
+    token_source: "hermes_webui_session_endpoint",
+    cost_source: "hermes_webui_session_endpoint",
+    token_lookup_attempts: attempts
   };
 }
 
@@ -1081,7 +1112,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.11",
+    version: "2.4.12",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1940,7 +1971,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.11</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.12</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -2473,7 +2504,8 @@ app.post("/helios/message", async (req, res) => {
       cache_write_tokens: null,
       estimated_cost: null,
       token_source: "not_available_from_hermes",
-      cost_source: "not_available_from_hermes"
+      cost_source: "not_available_from_hermes",
+      token_lookup_attempts: []
     }
   };
 
@@ -2605,8 +2637,8 @@ app.post("/helios/message", async (req, res) => {
       // Consultar tokens exactos de Hermes
       if (sessionId) {
         try {
-          const sessionData = await fetchHermesSessionData(sessionId);
-          debugEvent.token_usage = extractTokenUsage(sessionData);
+          const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+          debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
         } catch (_) {}
       }
 
@@ -2648,8 +2680,8 @@ app.post("/helios/message", async (req, res) => {
     // Consultar tokens exactos de Hermes
     if (sessionId) {
       try {
-        const sessionData = await fetchHermesSessionData(sessionId);
-        debugEvent.token_usage = extractTokenUsage(sessionData);
+        const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+        debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
       } catch (_) {}
     }
 
@@ -2715,8 +2747,8 @@ app.post("/helios/message", async (req, res) => {
     // Consultar tokens exactos de Hermes
     if (sessionId) {
       try {
-        const sessionData = await fetchHermesSessionData(sessionId);
-        debugEvent.token_usage = extractTokenUsage(sessionData);
+        const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+        debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
       } catch (_) {}
     }
 
@@ -2725,5 +2757,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.11 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.12 listening on port ${PORT}`);
 });
