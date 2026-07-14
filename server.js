@@ -1114,7 +1114,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.12",
+    version: "2.4.13",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1973,7 +1973,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.12</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.13</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -2223,7 +2223,7 @@ function serveDashboard(req, res) {
                           (usage.output_tokens !== null ? usage.output_tokens.toLocaleString() : 'N/A') + ' / ' +
                           (usage.total_tokens !== null ? usage.total_tokens.toLocaleString() : 'N/A');
 
-        return '<div class="request-card ' + statusClass + '" onclick="openEventDetail(\'' + ev.id + '\')">' +
+        return '<div class="request-card ' + statusClass + '" data-id="' + escapeHtml(ev.id) + '">' +
           '<div class="card-header">' +
             '<div class="card-meta">' +
               '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
@@ -2312,7 +2312,7 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>B. Entrada Gateway → Adapter</span>' +
-          '<button class="btn-copy" onclick="copyContent(\'payload-gate\')">Copiar</button>' +
+          '<button class="btn-copy" data-copy="payload-gate">Copiar</button>' +
         '</div>' +
         '<pre class="detail-pre" id="payload-gate">' + escapeHtml(ev.input_detail || 'N/A') + '</pre>' +
       '</div>';
@@ -2321,7 +2321,7 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>C. Adapter → Hermes</span>' +
-          '<button class="btn-copy" onclick="copyContent(\'payload-herm-req\')">Copiar</button>' +
+          '<button class="btn-copy" data-copy="payload-herm-req">Copiar</button>' +
         '</div>' +
         '<pre class="detail-pre" id="payload-herm-req">' + escapeHtml(ev.hermes_request_detail || 'N/A') + '</pre>' +
       '</div>';
@@ -2330,7 +2330,7 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>D. Hermes → Adapter / Crudo</span>' +
-          '<button class="btn-copy" onclick="copyContent(\'payload-herm-raw\')">Copiar</button>' +
+          '<button class="btn-copy" data-copy="payload-herm-raw">Copiar</button>' +
         '</div>' +
         '<pre class="detail-pre" id="payload-herm-raw">' + escapeHtml(ev.raw_hermes_detail || 'N/A') + '</pre>' +
       '</div>';
@@ -2339,7 +2339,7 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>E. Respuesta Sanitizada</span>' +
-          '<button class="btn-copy" onclick="copyContent(\'payload-sanit\')">Copiar</button>' +
+          '<button class="btn-copy" data-copy="payload-sanit">Copiar</button>' +
         '</div>' +
         '<pre class="detail-pre" id="payload-sanit" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.sanitized_reply || 'N/A') + '</pre>' +
       '</div>';
@@ -2348,7 +2348,7 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>F. Adapter → Gateway</span>' +
-          '<button class="btn-copy" onclick="copyContent(\'payload-out-gate\')">Copiar</button>' +
+          '<button class="btn-copy" data-copy="payload-out-gate">Copiar</button>' +
         '</div>' +
         '<pre class="detail-pre" id="payload-out-gate">' + escapeHtml(ev.adapter_response_detail || 'N/A') + '</pre>' +
       '</div>';
@@ -2379,7 +2379,8 @@ function serveDashboard(req, res) {
     function copyContent(elementId) {
       const text = document.getElementById(elementId).textContent;
       navigator.clipboard.writeText(text).then(() => {
-        const btn = document.querySelector('[onclick="copyContent(\'' + elementId + '\')"]');
+        const btn = document.querySelector('[data-copy="' + elementId + '"]');
+        if (!btn) return;
         const origText = btn.textContent;
         btn.textContent = '¡Copiado!';
         btn.style.color = 'var(--success)';
@@ -2391,6 +2392,21 @@ function serveDashboard(req, res) {
         }, 1500);
       });
     }
+
+    // Delegation global para clicks
+    document.addEventListener('click', function(e) {
+      // Click en tarjeta
+      const card = e.target.closest('.request-card');
+      if (card && card.dataset.id) {
+        openEventDetail(card.dataset.id);
+      }
+      
+      // Click en copiar
+      const copyBtn = e.target.closest('.btn-copy');
+      if (copyBtn && copyBtn.dataset.copy) {
+        copyContent(copyBtn.dataset.copy);
+      }
+    });
 
     function escapeHtml(text) {
       if (!text) return '';
@@ -2759,5 +2775,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.12 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.13 listening on port ${PORT}`);
 });
