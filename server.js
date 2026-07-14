@@ -64,6 +64,16 @@ function addRecentRequest(reqData) {
   if (recentRequests.length > 50) {
     recentRequests.length = 50;
   }
+  // Log seguro para trazabilidad (sin secretos)
+  try {
+    console.log(JSON.stringify({
+      event: "debug_event_recorded",
+      trace_id: reqData.trace_id || null,
+      conversation_id: reqData.conversation_id || null,
+      status: reqData.status || null,
+      recent_count: recentRequests.length
+    }));
+  } catch (_) {}
 }
 
 function loadSessionMap() {
@@ -1101,7 +1111,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.8",
+    version: "2.4.9",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1397,10 +1407,16 @@ function serveLoginPage(req, res) {
 }
 // Endpoint para el historial de eventos recientes en JSON
 app.get("/debug/events", requireDebugAuth, (req, res) => {
-  res.json({
-    events: recentRequests,
-    count: recentRequests.length
-  });
+  try {
+    res.setHeader("Content-Type", "application/json");
+    res.json({
+      count: recentRequests.length,
+      events: recentRequests
+    });
+  } catch (err) {
+    console.error("Error en /debug/events:", err.message);
+    res.status(500).json({ error: true, message: err.message || "Error interno" });
+  }
 });
 
 // Servir Dashboard HTML común
@@ -1956,7 +1972,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.8</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.9</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -1998,8 +2014,11 @@ function serveDashboard(req, res) {
     </div>
   </div>
 
+  <!-- Panel de diagnóstico pequeño -->
+  <div id="diag-panel" style="margin: 0 0 1rem 0; padding: 0.75rem 1rem; background: rgba(20,20,25,0.4); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; font-family: 'JetBrains Mono', monospace;"></div>
+
   <div class="requests-list" id="requests-container">
-    <div class="empty-state">Cargando eventos...</div>
+    <div class="empty-state" id="initial-loading-msg">Iniciando carga de eventos...</div>
   </div>
 
   <!-- Estructura del Drawer Lateral -->
@@ -2021,6 +2040,11 @@ function serveDashboard(req, res) {
     let refreshInterval = null;
     let currentFilter = 'all';
     let rawEventsList = [];
+    let lastLoadStatus = null;
+    let lastLoadTime = null;
+    let lastLoadCount = 0;
+    let lastLoadError = null;
+    let firstLoadDone = false;
 
     const btnAuto = document.getElementById('btn-auto');
     const btnManual = document.getElementById('btn-manual');
@@ -2033,55 +2057,105 @@ function serveDashboard(req, res) {
     const token = urlParams.get('token') || '';
 
     function logout() {
-      document.cookie = "debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;";
-      fetch('/logout').then(() => {
-        window.location.href = "/";
+      // Limpiar cookie de sesión
+      document.cookie = 'debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax';
+      document.cookie = 'debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Strict';
+      // Intentar logout en servidor
+      fetch('/logout', { credentials: 'include' }).catch(() => {}).finally(() => {
+        // Redirigir a login forzando recarga
+        window.location.replace('/');
       });
     }
 
+    function showDiagnosticPanel() {
+      const panel = document.getElementById('diag-panel');
+      if (!panel) return;
+      const ts = lastLoadTime ? new Date(lastLoadTime).toLocaleTimeString() : 'N/A';
+      panel.innerHTML =
+        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Diagnóstico</strong>' +
+        '<div style="margin-top: 0.4rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem 1rem; font-size: 0.8rem;">' +
+          '<span style="color: var(--text-muted);">Ultima carga:</span><span>' + ts + '</span>' +
+          '<span style="color: var(--text-muted);">HTTP Status:</span><span style="color: ' + (lastLoadStatus === 200 ? 'var(--success)' : 'var(--danger)') + '">' + (lastLoadStatus || 'N/A') + '</span>' +
+          '<span style="color: var(--text-muted);">Eventos recibidos:</span><span>' + lastLoadCount + '</span>' +
+          '<span style="color: var(--text-muted);">Error:</span><span style="color: var(--danger);">' + (lastLoadError || 'Ninguno') + '</span>' +
+        '</div>';
+    }
+
     async function loadData() {
+      lastLoadError = null;
       try {
         const queryParam = token ? '?token=' + encodeURIComponent(token) : '';
-        
-        const healthRes = await fetch('/health' + queryParam);
-        if (healthRes.ok) {
-          const healthData = await healthRes.json();
-          sessionCountEl.textContent = healthData.session_count || 0;
-        }
 
-        const res = await fetch('/debug/events' + queryParam, { credentials: 'include' });
-        if (res.status === 401 || res.status === 403 || res.status === 500) {
-          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
-            'Error cargando eventos: HTTP ' + res.status +
-            '</div>';
+        // Actualizar contador de sesiones del health check
+        try {
+          const healthRes = await fetch('/health', { credentials: 'include' });
+          if (healthRes.ok) {
+            const healthData = await healthRes.json();
+            sessionCountEl.textContent = healthData.session_count || 0;
+          }
+        } catch (_) {}
+
+        const eventsUrl = '/debug/events' + queryParam;
+        const res = await fetch(eventsUrl, { credentials: 'include' });
+
+        lastLoadStatus = res.status;
+        lastLoadTime = Date.now();
+
+        if (res.status === 401) {
+          lastLoadError = 'No autorizado (401)';
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">No autorizado para cargar eventos. Vuelve a iniciar sesión.</div>';
+          showDiagnosticPanel();
           return;
         }
-
+        if (res.status === 403) {
+          lastLoadError = 'Acceso denegado (403)';
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">Acceso denegado para cargar eventos.</div>';
+          showDiagnosticPanel();
+          return;
+        }
+        if (res.status === 500) {
+          lastLoadError = 'Error interno del servidor (500)';
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">Error interno cargando eventos (500).</div>';
+          showDiagnosticPanel();
+          return;
+        }
         if (!res.ok) {
+          lastLoadError = 'HTTP ' + res.status;
           throw new Error('HTTP ' + res.status);
         }
 
-        const contentType = res.headers.get("content-type") || "";
-        if (!contentType.includes("application/json")) {
-          throw new Error('La respuesta no es JSON válido');
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          lastLoadError = 'Respuesta no es JSON (content-type: ' + contentType + ')';
+          throw new Error('Respuesta inválida de /debug/events: no es JSON');
         }
 
         const data = await res.json();
-        
-        if (Array.isArray(data)) {
-          rawEventsList = data;
-        } else if (data && Array.isArray(data.events)) {
-          rawEventsList = data.events;
-        } else {
-          rawEventsList = [];
+        if (data && data.error) {
+          lastLoadError = data.message || 'Error desconocido del servidor';
+          throw new Error(lastLoadError);
         }
 
+        let events = [];
+        if (Array.isArray(data)) {
+          events = data;
+        } else if (data && Array.isArray(data.events)) {
+          events = data.events;
+        }
+
+        rawEventsList = events;
+        lastLoadCount = events.length;
+        firstLoadDone = true;
+        showDiagnosticPanel();
         applyFiltersAndSearch();
       } catch (err) {
-        console.error(err);
-        container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
-          'Error cargando eventos: ' + err.message +
-          '</div>';
+        console.error('[dashboard] Error cargando eventos:', err.message);
+        lastLoadError = err.message;
+        lastLoadTime = Date.now();
+        showDiagnosticPanel();
+        if (!firstLoadDone) {
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">Error cargando eventos: ' + escapeHtml(err.message) + '</div>';
+        }
       }
     }
 
@@ -2125,7 +2199,11 @@ function serveDashboard(req, res) {
 
     function renderList(events) {
       if (events.length === 0) {
-        container.innerHTML = '<div class="empty-state">No se encontraron eventos con los filtros seleccionados.</div>';
+        if (!firstLoadDone) {
+          container.innerHTML = '<div class="empty-state">No se encontraron eventos todavía. El adapter responderá aquí cuando procese mensajes.</div>';
+        } else {
+          container.innerHTML = '<div class="empty-state">No hay eventos con los filtros seleccionados.</div>';
+        }
         return;
       }
 
@@ -2698,5 +2776,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.8 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.9 listening on port ${PORT}`);
 });
