@@ -976,7 +976,6 @@ function containsInternalReasoning(text) {
     "esta simulación",
     "esta simulacion",
     "voy a intentar",
-    "el token de ghl",
     "perfil está incompleto",
     "perfil esta incompleto"
   ];
