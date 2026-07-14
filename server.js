@@ -960,47 +960,56 @@ function containsInternalReasoning(text) {
     "no tengo acceso directo",
     "no tengo conectado",
     "esta simulación",
-    "esta simulacion"
+    "esta simulacion",
+    "voy a intentar",
+    "el token de ghl",
+    "perfil está incompleto",
+    "perfil esta incompleto"
   ];
   return patterns.some(pattern => lowerText.includes(pattern));
 }
 
-function sanitizePatientReply(text) {
+function extractLastPatientFacingReply(text) {
   if (!text) return "";
 
   // 1. Quitar bloques de pensamiento tipo <think>...</think>
   let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  // 2. Si tiene señales de razonamiento interno, forzar la extracción o saneado
-  if (containsInternalReasoning(cleaned)) {
-    const priorityTriggers = [
-      "¡hola", "hola", "buenos días", "buenos dias", "buenas tardes", "buenas noches", "claro", "con gusto", "perfecto", "entiendo", "gracias", "para ayudarte", "te ayudo"
-    ];
+  // Si no tiene razonamiento interno, devolverlo tal cual
+  if (!containsInternalReasoning(cleaned)) {
+    return cleaned;
+  }
 
-    let firstTriggerIndex = -1;
-    const lowercaseCleaned = cleaned.toLowerCase();
+  const priorityTriggers = [
+    "¡hola", "hola,", "hola ", "buenos días", "buenos dias", "buenas tardes", "buenas noches", "claro", "con gusto", "perfecto", "entiendo", "gracias", "para ayudarte", "te ayudo", "me alegra"
+  ];
 
-    for (const trigger of priorityTriggers) {
-      const index = lowercaseCleaned.indexOf(trigger);
-      if (index !== -1) {
-        if (firstTriggerIndex === -1 || index < firstTriggerIndex) {
-          firstTriggerIndex = index;
-        }
-      }
-    }
+  const lowercaseCleaned = cleaned.toLowerCase();
+  const candidates = [];
 
-    if (firstTriggerIndex !== -1) {
-      cleaned = cleaned.substring(firstTriggerIndex).trim();
-    } else {
-      return "";
+  for (const trigger of priorityTriggers) {
+    let pos = lowercaseCleaned.indexOf(trigger);
+    while (pos !== -1) {
+      candidates.push(pos);
+      pos = lowercaseCleaned.indexOf(trigger, pos + 1);
     }
   }
 
-  if (containsInternalReasoning(cleaned)) {
-    return "";
+  candidates.sort((a, b) => a - b);
+
+  for (const index of candidates) {
+    const substring = cleaned.substring(index).trim();
+    if (!containsInternalReasoning(substring) && substring.length >= 5) {
+      return substring;
+    }
   }
 
-  return cleaned;
+  return "";
+}
+
+function sanitizePatientReply(text) {
+  if (!text) return "";
+  return extractLastPatientFacingReply(text);
 }
 
 function normalizeAdapterResponse(result) {
@@ -1092,7 +1101,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.7",
+    version: "2.4.8",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1947,7 +1956,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.7</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.8</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -2041,15 +2050,20 @@ function serveDashboard(req, res) {
         }
 
         const res = await fetch('/debug/events' + queryParam, { credentials: 'include' });
-        if (res.status === 401 || res.status === 403) {
+        if (res.status === 401 || res.status === 403 || res.status === 500) {
           container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
-            'No autorizado para cargar eventos. Vuelve a iniciar sesión.' +
+            'Error cargando eventos: HTTP ' + res.status +
             '</div>';
           return;
         }
 
         if (!res.ok) {
-          throw new Error('Error cargando eventos');
+          throw new Error('HTTP ' + res.status);
+        }
+
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+          throw new Error('La respuesta no es JSON válido');
         }
 
         const data = await res.json();
@@ -2066,7 +2080,7 @@ function serveDashboard(req, res) {
       } catch (err) {
         console.error(err);
         container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
-          'Error cargando eventos' +
+          'Error cargando eventos: ' + err.message +
           '</div>';
       }
     }
@@ -2187,8 +2201,10 @@ function serveDashboard(req, res) {
           '<div class="grid-item"><span>Ruta</span><div>' + (ev.route || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Intent</span><div>' + (ev.intent || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Requiere Derivación</span><div>' + (ev.requires_handoff ? 'SÍ' : 'NO') + '</div></div>' +
-          '<div class="grid-item"><span>Razonamiento Interno Detectado</span><div>' + (ev.internal_reasoning_detected ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Razonamiento Detectado</span><div>' + (ev.internal_reasoning_detected ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Respuesta Extraída</span><div>' + (ev.patient_reply_extracted ? 'SÍ' : 'NO') + '</div></div>' +
           '<div class="grid-item"><span>Razonamiento Bloqueado</span><div>' + (ev.blocked_internal_reasoning ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Estrategia Extracción</span><div>' + (ev.extraction_strategy || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Sesión Hermes</span><div>' + (ev.hermes_session_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Stream Hermes</span><div>' + (ev.hermes_stream_id || 'N/A') + '</div></div>' +
         '</div>' +
@@ -2395,7 +2411,9 @@ app.post("/helios/message", async (req, res) => {
     timeout_ms: null,
 
     internal_reasoning_detected: false,
+    patient_reply_extracted: false,
     blocked_internal_reasoning: false,
+    extraction_strategy: null,
  
     token_usage: {
       model: null,
@@ -2535,7 +2553,9 @@ app.post("/helios/message", async (req, res) => {
       };
 
       debugEvent.internal_reasoning_detected = false;
+      debugEvent.patient_reply_extracted = false;
       debugEvent.blocked_internal_reasoning = false;
+      debugEvent.extraction_strategy = null;
 
       debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
@@ -2576,8 +2596,14 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.error = normalizedResponse.intent;
     }
 
-    debugEvent.internal_reasoning_detected = containsInternalReasoning(rawResponseText);
-    debugEvent.blocked_internal_reasoning = containsInternalReasoning(rawResponseText) && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
+    const hasReasoning = containsInternalReasoning(rawResponseText);
+    const wasBlocked = hasReasoning && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
+    const wasExtracted = hasReasoning && !wasBlocked && finalReply.length > 0;
+
+    debugEvent.internal_reasoning_detected = hasReasoning;
+    debugEvent.patient_reply_extracted = wasExtracted;
+    debugEvent.blocked_internal_reasoning = wasBlocked;
+    debugEvent.extraction_strategy = "last_patient_facing_start";
 
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
@@ -2642,8 +2668,14 @@ app.post("/helios/message", async (req, res) => {
       }
     };
 
-    debugEvent.internal_reasoning_detected = containsInternalReasoning(rawResponseText);
-    debugEvent.blocked_internal_reasoning = containsInternalReasoning(rawResponseText) && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
+    const hasReasoningErr = containsInternalReasoning(rawResponseText);
+    const wasBlockedErr = hasReasoningErr && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
+    const wasExtractedErr = hasReasoningErr && !wasBlockedErr && finalReply.length > 0;
+
+    debugEvent.internal_reasoning_detected = hasReasoningErr;
+    debugEvent.patient_reply_extracted = wasExtractedErr;
+    debugEvent.blocked_internal_reasoning = wasBlockedErr;
+    debugEvent.extraction_strategy = "last_patient_facing_start";
 
     debugEvent.adapter_response_preview = JSON.stringify(errorResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(errorResponse, null, 2);
@@ -2666,5 +2698,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.7 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.8 listening on port ${PORT}`);
 });
