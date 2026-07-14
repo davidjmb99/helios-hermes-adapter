@@ -924,83 +924,89 @@ async function sendMessageToHermes(payload) {
   };
 }
 
+function containsInternalReasoning(text) {
+  if (!text) return false;
+  const lowerText = text.toLowerCase();
+  const patterns = [
+    "estado:",
+    "**estado:**",
+    "siguiendo el flujo interno",
+    "validar estado",
+    "señales",
+    "clasificar intención",
+    "clasificar intencion",
+    "consultar rag",
+    "rag/tools",
+    "responder",
+    "ai enabled",
+    "handoff humano",
+    "kill switch",
+    "status:",
+    "perfil:",
+    "**perfil:**",
+    "clínica:",
+    "clinica:",
+    "**clínica:**",
+    "**clinica:**",
+    "no hay herramienta",
+    "herramienta de agenda",
+    "base de conocimiento",
+    "flujo interno",
+    "debo responder",
+    "la respuesta debe",
+    "voy a procesar",
+    "el paciente",
+    "detecto que",
+    "no tengo acceso directo",
+    "no tengo conectado",
+    "esta simulación",
+    "esta simulacion"
+  ];
+  return patterns.some(pattern => lowerText.includes(pattern));
+}
+
 function sanitizePatientReply(text) {
   if (!text) return "";
 
   // 1. Quitar bloques de pensamiento tipo <think>...</think>
-  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-  // 2. Separar por líneas para analizar mejor
-  let lines = cleaned.split(/\r?\n/);
-  let filteredLines = [];
+  // 2. Si tiene señales de razonamiento interno, forzar la extracción o saneado
+  if (containsInternalReasoning(cleaned)) {
+    const priorityTriggers = [
+      "¡hola", "hola", "buenos días", "buenos dias", "buenas tardes", "buenas noches", "claro", "con gusto", "perfecto", "entiendo", "gracias", "para ayudarte", "te ayudo"
+    ];
 
-  // Frases prohibidas / patrones de ruido interno (insensibles a mayúsculas)
-  const forbiddenPatterns = [
-    /^\s*bueno,\s*empecemos/i,
-    /^\s*el\s+paciente\s+ha/i,
-    /^\s*voy\s+a\s+responder/i,
-    /^\s*ahora\s+mismo\s+no\s+tengo\s+conectado/i,
-    /^\s*responder[eé]\s+directamente\s+como\s+helios/i
-  ];
+    let firstTriggerIndex = -1;
+    const lowercaseCleaned = cleaned.toLowerCase();
 
-  for (let line of lines) {
-    let trimmedLine = line.trim();
-    if (!trimmedLine) continue;
-
-    // Verificar si la línea coincide con algún patrón prohibido
-    let matchForbidden = false;
-    for (const pattern of forbiddenPatterns) {
-      if (pattern.test(trimmedLine)) {
-        matchForbidden = true;
-        break;
+    for (const trigger of priorityTriggers) {
+      const index = lowercaseCleaned.indexOf(trigger);
+      if (index !== -1) {
+        if (firstTriggerIndex === -1 || index < firstTriggerIndex) {
+          firstTriggerIndex = index;
+        }
       }
     }
 
-    if (!matchForbidden) {
-      // Limpiar frases específicas dentro de la línea
-      let cleanedLine = trimmedLine;
-      cleanedLine = cleanedLine.replace(/bueno,\s*empecemos\.?\s*/gi, "");
-      cleanedLine = cleanedLine.replace(/el\s+paciente\s+ha\s+[^.!?]*[.!?]\s*/gi, "");
-      cleanedLine = cleanedLine.replace(/voy\s+a\s+responder\s+[^.!?]*[.!?]\s*/gi, "");
-      cleanedLine = cleanedLine.replace(/ahora\s+mismo\s+no\s+tengo\s+conectado[^.!?]*[.!?]\s*/gi, "");
-      cleanedLine = cleanedLine.replace(/responder[eé]\s+directamente\s+como\s+helios\.?\s*/gi, "");
-      
-      if (cleanedLine.trim()) {
-        filteredLines.push(cleanedLine.trim());
-      }
+    if (firstTriggerIndex !== -1) {
+      cleaned = cleaned.substring(firstTriggerIndex).trim();
+    } else {
+      return "";
     }
   }
 
-  let finalCandidate = filteredLines.join("\n").trim();
-
-  // 3. Priorizar contenido que empiece con saludos o frases clave
-  const priorityTriggers = [
-    "¡hola", "hola", "buenas tardes", "buenos días", "buenas noches", "claro", "con gusto", "para ayudarte"
-  ];
-
-  let firstTriggerIndex = -1;
-  const lowercaseCandidate = finalCandidate.toLowerCase();
-
-  for (const trigger of priorityTriggers) {
-    const index = lowercaseCandidate.indexOf(trigger);
-    if (index !== -1) {
-      if (firstTriggerIndex === -1 || index < firstTriggerIndex) {
-        firstTriggerIndex = index;
-      }
-    }
+  if (containsInternalReasoning(cleaned)) {
+    return "";
   }
 
-  if (firstTriggerIndex !== -1) {
-    finalCandidate = finalCandidate.substring(firstTriggerIndex).trim();
-  }
-
-  return finalCandidate;
+  return cleaned;
 }
 
 function normalizeAdapterResponse(result) {
-  const rawAnswer = result.answer || "";
+  const rawReply = result.answer || "";
   
-  if (isProviderErrorText(rawAnswer)) {
+  if (isProviderErrorText(rawReply)) {
     return {
       ok: false,
       reply:
@@ -1021,9 +1027,31 @@ function normalizeAdapterResponse(result) {
     };
   }
 
-  const reply = sanitizePatientReply(rawAnswer);
+  const sanitizedReply = sanitizePatientReply(rawReply);
 
-  if (!reply) {
+  // Verificar si hay razonamiento interno bloqueado
+  if (containsInternalReasoning(rawReply) && (!sanitizedReply || containsInternalReasoning(sanitizedReply))) {
+    return {
+      ok: false,
+      reply:
+        "Ahora mismo no pude generar una respuesta adecuada. Te voy a derivar con el equipo para ayudarte mejor.",
+      route: "handoff",
+      intent: "internal_reasoning_blocked",
+      requires_handoff: true,
+      tool_calls: [],
+      case_tracking: {
+        requires_case_tracking: true,
+        reason: "internal_reasoning_blocked"
+      },
+      metadata: {
+        profile: HERMES_PROFILE,
+        hermes_session_id: result.sessionId,
+        internal_reasoning_blocked: true
+      }
+    };
+  }
+
+  if (!sanitizedReply) {
     return {
       ok: false,
       reply:
@@ -1045,7 +1073,7 @@ function normalizeAdapterResponse(result) {
 
   return {
     ok: true,
-    reply: reply,
+    reply: sanitizedReply,
     route: "hermes",
     intent: "respuesta_hermes",
     requires_handoff: false,
@@ -1064,7 +1092,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.6",
+    version: "2.4.7",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1919,7 +1947,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.6</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.7</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -2012,8 +2040,18 @@ function serveDashboard(req, res) {
           sessionCountEl.textContent = healthData.session_count || 0;
         }
 
-        const res = await fetch('/debug/events' + queryParam);
-        if (!res.ok) throw new Error('Error cargando eventos');
+        const res = await fetch('/debug/events' + queryParam, { credentials: 'include' });
+        if (res.status === 401 || res.status === 403) {
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
+            'No autorizado para cargar eventos. Vuelve a iniciar sesión.' +
+            '</div>';
+          return;
+        }
+
+        if (!res.ok) {
+          throw new Error('Error cargando eventos');
+        }
+
         const data = await res.json();
         
         if (Array.isArray(data)) {
@@ -2027,6 +2065,9 @@ function serveDashboard(req, res) {
         applyFiltersAndSearch();
       } catch (err) {
         console.error(err);
+        container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239, 68, 68, 0.2); background: rgba(239, 68, 68, 0.05);">' +
+          'Error cargando eventos' +
+          '</div>';
       }
     }
 
@@ -2146,6 +2187,8 @@ function serveDashboard(req, res) {
           '<div class="grid-item"><span>Ruta</span><div>' + (ev.route || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Intent</span><div>' + (ev.intent || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Requiere Derivación</span><div>' + (ev.requires_handoff ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Razonamiento Interno Detectado</span><div>' + (ev.internal_reasoning_detected ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Razonamiento Bloqueado</span><div>' + (ev.blocked_internal_reasoning ? 'SÍ' : 'NO') + '</div></div>' +
           '<div class="grid-item"><span>Sesión Hermes</span><div>' + (ev.hermes_session_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Stream Hermes</span><div>' + (ev.hermes_stream_id || 'N/A') + '</div></div>' +
         '</div>' +
@@ -2351,6 +2394,9 @@ app.post("/helios/message", async (req, res) => {
     error_type: null,
     timeout_ms: null,
 
+    internal_reasoning_detected: false,
+    blocked_internal_reasoning: false,
+ 
     token_usage: {
       model: null,
       model_provider: null,
@@ -2488,6 +2534,9 @@ app.post("/helios/message", async (req, res) => {
         }
       };
 
+      debugEvent.internal_reasoning_detected = false;
+      debugEvent.blocked_internal_reasoning = false;
+
       debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
 
@@ -2526,6 +2575,9 @@ app.post("/helios/message", async (req, res) => {
     if (!normalizedResponse.ok) {
       debugEvent.error = normalizedResponse.intent;
     }
+
+    debugEvent.internal_reasoning_detected = containsInternalReasoning(rawResponseText);
+    debugEvent.blocked_internal_reasoning = containsInternalReasoning(rawResponseText) && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
 
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
@@ -2590,6 +2642,9 @@ app.post("/helios/message", async (req, res) => {
       }
     };
 
+    debugEvent.internal_reasoning_detected = containsInternalReasoning(rawResponseText);
+    debugEvent.blocked_internal_reasoning = containsInternalReasoning(rawResponseText) && (!finalReply || containsInternalReasoning(finalReply) || finalIntent === "internal_reasoning_blocked");
+
     debugEvent.adapter_response_preview = JSON.stringify(errorResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(errorResponse, null, 2);
 
@@ -2611,5 +2666,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.6 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.7 listening on port ${PORT}`);
 });
