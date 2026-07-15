@@ -1114,7 +1114,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.13",
+    version: "2.4.14",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: "HERMES_WEBUI_STREAM_API",
@@ -1140,8 +1140,8 @@ app.post("/login", (req, res) => {
       .update(`${DEBUG_USERNAME}:${DEBUG_PASSWORD}`)
       .digest('hex');
     
-    const isProd = NODE_ENV === "production";
-    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isProd ? "Secure;" : ""} SameSite=Lax; Max-Age=86400`);
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=864000`);
     
     return res.json({ ok: true });
   }
@@ -1973,7 +1973,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.13</div>
+      <div class="stat-value" style="color: var(--primary);">2.4.14</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -2036,16 +2036,18 @@ function serveDashboard(req, res) {
     </div>
   </div>
 
-  <script>
+<script>
     let autoRefresh = true;
     let refreshInterval = null;
     let currentFilter = 'all';
     let rawEventsList = [];
+    let lastEventsJson = '';
+    let currentOpenEventId = null;
+    let firstLoadDone = false;
     let lastLoadStatus = null;
     let lastLoadTime = null;
     let lastLoadCount = 0;
     let lastLoadError = null;
-    let firstLoadDone = false;
 
     const btnAuto = document.getElementById('btn-auto');
     const btnManual = document.getElementById('btn-manual');
@@ -2058,12 +2060,11 @@ function serveDashboard(req, res) {
     const token = urlParams.get('token') || '';
 
     function logout() {
-      // Limpiar cookie de sesión
-      document.cookie = 'debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax';
-      document.cookie = 'debug_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Strict';
-      // Intentar logout en servidor
+      const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
+      const cookieOptions = isSecure ? '; Path=/; Secure; SameSite=Lax' : '; Path=/; SameSite=Lax';
+      document.cookie = 'debug_token=; Expires=Thu, 01 Jan 1970 00:00:01 GMT' + cookieOptions;
+      
       fetch('/logout', { credentials: 'include' }).catch(() => {}).finally(() => {
-        // Redirigir a login forzando recarga
         window.location.replace('/');
       });
     }
@@ -2087,7 +2088,6 @@ function serveDashboard(req, res) {
       try {
         const queryParam = token ? '?token=' + encodeURIComponent(token) : '';
 
-        // Actualizar contador de sesiones del health check
         try {
           const healthRes = await fetch('/health', { credentials: 'include' });
           if (healthRes.ok) {
@@ -2144,11 +2144,20 @@ function serveDashboard(req, res) {
           events = data.events;
         }
 
-        rawEventsList = events;
+        const newEventsJson = JSON.stringify(events);
         lastLoadCount = events.length;
         firstLoadDone = true;
         showDiagnosticPanel();
-        applyFiltersAndSearch();
+
+        if (lastEventsJson !== newEventsJson) {
+          rawEventsList = events;
+          lastEventsJson = newEventsJson;
+          applyFiltersAndSearch();
+          
+          if (currentOpenEventId && document.getElementById('drawer').classList.contains('open')) {
+            openEventDetail(currentOpenEventId);
+          }
+        }
       } catch (err) {
         console.error('[dashboard] Error cargando eventos:', err.message);
         lastLoadError = err.message;
@@ -2181,12 +2190,10 @@ function serveDashboard(req, res) {
       
       let filtered = rawEventsList;
 
-      // Aplicar filtro de estado
       if (currentFilter !== 'all') {
         filtered = filtered.filter(ev => ev.status === currentFilter);
       }
 
-      // Aplicar búsqueda
       if (searchTerm) {
         filtered = filtered.filter(ev => {
           return (ev.trace_id && ev.trace_id.toLowerCase().includes(searchTerm)) ||
@@ -2251,9 +2258,10 @@ function serveDashboard(req, res) {
       }).join('');
     }
 
-    function openEventDetail(eventId) {
-      const ev = rawEventsList.find(e => e.id === eventId);
+    function openEventDetail(id) {
+      const ev = rawEventsList.find(e => e.id === id);
       if (!ev) return;
+      currentOpenEventId = id;
 
       const overlay = document.getElementById('drawer-overlay');
       const drawer = document.getElementById('drawer');
@@ -2264,8 +2272,6 @@ function serveDashboard(req, res) {
       titleArea.innerHTML = '<span class="badge ' + badgeClass + '">' + ev.status + '</span> <span>Detalle de Traza</span>';
 
       let bodyHtml = '';
-
-      // A. Resumen Grid
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">A. Resumen de la Traza</div>' +
         '<div class="grid-2col">' +
@@ -2289,7 +2295,6 @@ function serveDashboard(req, res) {
         '</div>' +
       '</div>';
 
-      // H. Uso de tokens
       const usage = ev.token_usage || {};
       bodyHtml += '<div class="detail-section" style="border-color: rgba(99, 102, 241, 0.2);">' +
         '<div class="detail-section-title" style="color: #818cf8;">H. Uso de Tokens</div>' +
@@ -2308,7 +2313,6 @@ function serveDashboard(req, res) {
         '</div>' +
       '</div>';
 
-      // B. Entrada Gateway
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>B. Entrada Gateway → Adapter</span>' +
@@ -2317,7 +2321,6 @@ function serveDashboard(req, res) {
         '<pre class="detail-pre" id="payload-gate">' + escapeHtml(ev.input_detail || 'N/A') + '</pre>' +
       '</div>';
 
-      // C. Adapter a Hermes
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>C. Adapter → Hermes</span>' +
@@ -2326,7 +2329,6 @@ function serveDashboard(req, res) {
         '<pre class="detail-pre" id="payload-herm-req">' + escapeHtml(ev.hermes_request_detail || 'N/A') + '</pre>' +
       '</div>';
 
-      // D. Respuesta Cruda Hermes
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>D. Hermes → Adapter / Crudo</span>' +
@@ -2335,7 +2337,6 @@ function serveDashboard(req, res) {
         '<pre class="detail-pre" id="payload-herm-raw">' + escapeHtml(ev.raw_hermes_detail || 'N/A') + '</pre>' +
       '</div>';
 
-      // E. Respuesta Sanitizada
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>E. Respuesta Sanitizada</span>' +
@@ -2344,7 +2345,6 @@ function serveDashboard(req, res) {
         '<pre class="detail-pre" id="payload-sanit" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.sanitized_reply || 'N/A') + '</pre>' +
       '</div>';
 
-      // F. Respuesta enviada al Gateway
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">' +
           '<span>F. Adapter → Gateway</span>' +
@@ -2353,7 +2353,6 @@ function serveDashboard(req, res) {
         '<pre class="detail-pre" id="payload-out-gate">' + escapeHtml(ev.adapter_response_detail || 'N/A') + '</pre>' +
       '</div>';
 
-      // G. Errores (si existe)
       if (ev.status === 'error' || ev.error) {
         bodyHtml += '<div class="detail-section" style="background: rgba(239, 68, 68, 0.05); border-color: rgba(239, 68, 68, 0.2);">' +
           '<div class="detail-section-title" style="color: var(--danger);">G. Errores</div>' +
@@ -2372,8 +2371,9 @@ function serveDashboard(req, res) {
     }
 
     function closeDrawer() {
-      document.getElementById('drawer-overlay').classList.remove('open');
+      currentOpenEventId = null;
       document.getElementById('drawer').classList.remove('open');
+      document.getElementById('drawer-overlay').classList.remove('open');
     }
 
     function copyContent(elementId) {
@@ -2393,15 +2393,11 @@ function serveDashboard(req, res) {
       });
     }
 
-    // Delegation global para clicks
     document.addEventListener('click', function(e) {
-      // Click en tarjeta
       const card = e.target.closest('.request-card');
       if (card && card.dataset.id) {
         openEventDetail(card.dataset.id);
       }
-      
-      // Click en copiar
       const copyBtn = e.target.closest('.btn-copy');
       if (copyBtn && copyBtn.dataset.copy) {
         copyContent(copyBtn.dataset.copy);
@@ -2423,7 +2419,7 @@ function serveDashboard(req, res) {
       if (refreshInterval) clearInterval(refreshInterval);
       refreshInterval = setInterval(loadData, 5000);
     }
-
+    
     function stopInterval() {
       if (refreshInterval) clearInterval(refreshInterval);
       refreshInterval = null;
@@ -2431,14 +2427,15 @@ function serveDashboard(req, res) {
 
     btnAuto.addEventListener('click', () => {
       autoRefresh = !autoRefresh;
-      if (autoRefresh) {
-        btnAuto.classList.add('active');
-        btnAuto.textContent = 'Auto-refrescar (5s)';
-        startInterval();
-      } else {
+      if (!autoRefresh) {
+        stopInterval();
         btnAuto.classList.remove('active');
         btnAuto.textContent = 'Auto-refrescar (Apagado)';
-        stopInterval();
+      } else {
+        startInterval();
+        loadData();
+        btnAuto.classList.add('active');
+        btnAuto.textContent = 'Auto-refrescar (5s)';
       }
     });
 
@@ -2446,11 +2443,13 @@ function serveDashboard(req, res) {
       loadData();
     });
 
-    // Iniciar
+    if (autoRefresh) {
+      btnAuto.classList.add('active');
+      btnAuto.textContent = 'Auto-refrescar (5s)';
+      startInterval();
+    }
+
     loadData();
-    startInterval();
-  </script>
-</body>
 </html>`);
 }
 
@@ -2775,5 +2774,5 @@ app.post("/helios/message", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.13 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.4.14 listening on port ${PORT}`);
 });
