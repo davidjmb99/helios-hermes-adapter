@@ -1544,7 +1544,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     let query = supabase
       .from('helios_adapter_events')
-      .select('id, created_at, trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code')
+      .select('trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code')
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
@@ -2146,8 +2146,8 @@ function serveDashboard(req, res) {
     <div class="filter-buttons">
       <button class="btn active" id="filter-all" onclick="setFilter('all')">Todos</button>
       <button class="btn" id="filter-ok" onclick="setFilter('ok')">OK</button>
-      <button class="btn" id="filter-processing" onclick="setFilter('processing')">Procesando</button>
-      <button class="btn" id="filter-buffered" onclick="setFilter('buffered')">Derivados</button>
+      <button class="btn" id="filter-started" onclick="setFilter('started')">Procesando</button>
+      <button class="btn" id="filter-handoff" onclick="setFilter('handoff')">Derivados</button>
       <button class="btn" id="filter-error" onclick="setFilter('error')">Errores</button>
     </div>
   </div>
@@ -2308,25 +2308,22 @@ function serveDashboard(req, res) {
         lastLoadError = err.message;
         lastLoadTime = Date.now();
         showDiagnosticPanel();
-        container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">Error cargando eventos: ' + escapeHtml(err.message) + '</div>';
-      } finally {
-        const loadingMsg = document.getElementById('initial-loading-msg');
-        if (loadingMsg) loadingMsg.style.display = 'none';
+        if (!firstLoadDone) {
+          container.innerHTML = '<div class="empty-state" style="color: var(--danger); border-color: rgba(239,68,68,0.2); background: rgba(239,68,68,0.05);">Error cargando eventos: ' + escapeHtml(err.message) + '</div>';
+        }
       }
     }
 
     function setFilter(filterType) {
       currentFilter = filterType;
       
-      const buttons = ['all', 'ok', 'processing', 'buffered', 'error'];
+      const buttons = ['all', 'ok', 'started', 'handoff', 'error'];
       buttons.forEach(b => {
         const btn = document.getElementById('filter-' + b);
-        if (btn) {
-          if (b === filterType) {
-            btn.classList.add('active');
-          } else {
-            btn.classList.remove('active');
-          }
+        if (b === filterType) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
         }
       });
 
@@ -2363,26 +2360,20 @@ function serveDashboard(req, res) {
         return;
       }
 
-      if (rawEventsList.length > 0) {
-        const latestEv = rawEventsList[0];
-        const latestTime = latestEv.started_at || latestEv.created_at;
-        if (latestTime) {
-          const date = new Date(latestTime);
-          if (!isNaN(date)) lastEventTimeEl.textContent = date.toLocaleTimeString();
-        }
-      }
+      const date = new Date(rawEventsList[0].timestamp);
+      lastEventTimeEl.textContent = date.toLocaleTimeString();
 
       container.innerHTML = events.map(ev => {
         const statusClass = 'status-' + ev.status;
         const badgeClass = 'badge-' + ev.status;
-        const evTime = ev.started_at || ev.created_at;
-        const formattedDate = evTime ? new Date(evTime).toLocaleString() : 'N/A';
+        const formattedDate = new Date(ev.timestamp).toLocaleString();
         const durationText = ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + 'ms' : 'N/A';
         const traceShort = ev.trace_id ? ev.trace_id.slice(0, 8) + '...' : 'N/A';
         
-        const tokenText = (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
-                          (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + ' / ' +
-                          (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A');
+        const usage = ev.token_usage || {};
+        const tokenText = (usage.input_tokens !== null ? usage.input_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (usage.output_tokens !== null ? usage.output_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (usage.total_tokens !== null ? usage.total_tokens.toLocaleString() : 'N/A');
 
         return '<div class="request-card ' + statusClass + '" data-id="' + escapeHtml(ev.id) + '">' +
           '<div class="card-header">' +
@@ -2403,15 +2394,19 @@ function serveDashboard(req, res) {
             '<div class="info-line">Sesión: <code>' + (ev.hermes_session_id ? ev.hermes_session_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
             '<div class="info-line">Stream: <code>' + (ev.hermes_stream_id ? ev.hermes_stream_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
           '</div>' +
-          (ev.error_code ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error_code) + '</div>' : '') +
+          '<div class="card-message-previews">' +
+            '<div class="preview-box"><strong>Entrada:</strong>' + escapeHtml(ev.input_preview || '(Vacío)') + '</div>' +
+            '<div class="preview-box"><strong style="color: #a5b4fc;">Salida:</strong>' + escapeHtml(ev.final_reply_preview || '(Vacío)') + '</div>' +
+          '</div>' +
+          (ev.error ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error) + '</div>' : '') +
         '</div>';
       }).join('');
     }
 
-    function openEventDetail(eventId) {
-      currentOpenEventId = eventId;
-      const ev = rawEventsList.find(e => String(e.id) === String(eventId));
+    function openEventDetail(id) {
+      const ev = rawEventsList.find(e => e.id === id);
       if (!ev) return;
+      currentOpenEventId = id;
 
       const overlay = document.getElementById('drawer-overlay');
       const drawer = document.getElementById('drawer');
@@ -2421,43 +2416,95 @@ function serveDashboard(req, res) {
       const badgeClass = 'badge-' + ev.status;
       titleArea.innerHTML = '<span class="badge ' + badgeClass + '">' + ev.status + '</span> <span>Detalle de Traza</span>';
 
-      const evTime = ev.started_at || ev.created_at;
-
       let bodyHtml = '';
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">A. Resumen de la Traza</div>' +
         '<div class="grid-2col">' +
-          '<div class="grid-item"><span>Timestamp</span><div>' + (evTime ? new Date(evTime).toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Timestamp</span><div>' + new Date(ev.timestamp).toLocaleString() + '</div></div>' +
           '<div class="grid-item"><span>Trace ID Completo</span><div>' + (ev.trace_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Tenant ID</span><div>' + (ev.tenant_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Clinic ID</span><div>' + (ev.clinic_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Conv ID</span><div>' + (ev.conversation_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Contact ID</span><div>' + (ev.contact_id || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Duración</span><div>' + (ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + ' ms' : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Hermes Duración</span><div>' + (ev.hermes_duration_ms !== null && ev.hermes_duration_ms !== undefined ? ev.hermes_duration_ms + ' ms' : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Intentos</span><div>' + (ev.attempt_count || '1') + '</div></div>' +
-          '<div class="grid-item"><span>Safe to Send</span><div>' + (ev.safe_to_send ? 'SÍ' : 'NO') + '</div></div>' +
-          '<div class="grid-item"><span>Response Sent</span><div>' + (ev.response_sent ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Teléfono</span><div>' + (ev.phone_masked || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Duración</span><div>' + (ev.duration_ms !== null ? ev.duration_ms + ' ms' : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Ruta</span><div>' + (ev.route || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Intent</span><div>' + (ev.intent || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Requiere Derivación</span><div>' + (ev.requires_handoff ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Razonamiento Detectado</span><div>' + (ev.internal_reasoning_detected ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Respuesta Extraída</span><div>' + (ev.patient_reply_extracted ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Razonamiento Bloqueado</span><div>' + (ev.blocked_internal_reasoning ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Estrategia Extracción</span><div>' + (ev.extraction_strategy || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Sesión Hermes</span><div>' + (ev.hermes_session_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Stream Hermes</span><div>' + (ev.hermes_stream_id || 'N/A') + '</div></div>' +
         '</div>' +
       '</div>';
 
+      const usage = ev.token_usage || {};
       bodyHtml += '<div class="detail-section" style="border-color: rgba(99, 102, 241, 0.2);">' +
         '<div class="detail-section-title" style="color: #818cf8;">H. Uso de Tokens</div>' +
         '<div class="grid-2col">' +
-          '<div class="grid-item"><span>Modelo</span><div>' + (ev.model || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Herramientas Usadas</span><div>' + (ev.tool_names && ev.tool_names.length > 0 ? escapeHtml(ev.tool_names.join(', ')) : 'Ninguna') + '</div></div>' +
+          '<div class="grid-item"><span>Tokens Exactos</span><div>' + (usage.exact ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>Modelo</span><div>' + (usage.model || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Model Provider</span><div>' + (usage.model_provider || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Input Tokens</span><div>' + (usage.input_tokens !== null ? usage.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Output Tokens</span><div>' + (usage.output_tokens !== null ? usage.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Total Tokens</span><div>' + (usage.total_tokens !== null ? usage.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Cache Read Tokens</span><div>' + (usage.cache_read_tokens !== null ? usage.cache_read_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Cache Write Tokens</span><div>' + (usage.cache_write_tokens !== null ? usage.cache_write_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Costo Estimado</span><div>' + (usage.estimated_cost !== null ? '$' + usage.estimated_cost.toFixed(6) : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Fuente Medición Tokens</span><div>' + (usage.token_source || 'not_available_from_hermes') + '</div></div>' +
+          '<div class="grid-item"><span>Fuente Medición Costos</span><div>' + (usage.cost_source || 'not_available_from_hermes') + '</div></div>' +
         '</div>' +
       '</div>';
 
-      // Payload details were omitted for privacy.
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>B. Entrada Gateway → Adapter</span>' +
+          '<button class="btn-copy" data-copy="payload-gate">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-gate">' + escapeHtml(ev.input_detail || 'N/A') + '</pre>' +
+      '</div>';
 
-      if (ev.status === 'error' || ev.error_code) {
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>C. Adapter → Hermes</span>' +
+          '<button class="btn-copy" data-copy="payload-herm-req">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-herm-req">' + escapeHtml(ev.hermes_request_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>D. Hermes → Adapter / Crudo</span>' +
+          '<button class="btn-copy" data-copy="payload-herm-raw">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-herm-raw">' + escapeHtml(ev.raw_hermes_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>E. Respuesta Sanitizada</span>' +
+          '<button class="btn-copy" data-copy="payload-sanit">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-sanit" style="color: #a5b4fc; font-weight: 500;">' + escapeHtml(ev.sanitized_reply || 'N/A') + '</pre>' +
+      '</div>';
+
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">' +
+          '<span>F. Adapter → Gateway</span>' +
+          '<button class="btn-copy" data-copy="payload-out-gate">Copiar</button>' +
+        '</div>' +
+        '<pre class="detail-pre" id="payload-out-gate">' + escapeHtml(ev.adapter_response_detail || 'N/A') + '</pre>' +
+      '</div>';
+
+      if (ev.status === 'error' || ev.error) {
         bodyHtml += '<div class="detail-section" style="background: rgba(239, 68, 68, 0.05); border-color: rgba(239, 68, 68, 0.2);">' +
           '<div class="detail-section-title" style="color: var(--danger);">G. Errores</div>' +
           '<div class="grid-2col">' +
-            '<div class="grid-item"><span>Error Code</span><div style="color: var(--danger);">' + escapeHtml(ev.error_code || 'N/A') + '</div></div>' +
+            '<div class="grid-item"><span>Mensaje Error</span><div style="color: var(--danger);">' + escapeHtml(ev.error || 'N/A') + '</div></div>' +
+            '<div class="grid-item"><span>Error Type</span><div>' + escapeHtml(ev.error_type || 'N/A') + '</div></div>' +
+            '<div class="grid-item"><span>Timeout Configurado</span><div>' + (ev.timeout_ms ? ev.timeout_ms + ' ms' : 'N/A') + '</div></div>' +
           '</div>' +
         '</div>';
       }
