@@ -1,6 +1,13 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+const { createClient } = require('@supabase/supabase-js');
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+}
 
 const app = reportExpressErrorsAndConfigure();
 
@@ -56,25 +63,117 @@ const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 let hermesCookie = "";
 let sessionMap = {};
 
-// Memoria para Debugging (Últimos 50 requests)
-const recentRequests = [];
 
-function addRecentRequest(reqData) {
-  recentRequests.unshift(reqData);
-  if (recentRequests.length > 50) {
-    recentRequests.length = 50;
+function normalizeTelemetryIdentity(payload) {
+  const traceId = payload?.metadata?.trace_id || payload?.trace_id || crypto.randomUUID();
+  const tenantId = payload?.tenant_id;
+  const conversationId = payload?.conversation?.conversation_id || payload?.conversation_id;
+  const contactId = payload?.conversation?.contact_id || payload?.contact_id;
+  const incomplete = !tenantId || !conversationId || !contactId;
+  if (incomplete) {
+    console.warn(`[Adapter] TELEMETRY_IDENTITY_INCOMPLETE: traceId=${traceId}`);
   }
-  // Log seguro para trazabilidad (sin secretos)
-  try {
-    console.log(JSON.stringify({
-      event: "debug_event_recorded",
-      trace_id: reqData.trace_id || null,
-      conversation_id: reqData.conversation_id || null,
-      status: reqData.status || null,
-      recent_count: recentRequests.length
-    }));
-  } catch (_) {}
+  return {
+    trace_id: traceId,
+    tenant_id: tenantId || 'unknown_tenant',
+    conversation_id: conversationId || 'unknown_conversation',
+    contact_id: contactId || 'unknown_contact'
+  };
 }
+
+async function startAdapterEvent(payload) {
+  try {
+    const identity = normalizeTelemetryIdentity(payload);
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('helios_adapter_events')
+        .insert({
+          trace_id: identity.trace_id,
+          tenant_id: identity.tenant_id,
+          conversation_id: identity.conversation_id,
+          contact_id: identity.contact_id,
+          status: 'processing',
+          started_at: new Date().toISOString()
+        })
+        .select('id')
+        .single();
+      if (error) throw error;
+      return { eventId: data.id, identity, startedAt: Date.now() };
+    } else {
+       return { eventId: null, identity, startedAt: Date.now() };
+    }
+  } catch (err) {
+    console.error('[Adapter] Fallo al iniciar telemetría:', err.message);
+    return { eventId: null, identity: normalizeTelemetryIdentity(payload), startedAt: Date.now() };
+  }
+}
+
+async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsage) {
+  if (!ctx || !ctx.eventId || !supabase) return;
+  try {
+    const toolsNames = [...new Set((tokenUsage?.tool_calls || []).map(t => t.name).filter(Boolean))];
+    const durationMs = Date.now() - ctx.startedAt;
+    const finalStatus = status === 'buffered' ? 'buffered' : 'ok';
+    const isSent = finalStatus === 'ok' && result?.response_sent === true;
+    await supabase.from('helios_adapter_events')
+      .update({
+        status: finalStatus,
+        finished_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        hermes_duration_ms: hermesDuration || null,
+        input_tokens: tokenUsage?.input_tokens ?? null,
+        output_tokens: tokenUsage?.output_tokens ?? null,
+        total_tokens: tokenUsage?.total_tokens ?? null,
+        model: tokenUsage?.model || 'unknown',
+        tool_names: toolsNames,
+        safe_to_send: result?.safe_to_send === true,
+        response_sent: isSent
+      })
+      .eq('id', ctx.eventId);
+  } catch (err) {
+    console.error('[Adapter] Fallo al finalizar telemetría:', err.message);
+  }
+}
+
+async function failAdapterEvent(ctx, errorCode) {
+  if (!ctx || !ctx.eventId || !supabase) return;
+  try {
+    const durationMs = Date.now() - ctx.startedAt;
+    await supabase.from('helios_adapter_events')
+      .update({
+        status: 'error',
+        finished_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        error_code: errorCode,
+        safe_to_send: false,
+        response_sent: false
+      })
+      .eq('id', ctx.eventId);
+  } catch (err) {
+    console.error('[Adapter] Fallo al reportar error en telemetría:', err.message);
+  }
+}
+
+// Stub function to replace original addRecentRequest so code doesn't break
+let currentTelemetryCtx = null;
+function addRecentRequest(reqData) {
+   // reqData is debugEvent
+   let finalStatus = 'ok';
+   if (reqData.status === 'error') finalStatus = 'error';
+   else if (reqData.status === 'buffered' || reqData.status === 'processing') finalStatus = 'buffered';
+   
+   if (finalStatus === 'error') {
+      failAdapterEvent(currentTelemetryCtx, reqData.error_code || reqData.error_type || 'UNKNOWN_ERROR');
+   } else {
+      let mockResult = { safe_to_send: false, response_sent: false };
+      if (reqData.sanitized_reply && finalStatus === 'ok') {
+         mockResult.safe_to_send = true; 
+         mockResult.response_sent = true;
+      }
+      finishAdapterEvent(currentTelemetryCtx, finalStatus, mockResult, reqData.duration_ms, reqData.token_usage);
+   }
+}
+
 
 function loadSessionMap() {
   try {
@@ -1022,7 +1121,11 @@ function extractLastPatientFacingReply(text) {
 
 function sanitizePatientReply(text) {
   if (!text) return "";
-  return extractLastPatientFacingReply(text);
+  const extracted = extractLastPatientFacingReply(text);
+  if (extracted) return extracted;
+  
+  // Fallback: si no se pudo extraer nada inteligente, devolver el texto original
+  return text;
 }
 
 function normalizeAdapterResponse(result) {
@@ -1051,19 +1154,35 @@ function normalizeAdapterResponse(result) {
 
   const sanitizedReply = sanitizePatientReply(rawReply);
 
-  // Verificar si hay razonamiento interno bloqueado
-  if (containsInternalReasoning(rawReply) && (!sanitizedReply || containsInternalReasoning(sanitizedReply))) {
+  const forbiddenPhrases = [
+    "perfil incompleto",
+    "display_name",
+    "mensajes consolidados",
+    "buffer",
+    "reglas internas",
+    "herramientas",
+    "razonamiento",
+    "estados técnicos",
+    "nombres de campos"
+  ];
+
+  const lowerReply = (sanitizedReply || "").toLowerCase();
+  const containsForbidden = forbiddenPhrases.some(phrase => lowerReply.includes(phrase));
+
+  // Verificar si hay razonamiento interno bloqueado o frases prohibidas
+  if (containsForbidden || (containsInternalReasoning(rawReply) && (!sanitizedReply || containsInternalReasoning(sanitizedReply)))) {
     return {
       ok: false,
       reply:
         "Ahora mismo no pude generar una respuesta adecuada. Te voy a derivar con el equipo para ayudarte mejor.",
       route: "handoff",
-      intent: "internal_reasoning_blocked",
-      requires_handoff: true,
+      intent: "invalid_client_message",
+      requires_handoff: false,
       tool_calls: [],
+      error_code: "INVALID_CLIENT_MESSAGE",
       case_tracking: {
         requires_case_tracking: true,
-        reason: "internal_reasoning_blocked"
+        reason: "internal_reasoning_or_forbidden_phrases_blocked"
       },
       metadata: {
         profile: HERMES_PROFILE,
@@ -1407,16 +1526,42 @@ function serveLoginPage(req, res) {
 </html>`);
 }
 // Endpoint para el historial de eventos recientes en JSON
-app.get("/debug/events", requireDebugAuth, (req, res) => {
+app.get("/debug/events", requireDebugAuth, async (req, res) => {
   try {
-    res.setHeader("Content-Type", "application/json");
-    res.json({
-      count: recentRequests.length,
-      events: recentRequests
-    });
+    if (!supabase) throw new Error("Supabase is not initialized.");
+    
+    const { status, trace_id, conversation_id, limit = '50' } = req.query;
+    
+    const allowlistStatus = ['processing', 'ok', 'buffered', 'error'];
+    if (status && !allowlistStatus.includes(status)) {
+      return res.status(400).json({ error: true, error_code: "INVALID_STATUS_FILTER" });
+    }
+    
+    if (trace_id && trace_id.length > 50) return res.status(400).json({ error: true, error_code: "TRACE_ID_TOO_LONG" });
+    if (conversation_id && conversation_id.length > 50) return res.status(400).json({ error: true, error_code: "CONV_ID_TOO_LONG" });
+    
+    const queryLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
+
+    let query = supabase
+      .from('helios_adapter_events')
+      .select('trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code')
+      .order('created_at', { ascending: false })
+      .limit(queryLimit);
+
+    if (status) query = query.eq('status', status);
+    if (trace_id) query = query.eq('trace_id', trace_id);
+    if (conversation_id) query = query.eq('conversation_id', conversation_id);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error("[Dashboard] Supabase Query Error:", error.message);
+      return res.status(500).json({ error: true, error_code: "ADAPTER_EVENTS_QUERY_FAILED" });
+    }
+
+    res.json({ count: data.length, events: data });
   } catch (err) {
-    console.error("Error en /debug/events:", err.message);
-    res.status(500).json({ error: true, message: err.message || "Error interno" });
+    console.error("[Dashboard] Exception:", err.message);
+    res.status(500).json({ error: true, error_code: "ADAPTER_EVENTS_QUERY_FAILED" });
   }
 });
 
@@ -2457,6 +2602,7 @@ function serveDashboard(req, res) {
 app.get("/", requireDebugAuth, serveDashboard);
 
 app.post("/helios/message", async (req, res) => {
+  currentTelemetryCtx = await startAdapterEvent(req.body || {});
   const startTime = Date.now();
   const uniqueEventId = crypto.randomUUID();
   const payload = req.body || {};
