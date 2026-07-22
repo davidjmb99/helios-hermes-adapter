@@ -2562,6 +2562,8 @@ function serveDashboard(req, res) {
     }
 
     loadData();
+  </script>
+</body>
 </html>`);
 }
 
