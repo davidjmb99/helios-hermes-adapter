@@ -123,7 +123,14 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
     }
 
     const durationMs = Date.now() - ctx.startedAt;
-    const finalStatus = status === 'buffered' ? 'buffered' : 'ok';
+    let finalStatus = status;
+    if (status !== 'buffered' && status !== 'error') {
+      if (result?.safe_to_send === true && result?.response_sent === true) {
+        finalStatus = 'ok';
+      } else {
+        finalStatus = 'error';
+      }
+    }
     const isSent = result?.response_sent === true;
     await supabase.from('helios_adapter_events')
       .update({
@@ -139,13 +146,20 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
         safe_to_send: result?.safe_to_send === true,
         response_sent: isSent,
         patient_display_name: extra.patient_display_name || null,
+        phone: extra.phone || null,
+        hermes_first_token_ms: extra.hermes_first_token_ms || null,
+        tool_duration_ms: extra.tool_duration_ms || null,
+        phone: extra.phone || null,
+        hermes_first_token_ms: extra.hermes_first_token_ms || null,
+        tool_duration_ms: extra.tool_duration_ms || null,
         display_name_source: extra.display_name_source || null,
         message_preview: extra.message_preview || null,
         message_count: extra.message_count || null,
         intent: extra.intent || null,
         response_preview: extra.response_preview || null,
         route: extra.route || null,
-        tool_status: toolStatus
+        tool_status: toolStatus,
+        tool_duration_ms: tokenUsage?.tool_duration_ms || null
       })
       .eq('id', ctx.eventId);
   } catch (err) {
@@ -742,6 +756,19 @@ function extractTokenUsage(sessionData, attempts = []) {
     estimated_cost,
     token_source: "hermes_webui_session_endpoint",
     cost_source: "hermes_webui_session_endpoint",
+    tool_duration_ms: (function() {
+      try {
+         const msgs = session.messages || session.history || [];
+         let total = 0;
+         for (const m of msgs) {
+            const arr = m.tool_calls || m.tools || [];
+            for (const t of arr) {
+               total += (t.duration_ms || t.execution_time_ms || 0);
+            }
+         }
+         return total > 0 ? total : null;
+      } catch(e) { return null; }
+    })(),
     token_lookup_attempts: attempts,
     tool_calls: (function(){
       let extractedToolCalls = [];
@@ -753,7 +780,8 @@ function extractTokenUsage(sessionData, attempts = []) {
             if (!tc) continue;
             const name = tc.name || tc.tool_name || tc.function?.name || 'unknown';
             const status = tc.status || 'success';
-            extractedToolCalls.push({ name, status });
+            const duration = tc.duration_ms || tc.execution_time_ms || null;
+            extractedToolCalls.push({ name, status, duration });
           }
         };
         for (const msg of messages) {
@@ -936,7 +964,11 @@ async function consumeHermesStream(streamId) {
           if (eventName === "token") {
             const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
             accumulatedAnswer += token;
-          } else if (eventName === "reasoning") {
+          } else if (eventName === "tool" || eventName === "tool_call") {
+              activeTool = true;
+            } else if (eventName === "tool_result" || eventName === "tool_end") {
+              activeTool = false;
+            } else if (eventName === "reasoning") {
             // Ignorar razonamiento
           } else if (eventName === "error") {
             const errorMsg = isJson ? (parsed.error || parsed.message || dataStr) : dataStr;
@@ -975,7 +1007,7 @@ async function consumeHermesStream(streamId) {
     } catch (_) {}
   }
 
-  return accumulatedAnswer;
+  return { answer: accumulatedAnswer, firstTokenTime };
 }
 
 async function consumeHermesStreamWithRetry(streamId) {
@@ -1055,7 +1087,9 @@ async function sendMessageToHermes(payload) {
       throw new Error("Hermes did not return stream_id on chat start");
     }
 
-    answer = await consumeHermesStreamWithRetry(streamId);
+    const resStream = await consumeHermesStreamWithRetry(streamId);
+      answer = resStream.answer;
+      if (resStream.firstTokenTime) firstTokenMs = resStream.firstTokenTime - startTimestamp;
   };
 
   try {
@@ -1305,6 +1339,11 @@ app.get("/health", (req, res) => {
 });
 
 // Endpoint para procesar el Login (POST)
+app.post("/debug/logout", (req, res) => {
+    res.setHeader('Set-Cookie', 'debug_token=; Path=/; HttpOnly; Max-Age=0');
+    res.json({ ok: true });
+});
+
 app.post("/login", (req, res) => {
   const { username, password } = req.body || {};
   
@@ -1318,7 +1357,7 @@ app.post("/login", (req, res) => {
       .digest('hex');
     
     const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=864000`);
+    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=604800`);
     
     return res.json({ ok: true });
   }
@@ -2703,13 +2742,17 @@ function extractResponsePreview(responseObj) {
   return reply.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/```json[\s\S]*?```/gi, "").trim().slice(0, 200);
 }
 
+function extractPhone(normalized, payload) {
+  return normalized?.conversation?.phone || normalized?.patient?.phone || payload?.conversation?.phone || payload?.patient?.phone || null;
+}
+
 function getPatientDisplayName(patient) {
   if (!patient) return "Contacto sin identificar";
   if (patient.profile_complete === true && patient.first_name && patient.last_name) {
     return patient.first_name + " " + patient.last_name;
   }
   if (patient.chatwoot_display_name) return patient.chatwoot_display_name;
-  if (patient.name) return patient.name;
+  
   return "Contacto sin identificar";
 }
 
@@ -2935,6 +2978,8 @@ const hermesStartTime = Date.now();
         hermesDurationMs,
         {
           patient_display_name: getPatientDisplayName(normalized?.patient),
+          phone: extractPhone(normalized, payload),
+          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
           display_name_source: getDisplayNameSource(normalized?.patient),
           message_preview: maskPreview(normalized?.message_text),
           message_count: normalized?.message_count,
@@ -3003,6 +3048,8 @@ const hermesStartTime = Date.now();
       debugEvent.token_usage,
       {
         patient_display_name: getPatientDisplayName(normalized?.patient),
+          phone: extractPhone(normalized, payload),
+          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
         display_name_source: getDisplayNameSource(normalized?.patient),
         message_preview: maskPreview(normalized?.message_text),
         message_count: normalized?.message_count,
@@ -3075,6 +3122,8 @@ const hermesStartTime = Date.now();
       typeof hermesDurationMs !== 'undefined' ? hermesDurationMs : null,
       {
         patient_display_name: getPatientDisplayName(normalized?.patient),
+          phone: extractPhone(normalized, payload),
+          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
         display_name_source: getDisplayNameSource(normalized?.patient),
         message_preview: maskPreview(normalized?.message_text),
         message_count: normalized?.message_count,
