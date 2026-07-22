@@ -149,6 +149,10 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
         phone: extra.phone || null,
         hermes_first_token_ms: extra.hermes_first_token_ms || null,
         tool_duration_ms: extra.tool_duration_ms || null,
+          session_id: extra.session_id || null,
+          stream_id: extra.stream_id || null,
+          session_id: extra.session_id || null,
+          stream_id: extra.stream_id || null,
         phone: extra.phone || null,
         hermes_first_token_ms: extra.hermes_first_token_ms || null,
         tool_duration_ms: extra.tool_duration_ms || null,
@@ -1231,102 +1235,106 @@ function normalizeAdapterResponse(result) {
   if (isProviderErrorText(rawReply)) {
     return {
       ok: false,
-      reply:
-        "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
-      route: "handoff",
-      intent: "provider_error",
-      requires_handoff: true,
-      tool_calls: [],
-      case_tracking: {
-        requires_case_tracking: true,
-        reason: "provider_limit_or_model_error"
-      },
-      metadata: {
-        profile: HERMES_PROFILE,
-        hermes_session_id: result.sessionId,
-        provider_error: true
-      }
+      reply: "",
+      message_for_client: "",
+      operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por error de proveedor." },
+      profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+      safe_to_send: false, response_sent: false, requires_handoff: true, recoverable: true, error_code: "PROVIDER_ERROR"
     };
   }
 
-  const sanitizedReply = sanitizePatientReply(rawReply);
+  let parsedJson = null;
+  let isStrictJson = false;
+  let jsonError = false;
 
-  const forbiddenPhrases = [
-    "perfil incompleto",
-    "display_name",
-    "mensajes consolidados",
-    "buffer",
-    "reglas internas",
-    "herramientas",
-    "razonamiento",
-    "estados técnicos",
-    "nombres de campos"
-  ];
-
-  const lowerReply = (sanitizedReply || "").toLowerCase();
-  const containsForbidden = forbiddenPhrases.some(phrase => lowerReply.includes(phrase));
-
-  // Verificar si hay razonamiento interno bloqueado o frases prohibidas
-  if (containsForbidden || (containsInternalReasoning(rawReply) && (!sanitizedReply || containsInternalReasoning(sanitizedReply)))) {
-    return {
-      ok: false,
-      reply:
-        "Ahora mismo no pude generar una respuesta adecuada. Te voy a derivar con el equipo para ayudarte mejor.",
-      route: "handoff",
-      intent: "invalid_client_message",
-      requires_handoff: false,
-      tool_calls: [],
-      error_code: "INVALID_CLIENT_MESSAGE",
-      case_tracking: {
-        requires_case_tracking: true,
-        reason: "internal_reasoning_or_forbidden_phrases_blocked"
-      },
-      metadata: {
-        profile: HERMES_PROFILE,
-        hermes_session_id: result.sessionId,
-        internal_reasoning_blocked: true
-      }
-    };
-  }
-
-  if (!sanitizedReply) {
-    return {
-      ok: false,
-      reply:
-        "Ahora mismo tuve un problema técnico para procesar tu mensaje. Te voy a derivar con el equipo para ayudarte mejor.",
-      route: "handoff",
-      intent: "empty_hermes_response",
-      requires_handoff: true,
-      tool_calls: [],
-      case_tracking: {
-        requires_case_tracking: true,
-        reason: "empty_hermes_response"
-      },
-      metadata: {
-        profile: HERMES_PROFILE,
-        hermes_session_id: result.sessionId
-      }
-    };
-  }
-
-  return {
-    ok: true,
-    reply: sanitizedReply,
-    route: "hermes",
-    intent: "respuesta_hermes",
-    requires_handoff: false,
-    tool_calls: [],
-    case_tracking: {
-      requires_case_tracking: false
-    },
-    metadata: {
-      profile: HERMES_PROFILE,
-      hermes_session_id: result.sessionId
+  const trimmed = rawReply.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      parsedJson = JSON.parse(trimmed);
+      isStrictJson = true;
+    } catch (e) {
+      jsonError = true;
     }
+  }
+
+  // If there's text before/after, or multiple JSON objects, it will fail the strict startswith/endswith or JSON.parse.
+  // Also, check for "Pensando" or reasoning tags.
+  if (containsInternalReasoning(rawReply) || jsonError || (!isStrictJson && trimmed.includes("{") && trimmed.includes("}"))) {
+      return {
+        ok: false, reply: "", message_for_client: "",
+        operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
+        profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+        safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
+      };
+  }
+
+  // Fallback a texto plano si no hay llaves de JSON
+  if (!isStrictJson) {
+     const sanitizedReply = sanitizePatientReply(rawReply);
+     const lowerReply = (sanitizedReply || "").toLowerCase();
+     const forbiddenPhrases = ["perfil incompleto", "display_name", "mensajes consolidados", "buffer", "reglas internas", "herramientas", "razonamiento", "estados tǸcnicos", "nombres de campos"];
+     if (forbiddenPhrases.some(p => lowerReply.includes(p)) || containsInternalReasoning(sanitizedReply) || !sanitizedReply) {
+        return {
+          ok: false, reply: "", message_for_client: "",
+          operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
+          profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+          safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
+        };
+     }
+     
+     return {
+        ok: true, reply: sanitizedReply, message_for_client: sanitizedReply,
+        operation: {}, profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+        safe_to_send: true, response_sent: false, requires_handoff: false, recoverable: false, error_code: null
+     };
+  }
+
+  // Es un JSON estricto, validar campos requeridos
+  const isValidContract = 
+    parsedJson && 
+    typeof parsedJson === "object" &&
+    typeof parsedJson.message_for_client === "string" &&
+    typeof parsedJson.operation === "object" && parsedJson.operation !== null &&
+    typeof parsedJson.profile_patch === "object" && parsedJson.profile_patch !== null &&
+    typeof parsedJson.state_patch === "object" && parsedJson.state_patch !== null &&
+    typeof parsedJson.booking_patch === "object" && parsedJson.booking_patch !== null &&
+    Array.isArray(parsedJson.tool_calls) &&
+    typeof parsedJson.safe_to_send === "boolean" &&
+    typeof parsedJson.requires_handoff === "boolean" &&
+    typeof parsedJson.recoverable === "boolean" &&
+    (typeof parsedJson.error_code === "string" || parsedJson.error_code === null);
+
+  if (!isValidContract) {
+     return {
+        ok: false, reply: "", message_for_client: "",
+        operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
+        profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+        safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
+     };
+  }
+
+  // Contrato vǭlido
+  const safe = parsedJson.safe_to_send === true;
+  const hasMsg = parsedJson.message_for_client.trim().length > 0;
+  
+  return {
+     ok: safe && hasMsg,
+     reply: (safe && hasMsg) ? parsedJson.message_for_client : "",
+     message_for_client: parsedJson.message_for_client,
+     operation: parsedJson.operation,
+     profile_patch: parsedJson.profile_patch,
+     state_patch: parsedJson.state_patch,
+     booking_patch: parsedJson.booking_patch,
+     tool_calls: parsedJson.tool_calls,
+     safe_to_send: safe,
+     response_sent: false,
+     requires_handoff: parsedJson.requires_handoff,
+     recoverable: parsedJson.recoverable,
+     error_code: parsedJson.error_code
   };
 }
 
-app.get("/health", (req, res) => {
+  app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
@@ -1646,7 +1654,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     let query = supabase
       .from('helios_adapter_events')
-      .select('id, created_at, trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code')
+      .select('id, created_at, trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code, phone, session_id, stream_id, patient_display_name, display_name_source')
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
@@ -1660,7 +1668,11 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
       return res.status(500).json({ error: true, error_code: "ADAPTER_EVENTS_QUERY_FAILED" });
     }
 
-    res.json({ count: data.length, events: data });
+    const maskedEvents = data.map(ev => ({
+        ...ev,
+        phone: ev.phone ? maskPhone(ev.phone) : 'N/A'
+      }));
+      res.json({ count: maskedEvents.length, events: maskedEvents });
   } catch (err) {
     console.error("[Dashboard] Exception:", err.message);
     res.status(500).json({ error: true, error_code: "ADAPTER_EVENTS_QUERY_FAILED" });
@@ -2513,11 +2525,12 @@ function serveDashboard(req, res) {
             '</div>' +
           '</div>' +
           '<div class="card-grid-info">' +
-            '<div class="info-line">Conv: <code>' + (ev.conversation_id || 'N/A') + '</code></div>' +
-            '<div class="info-line">Contact: <code>' + (ev.contact_id || 'N/A') + '</code></div>' +
-            '<div class="info-line">Tel: <code>' + (ev.phone_masked || 'N/A') + '</code></div>' +
-            '<div class="info-line">Sesión: <code>' + (ev.hermes_session_id ? ev.hermes_session_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
-            '<div class="info-line">Stream: <code>' + (ev.hermes_stream_id ? ev.hermes_stream_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
+            '<div class="info-line" style="grid-column: 1 / -1;">Nombre: <code>' + escapeHtml(ev.patient_display_name || 'N/A') + '</code></div>' +
+            '<div class="info-line">Tel: <code>' + escapeHtml(ev.phone || 'N/A') + '</code></div>' +
+            '<div class="info-line">Conv: <code>' + escapeHtml(ev.conversation_id || 'N/A') + '</code></div>' +
+            '<div class="info-line">Contact: <code>' + escapeHtml(ev.contact_id || 'N/A') + '</code></div>' +
+            '<div class="info-line">Session: <code>' + escapeHtml(ev.session_id ? ev.session_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
+            '<div class="info-line">Stream: <code>' + escapeHtml(ev.stream_id ? ev.stream_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
           '</div>' +
           (ev.error_code ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error_code) + '</div>' : '') +
         '</div>';
@@ -2544,10 +2557,14 @@ function serveDashboard(req, res) {
         '<div class="detail-section-title">A. Resumen de la Traza</div>' +
         '<div class="grid-2col">' +
           '<div class="grid-item"><span>Timestamp</span><div>' + (evTime ? new Date(evTime).toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Trace ID Completo</span><div>' + (ev.trace_id || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Tenant ID</span><div>' + (ev.tenant_id || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Conv ID</span><div>' + (ev.conversation_id || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Contact ID</span><div>' + (ev.contact_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Nombre</span><div>' + escapeHtml(ev.patient_display_name || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Teléfono</span><div>' + escapeHtml(ev.phone || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Session ID</span><div>' + escapeHtml(ev.session_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Stream ID</span><div>' + escapeHtml(ev.stream_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Trace ID Completo</span><div>' + escapeHtml(ev.trace_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Tenant ID</span><div>' + escapeHtml(ev.tenant_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Conv ID</span><div>' + escapeHtml(ev.conversation_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Contact ID</span><div>' + escapeHtml(ev.contact_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Duración</span><div>' + (ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + ' ms' : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Hermes Duración</span><div>' + (ev.hermes_duration_ms !== null && ev.hermes_duration_ms !== undefined ? ev.hermes_duration_ms + ' ms' : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Intentos</span><div>' + (ev.attempt_count || '1') + '</div></div>' +
@@ -2747,8 +2764,8 @@ function extractResponsePreview(responseObj) {
   return reply.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/```json[\s\S]*?```/gi, "").trim().slice(0, 200);
 }
 
-function extractPhone(normalized, payload) {
-  return normalized?.conversation?.phone || normalized?.patient?.phone || payload?.conversation?.phone || payload?.patient?.phone || null;
+function extractPhone(normalized, payload, input) {
+  return normalized?.conversation?.phone || normalized?.patient?.phone || payload?.conversation?.phone || payload?.patient?.phone || input?.conversation?.phone || input?.patient?.phone || null;
 }
 
 function getPatientDisplayName(patient) {
