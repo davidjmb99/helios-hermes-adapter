@@ -2380,9 +2380,23 @@ function serveDashboard(req, res) {
         const durationText = ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + 'ms' : 'N/A';
         const traceShort = ev.trace_id ? ev.trace_id.slice(0, 8) + '...' : 'N/A';
         
+        let detailToolsList = 'Ninguna';
+        if (ev.tool_names) {
+          let dt = ev.tool_names;
+          try { if (typeof dt === 'string') dt = JSON.parse(dt); } catch(e){}
+          if (Array.isArray(dt) && dt.length > 0) detailToolsList = escapeHtml(dt.join(', '));
+        }
+        
         const tokenText = (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
                           (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + ' / ' +
                           (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A');
+        
+        let toolsList = 'Ninguna';
+        if (ev.tool_names) {
+          let t = ev.tool_names;
+          try { if (typeof t === 'string') t = JSON.parse(t); } catch(e){}
+          if (Array.isArray(t) && t.length > 0) toolsList = escapeHtml(t.join(', '));
+        }
 
         return '<div class="request-card ' + statusClass + '" data-id="' + escapeHtml(ev.id) + '">' +
           '<div class="card-header">' +
@@ -2447,7 +2461,7 @@ function serveDashboard(req, res) {
           '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Herramientas Usadas</span><div>' + (ev.tool_names && ev.tool_names.length > 0 ? escapeHtml(ev.tool_names.join(', ')) : 'Ninguna') + '</div></div>' +
+          '<div class="grid-item"><span>Herramientas Usadas</span><div>' + (function(t){if(!t)return 'Ninguna';try{if(typeof t==='string')t=JSON.parse(t);}catch(e){}if(Array.isArray(t)&&t.length>0)return escapeHtml(t.join(', '));return 'Ninguna'})(ev.tool_names) + '</div></div>' +
         '</div>' +
       '</div>';
 
