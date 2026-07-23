@@ -2754,6 +2754,107 @@ function getDisplayNameSource(patient) {
   return "unknown";
 }
 
+async function finalizeAdapterEventReliably(
+  telemetryCtx,
+  finalStatus,
+  normalizedResponse,
+  hermesDurationMs,
+  debugEvent,
+  extra
+) {
+  const traceId = telemetryCtx?.identity?.trace_id || "";
+  let primarySuccess = false;
+  try {
+    const ctxClone = { ...telemetryCtx, closed: false };
+    
+    await withTimeout(
+      finishAdapterEvent(
+        ctxClone,
+        finalStatus,
+        { ...normalizedResponse, response_sent: false },
+        hermesDurationMs,
+        debugEvent.token_usage,
+        extra
+      ),
+      3000,
+      Symbol.for("timeout")
+    ).then((result) => {
+      if (result === Symbol.for("timeout")) {
+        throw new Error("Primary telemetry finish timed out (>3000ms)");
+      }
+      primarySuccess = true;
+    });
+
+    if (primarySuccess) {
+      console.log(JSON.stringify({
+        event: "adapter_telemetry_finished",
+        trace_id: traceId,
+        processing_stage: "response_returned",
+        ok: normalizedResponse.ok,
+        safe_to_send: normalizedResponse.safe_to_send,
+        error_code: normalizedResponse.error_code || null
+      }));
+    }
+  } catch (err) {
+    console.warn(JSON.stringify({
+      event: "adapter_telemetry_primary_failed",
+      trace_id: traceId,
+      processing_stage: "response_returned",
+      ok: normalizedResponse.ok,
+      safe_to_send: normalizedResponse.safe_to_send,
+      error_code: normalizedResponse.error_code || null,
+      error: err.message
+    }));
+
+    if (telemetryCtx && telemetryCtx.eventId && supabase) {
+      try {
+        const durationMs = Date.now() - telemetryCtx.startedAt;
+        const fallbackUpdate = {
+          status: finalStatus,
+          safe_to_send: normalizedResponse.safe_to_send === true,
+          response_sent: false,
+          error_code: normalizedResponse.error_code || null,
+          processing_stage: "response_returned",
+          duration_ms: durationMs,
+          finished_at: new Date().toISOString()
+        };
+
+        await withTimeout(
+          supabase
+            .from('helios_adapter_events')
+            .update(fallbackUpdate)
+            .eq('id', telemetryCtx.eventId),
+          3000,
+          Symbol.for("timeout")
+        ).then((resUpdate) => {
+          if (resUpdate === Symbol.for("timeout")) {
+            throw new Error("Fallback telemetry update timed out (>3000ms)");
+          }
+        });
+
+        console.log(JSON.stringify({
+          event: "adapter_telemetry_fallback_finished",
+          trace_id: traceId,
+          processing_stage: "response_returned",
+          ok: normalizedResponse.ok,
+          safe_to_send: normalizedResponse.safe_to_send,
+          error_code: normalizedResponse.error_code || null
+        }));
+      } catch (fallbackErr) {
+        console.error(JSON.stringify({
+          event: "adapter_telemetry_finalize_failed",
+          trace_id: traceId,
+          processing_stage: "response_returned",
+          ok: normalizedResponse.ok,
+          safe_to_send: normalizedResponse.safe_to_send,
+          error_code: normalizedResponse.error_code || null,
+          error: fallbackErr.message
+        }));
+      }
+    }
+  }
+}
+
 app.post("/helios/message", async (req, res) => {
   let processingStage = "request_received";
   let requestPhone = null;
@@ -2962,11 +3063,11 @@ const hermesStartTime = Date.now();
         ok: false,
         reply: debugEvent.final_reply_preview,
         route: finalRoute,
-          operation_type: normalizedResponse.operation?.type || null,
-          operation_status: normalizedResponse.operation?.status || null,
-          operation_summary: normalizedResponse.operation?.summary || null,
-          has_profile_patch: Object.keys(normalizedResponse.profile_patch || {}).length > 0,
-          has_booking_patch: Object.keys(normalizedResponse.booking_patch || {}).length > 0,
+        operation_type: "technical_error",
+        operation_status: "failed",
+        operation_summary: "Active Hermes stream conflict",
+        has_profile_patch: false,
+        has_booking_patch: false,
         intent: finalIntent,
         requires_handoff: false,
         safe_to_send: false,
@@ -2995,36 +3096,85 @@ const hermesStartTime = Date.now();
       debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
 
-      await failAdapterEvent(
-        telemetryCtx,
-        "ACTIVE_STREAM_CONFLICT",
-        hermesDurationMs,
-        {
-          patient_display_name: requestPatientDisplayName,
-          phone: requestPhone,
-          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
-          session_id: sessionId,
-          stream_id: streamId,
-          processing_stage: processingStage,
-          display_name_source: getDisplayNameSource(normalized?.patient),
-          message_preview: maskPreview(normalized?.message_text),
-          message_count: normalized?.message_count,
-          intent: finalIntent,
-          route: finalRoute,
-          provider_error_code: "ACTIVE_STREAM_CONFLICT",
-          response_preview: extractResponsePreview(conflictResponse)
-        }
-      );
-      
-      // Consultar tokens exactos de Hermes
-      if (sessionId) {
-        try {
-          const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
-          debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
-        } catch (_) {}
-      }
+      const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
 
-      return res.json(conflictResponse);
+      // OBJETIVO 1 — OBSERVABILIDAD HTTP REAL
+      console.log(JSON.stringify({
+        event: "adapter_http_response_start",
+        trace_id: traceId,
+        processing_stage: processingStage,
+        ok: conflictResponse.ok,
+        safe_to_send: conflictResponse.safe_to_send,
+        error_code: conflictResponse.error_code,
+        headers_sent: res.headersSent,
+        elapsed_ms: Date.now() - startTime
+      }));
+
+      res.once("finish", () => {
+        console.log(JSON.stringify({
+          event: "adapter_http_response_finish",
+          trace_id: traceId,
+          status_code: res.statusCode,
+          headers_sent: res.headersSent,
+          elapsed_ms: Date.now() - startTime
+        }));
+      });
+
+      res.once("close", () => {
+        console.log(JSON.stringify({
+          event: "adapter_http_response_close",
+          trace_id: traceId,
+          writable_ended: res.writableEnded,
+          headers_sent: res.headersSent,
+          elapsed_ms: Date.now() - startTime
+        }));
+      });
+
+      res.json(conflictResponse);
+
+      console.log(JSON.stringify({
+        event: "adapter_http_response_invoked",
+        trace_id: traceId,
+        processing_stage: processingStage,
+        ok: conflictResponse.ok,
+        safe_to_send: conflictResponse.safe_to_send,
+        error_code: conflictResponse.error_code
+      }));
+
+      // Cerrar telemetría en segundo plano con manejo explícito
+      (async () => {
+        if (sessionId) {
+          try {
+            const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+            debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
+          } catch (_) {}
+        }
+
+        await finalizeAdapterEventReliably(
+          telemetryCtx,
+          "error",
+          conflictResponse,
+          hermesDurationMs,
+          debugEvent,
+          {
+            patient_display_name: requestPatientDisplayName,
+            phone: requestPhone,
+            hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+            session_id: sessionId,
+            stream_id: streamId,
+            processing_stage: "response_returned",
+            display_name_source: getDisplayNameSource(normalized?.patient),
+            message_preview: maskPreview(normalized?.message_text),
+            message_count: normalized?.message_count,
+            intent: finalIntent,
+            route: finalRoute,
+            provider_error_code: "ACTIVE_STREAM_CONFLICT",
+            response_preview: extractResponsePreview(conflictResponse)
+          }
+        );
+      })();
+
+      return;
     }
 
     processingStage = "contract_parsing";
@@ -3061,48 +3211,88 @@ const hermesStartTime = Date.now();
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
 
+    // Registrar listeners una sola vez antes de responder:
+    const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
+
+    // OBJETIVO 1 — OBSERVABILIDAD HTTP REAL
+    console.log(JSON.stringify({
+      event: "adapter_http_response_start",
+      trace_id: traceId,
+      processing_stage: processingStage,
+      ok: normalizedResponse.ok,
+      safe_to_send: normalizedResponse.safe_to_send,
+      error_code: normalizedResponse.error_code || null,
+      headers_sent: res.headersSent,
+      elapsed_ms: Date.now() - startTime
+    }));
+
+    res.once("finish", () => {
+      console.log(JSON.stringify({
+        event: "adapter_http_response_finish",
+        trace_id: traceId,
+        status_code: res.statusCode,
+        headers_sent: res.headersSent,
+        elapsed_ms: Date.now() - startTime
+      }));
+    });
+
+    res.once("close", () => {
+      console.log(JSON.stringify({
+        event: "adapter_http_response_close",
+        trace_id: traceId,
+        writable_ended: res.writableEnded,
+        headers_sent: res.headersSent,
+        elapsed_ms: Date.now() - startTime
+      }));
+    });
+
     // Enviar respuesta al Gateway INMEDIATAMENTE
-    processingStage = "response_returned";
     res.json(normalizedResponse);
 
-    if (sessionId) {
-      try {
-        const result = await withTimeout(
-          fetchHermesSessionData(sessionId),
-          3000,
-          { sessionData: null, attempts: [] }
-        );
-        debugEvent.token_usage = extractTokenUsage(result.sessionData, result.attempts);
-      } catch (_) {}
-    }
+    console.log(JSON.stringify({
+      event: "adapter_http_response_invoked",
+      trace_id: traceId,
+      processing_stage: processingStage,
+      ok: normalizedResponse.ok,
+      safe_to_send: normalizedResponse.safe_to_send,
+      error_code: normalizedResponse.error_code || null
+    }));
 
-    try {
-      await withTimeout(
-        finishAdapterEvent(
-          telemetryCtx,
-          finalStatus,
-          { ...normalizedResponse, response_sent: false },
-          hermesDurationMs,
-          debugEvent.token_usage,
-          {
-            patient_display_name: requestPatientDisplayName,
-              phone: requestPhone,
-              hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
-              session_id: sessionId,
-              stream_id: streamId,
-              processing_stage: processingStage,
-            display_name_source: getDisplayNameSource(normalized?.patient),
-            message_preview: maskPreview(normalized?.message_text),
-            message_count: normalized?.message_count,
-            intent: finalIntent,
-            response_preview: extractResponsePreview(normalizedResponse),
-            route: finalRoute,
-          }
-        ),
-        3000,
-        null
+    // Cerrar telemetría en segundo plano con manejo explícito
+    (async () => {
+      if (sessionId) {
+        try {
+          const result = await withTimeout(
+            fetchHermesSessionData(sessionId),
+            3000,
+            { sessionData: null, attempts: [] }
+          );
+          debugEvent.token_usage = extractTokenUsage(result.sessionData, result.attempts);
+        } catch (_) {}
+      }
+
+      await finalizeAdapterEventReliably(
+        telemetryCtx,
+        finalStatus,
+        normalizedResponse,
+        hermesDurationMs,
+        debugEvent,
+        {
+          patient_display_name: requestPatientDisplayName,
+          phone: requestPhone,
+          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+          session_id: sessionId,
+          stream_id: streamId,
+          processing_stage: "response_returned",
+          display_name_source: getDisplayNameSource(normalized?.patient),
+          message_preview: maskPreview(normalized?.message_text),
+          message_count: normalized?.message_count,
+          intent: finalIntent,
+          response_preview: extractResponsePreview(normalizedResponse),
+          route: finalRoute,
+        }
       );
-    } catch (_) {}
+    })();
 
   } catch (error) {
     if (res.headersSent) {
@@ -3172,34 +3362,97 @@ const hermesStartTime = Date.now();
     debugEvent.adapter_response_preview = JSON.stringify(errorResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(errorResponse, null, 2);
 
-    if (sessionId) {
-      try {
-        const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
-        debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
-      } catch (_) {}
-    }
+    const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
 
-    await failAdapterEvent(
-      telemetryCtx,
-      normalizedError.error_code,
-      typeof hermesDurationMs !== 'undefined' ? hermesDurationMs : null,
-      {
-        patient_display_name: requestPatientDisplayName,
-          phone: requestPhone,
-          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
-          session_id: sessionId,
-          stream_id: streamId,
-          processing_stage: processingStage,
-        display_name_source: getDisplayNameSource(normalized?.patient),
-        message_preview: maskPreview(normalized?.message_text),
-        message_count: normalized?.message_count,
-        intent: normalizedError.intent,
-        route: "error",
-        provider_error_code: normalizedError.error_code,
-        response_preview: null
+    // OBJETIVO 1 — OBSERVABILIDAD HTTP REAL
+    console.log(JSON.stringify({
+      event: "adapter_http_response_start",
+      trace_id: traceId,
+      processing_stage: processingStage,
+      ok: errorResponse.ok,
+      safe_to_send: errorResponse.safe_to_send,
+      error_code: errorResponse.error_code,
+      headers_sent: res.headersSent,
+      elapsed_ms: Date.now() - startTime
+    }));
+
+    res.once("finish", () => {
+      console.log(JSON.stringify({
+        event: "adapter_http_response_finish",
+        trace_id: traceId,
+        status_code: res.statusCode,
+        headers_sent: res.headersSent,
+        elapsed_ms: Date.now() - startTime
+      }));
+    });
+
+    res.once("close", () => {
+      console.log(JSON.stringify({
+        event: "adapter_http_response_close",
+        trace_id: traceId,
+        writable_ended: res.writableEnded,
+        headers_sent: res.headersSent,
+        elapsed_ms: Date.now() - startTime
+      }));
+    });
+
+    res.status(normalizedError.http_status).json(errorResponse);
+
+    console.log(JSON.stringify({
+      event: "adapter_http_response_invoked",
+      trace_id: traceId,
+      processing_stage: processingStage,
+      ok: errorResponse.ok,
+      safe_to_send: errorResponse.safe_to_send,
+      error_code: errorResponse.error_code
+    }));
+
+    // Cerrar telemetría en segundo plano
+    (async () => {
+      if (sessionId) {
+        try {
+          const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+          debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
+        } catch (_) {}
       }
-    );
-    return res.status(normalizedError.http_status).json(errorResponse);
+
+      try {
+        await withTimeout(
+          failAdapterEvent(
+            telemetryCtx,
+            normalizedError.error_code,
+            typeof hermesDurationMs !== 'undefined' ? hermesDurationMs : null,
+            {
+              patient_display_name: requestPatientDisplayName,
+              phone: requestPhone,
+              hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+              session_id: sessionId,
+              stream_id: streamId,
+              processing_stage: processingStage,
+              display_name_source: getDisplayNameSource(normalized?.patient),
+              message_preview: maskPreview(normalized?.message_text),
+              message_count: normalized?.message_count,
+              intent: normalizedError.intent,
+              route: "error",
+              provider_error_code: normalizedError.error_code,
+              response_preview: null
+            }
+          ),
+          3000,
+          null
+        );
+      } catch (err) {
+        console.error(JSON.stringify({
+          event: "adapter_telemetry_finalize_failed",
+          trace_id: traceId,
+          processing_stage: processingStage,
+          ok: errorResponse.ok,
+          safe_to_send: errorResponse.safe_to_send,
+          error_code: errorResponse.error_code,
+          error: err.message
+        }));
+      }
+    })();
   }
 });
 
