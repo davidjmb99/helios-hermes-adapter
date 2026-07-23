@@ -207,10 +207,27 @@ function normalizeAdapterResponse(result) {
   // D. Si no encuentra contrato válido, devolver INVALID_HERMES_CONTRACT.
   if (!parsedJson) {
     return {
-      ok: false, reply: "", message_for_client: "",
+      ok: false,
+      reply: "",
+      message_for_client: "",
+      route: "error",
+      intent: "technical_error",
       operation: { type: "technical_error", status: "failed", summary: "Respuesta final de Hermes rechazada por contrato inválido o no encontrado." },
-      profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-      safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
+      operation_type: "technical_error",
+      operation_status: "failed",
+      operation_summary: "Respuesta final de Hermes rechazada por contrato inválido o no encontrado.",
+      profile_patch: {},
+      state_patch: {},
+      booking_patch: {},
+      has_profile_patch: false,
+      has_booking_patch: false,
+      has_state_patch: false,
+      tool_calls: [],
+      safe_to_send: false,
+      response_sent: false,
+      requires_handoff: false,
+      recoverable: true,
+      error_code: "INVALID_HERMES_CONTRACT"
     };
   }
 
@@ -222,10 +239,18 @@ function normalizeAdapterResponse(result) {
       ok: false,
       reply: "",
       message_for_client: "",
+      route: "error",
+      intent: "internal_reasoning_blocked",
       operation: { type: "technical_error", status: "failed", summary: "Respuesta final de Hermes rechazada por contener razonamiento interno en el mensaje al cliente." },
+      operation_type: "technical_error",
+      operation_status: "failed",
+      operation_summary: "Respuesta final de Hermes rechazada por contener razonamiento interno en el mensaje al cliente.",
       profile_patch: {},
       state_patch: {},
       booking_patch: {},
+      has_profile_patch: false,
+      has_booking_patch: false,
+      has_state_patch: false,
       tool_calls: [],
       safe_to_send: false,
       response_sent: false,
@@ -237,21 +262,33 @@ function normalizeAdapterResponse(result) {
 
   // Corrección 1: safe_to_send: safe y ok: safe
   const safe = parsedJson.safe_to_send === true;
+  const profilePatch = parsedJson.profile_patch || {};
+  const statePatch = parsedJson.state_patch || {};
+  const bookingPatch = parsedJson.booking_patch || {};
+  const operationObj = parsedJson.operation || {};
 
   return {
     ok: safe,
     reply: safe ? parsedJson.message_for_client : "",
     message_for_client: parsedJson.message_for_client,
-    operation: parsedJson.operation,
-    profile_patch: parsedJson.profile_patch,
-    state_patch: parsedJson.state_patch,
-    booking_patch: parsedJson.booking_patch,
-    tool_calls: parsedJson.tool_calls,
+    route: parsedJson.route || "hermes",
+    intent: parsedJson.intent || statePatch.pending_intent || statePatch.last_intent || operationObj.type || "respuesta_hermes",
+    operation: operationObj,
+    operation_type: operationObj.type || null,
+    operation_status: operationObj.status || null,
+    operation_summary: operationObj.summary || null,
+    profile_patch: profilePatch,
+    state_patch: statePatch,
+    booking_patch: bookingPatch,
+    has_profile_patch: Object.keys(profilePatch).length > 0,
+    has_state_patch: Object.keys(statePatch).length > 0,
+    has_booking_patch: Object.keys(bookingPatch).length > 0,
+    tool_calls: parsedJson.tool_calls || [],
     safe_to_send: safe,
     response_sent: false,
-    requires_handoff: parsedJson.requires_handoff,
-    recoverable: parsedJson.recoverable,
-    error_code: parsedJson.error_code
+    requires_handoff: parsedJson.requires_handoff === true,
+    recoverable: parsedJson.recoverable === true,
+    error_code: parsedJson.error_code || null
   };
 }
 
