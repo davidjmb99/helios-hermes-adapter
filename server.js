@@ -3153,6 +3153,15 @@ const hermesStartTime = Date.now();
     } catch (_) {}
 
   } catch (error) {
+    if (res.headersSent) {
+      console.error("Secondary error after response sent:", {
+        name: error?.name || "Error",
+        code: error?.code || null,
+        message: error?.message || "unknown"
+      });
+      return;
+    }
+    
     console.error("Adapter error:", error);
     finalStatus = "error";
     finalRoute = "error";
