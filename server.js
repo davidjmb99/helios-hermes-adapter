@@ -2870,7 +2870,18 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.error = errText.slice(0, 500);
       debugEvent.duration_ms = Date.now() - startTime;
       
-      const configErrorResponse = { ok: false, error: errText };
+      const configErrorResponse = {
+        ok: false,
+        route: "error",
+        intent: "error_configuracion",
+        requires_handoff: false,
+        safe_to_send: false,
+        response_sent: false,
+        recoverable: true,
+        error_code: "HERMES_API_KEY_MISSING",
+        metadata: { error_code: "HERMES_API_KEY_MISSING" },
+        error: errText
+      };
       debugEvent.adapter_response_preview = JSON.stringify(configErrorResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(configErrorResponse, null, 2);
 
@@ -2886,7 +2897,18 @@ app.post("/helios/message", async (req, res) => {
       debugEvent.error = errText;
       debugEvent.duration_ms = Date.now() - startTime;
 
-      const authErrorResponse = { ok: false, error: "Unauthorized" };
+      const authErrorResponse = {
+        ok: false,
+        route: "error",
+        intent: "unauthorized",
+        requires_handoff: false,
+        safe_to_send: false,
+        response_sent: false,
+        recoverable: true,
+        error_code: "UNAUTHORIZED",
+        metadata: { error_code: "UNAUTHORIZED" },
+        error: "Unauthorized"
+      };
       debugEvent.adapter_response_preview = JSON.stringify(authErrorResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(authErrorResponse, null, 2);
 
@@ -3097,7 +3119,7 @@ const hermesStartTime = Date.now();
     debugEvent.status = finalStatus;
     debugEvent.route = finalRoute;
     debugEvent.intent = finalIntent;
-    debugEvent.requires_handoff = true;
+    debugEvent.requires_handoff = normalizedError.requires_handoff;
     debugEvent.duration_ms = Date.now() - startTime;
     debugEvent.error = errorMsg.slice(0, 500);
     debugEvent.error_type = normalizedError.error_code;
