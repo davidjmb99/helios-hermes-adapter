@@ -940,6 +940,8 @@ async function consumeHermesStream(streamId) {
   let reasoningContent = "";
   let toolEvents = [];
   let firstTokenTime = null;
+  let sessionId = null;
+  let tokenUsage = null;
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -951,6 +953,11 @@ async function consumeHermesStream(streamId) {
     let isJson = false;
     try { parsed = JSON.parse(dataStr); isJson = true; } catch (_) {}
     const evName = eventName || (isJson ? parsed.event : "") || "";
+
+    if (isJson) {
+      if (parsed.session_id) sessionId = parsed.session_id;
+      if (parsed.usage || parsed.token_usage) tokenUsage = parsed.usage || parsed.token_usage;
+    }
 
     if (evName === "assistant.delta" || evName === "token") {
       const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
@@ -1039,9 +1046,9 @@ async function consumeHermesStream(streamId) {
     answer: rawReply,
     firstTokenTime,
     assistantCompletedReceived,
-    sessionId: null,
-    streamId: null,
-    tokenUsage: null,
+    sessionId,
+    streamId,
+    tokenUsage,
     toolCalls: toolEvents
   };
 }
@@ -1126,6 +1133,7 @@ async function sendMessageToHermes(payload) {
     const resStream = await consumeHermesStreamWithRetry(streamId);
       answer = resStream.answer;
       if (resStream.firstTokenTime) firstTokenMs = resStream.firstTokenTime - startTimestamp;
+      if (resStream.sessionId) sessionId = resStream.sessionId;
   };
 
   try {
