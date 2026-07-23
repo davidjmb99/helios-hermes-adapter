@@ -1,6 +1,22 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+
+function withTimeout(promise, ms, fallbackValue) {
+  const safePromise = promise.catch(err => {
+    console.error("Secondary operation late rejection:", err.message);
+    return fallbackValue;
+  });
+  
+  return Promise.race([
+    safePromise,
+    new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
+  ]).catch(err => {
+    console.error("Timeout/Error in secondary operation:", err.message);
+    return fallbackValue;
+  });
+}
+
 const { createClient } = require('@supabase/supabase-js');
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
