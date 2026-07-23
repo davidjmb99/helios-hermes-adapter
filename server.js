@@ -3093,37 +3093,48 @@ const hermesStartTime = Date.now();
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
 
+    // Enviar respuesta al Gateway INMEDIATAMENTE
+    processingStage = "response_returned";
+    res.json(normalizedResponse);
+
     if (sessionId) {
       try {
-        const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
-        debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
+        const result = await withTimeout(
+          fetchHermesSessionData(sessionId),
+          3000,
+          { sessionData: null, attempts: [] }
+        );
+        debugEvent.token_usage = extractTokenUsage(result.sessionData, result.attempts);
       } catch (_) {}
     }
 
-    await finishAdapterEvent(
-      telemetryCtx,
-      finalStatus,
-      { ...normalizedResponse, response_sent: normalizedResponse.response_sent === true },
-      hermesDurationMs,
-      debugEvent.token_usage,
-      {
-        patient_display_name: requestPatientDisplayName,
-          phone: requestPhone,
-          hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
-          session_id: sessionId,
-          stream_id: streamId,
-          processing_stage: processingStage,
-        display_name_source: getDisplayNameSource(normalized?.patient),
-        message_preview: maskPreview(normalized?.message_text),
-        message_count: normalized?.message_count,
-        intent: finalIntent,
-        response_preview: extractResponsePreview(normalizedResponse),
-        route: finalRoute,
-      }
-    );
-
-    processingStage = "response_returned";
-    return res.json(normalizedResponse);
+    try {
+      await withTimeout(
+        finishAdapterEvent(
+          telemetryCtx,
+          finalStatus,
+          { ...normalizedResponse, response_sent: true },
+          hermesDurationMs,
+          debugEvent.token_usage,
+          {
+            patient_display_name: requestPatientDisplayName,
+              phone: requestPhone,
+              hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+              session_id: sessionId,
+              stream_id: streamId,
+              processing_stage: processingStage,
+            display_name_source: getDisplayNameSource(normalized?.patient),
+            message_preview: maskPreview(normalized?.message_text),
+            message_count: normalized?.message_count,
+            intent: finalIntent,
+            response_preview: extractResponsePreview(normalizedResponse),
+            route: finalRoute,
+          }
+        ),
+        3000,
+        null
+      );
+    } catch (_) {}
 
   } catch (error) {
     console.error("Adapter error:", error);
