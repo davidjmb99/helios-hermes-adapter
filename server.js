@@ -1130,9 +1130,26 @@ async function sendMessageToHermes(payload) {
       throw new Error("Hermes did not return stream_id on chat start");
     }
 
+    const streamStartedAt = Date.now();
     const resStream = await consumeHermesStreamWithRetry(streamId);
       answer = resStream.answer;
-      if (resStream.firstTokenTime) firstTokenMs = resStream.firstTokenTime - startTimestamp;
+      
+      try {
+        if (
+          typeof resStream.firstTokenTime === "number" &&
+          Number.isFinite(resStream.firstTokenTime)
+        ) {
+          firstTokenMs = Math.max(
+            0,
+            resStream.firstTokenTime - streamStartedAt
+          );
+        } else {
+          firstTokenMs = null;
+        }
+      } catch (_) {
+        firstTokenMs = null;
+      }
+
       if (resStream.sessionId) sessionId = resStream.sessionId;
   };
 
