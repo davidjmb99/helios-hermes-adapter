@@ -3113,7 +3113,7 @@ const hermesStartTime = Date.now();
         finishAdapterEvent(
           telemetryCtx,
           finalStatus,
-          { ...normalizedResponse, response_sent: true },
+          { ...normalizedResponse, response_sent: false },
           hermesDurationMs,
           debugEvent.token_usage,
           {
