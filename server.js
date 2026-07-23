@@ -1,6 +1,12 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+const {
+  findBalancedJsonObjects,
+  isValidHermesContract,
+  extractLastValidHermesContract,
+  normalizeAdapterResponse
+} = require("./contract-parser");
 
 function withTimeout(promise, ms, fallbackValue) {
   const safePromise = promise.catch(err => {
@@ -1295,60 +1301,6 @@ function sanitizePatientReply(text) {
   
   // Fallback: si no se pudo extraer nada inteligente, devolver el texto original
   return text;
-}
-
-function normalizeAdapterResponse(result) {
-  const rawReply = result.answer || "";
-  
-  let parsedJson = null;
-  let isStrictJson = false;
-
-  const trimmed = rawReply.trim();
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    try {
-      parsedJson = JSON.parse(trimmed);
-      isStrictJson = true;
-    } catch (e) {}
-  }
-
-  const isValidContract = 
-    parsedJson && 
-    typeof parsedJson === "object" &&
-    typeof parsedJson.message_for_client === "string" &&
-    typeof parsedJson.operation === "object" && parsedJson.operation !== null &&
-    typeof parsedJson.profile_patch === "object" && parsedJson.profile_patch !== null &&
-    typeof parsedJson.state_patch === "object" && parsedJson.state_patch !== null &&
-    typeof parsedJson.booking_patch === "object" && parsedJson.booking_patch !== null &&
-    Array.isArray(parsedJson.tool_calls) &&
-    typeof parsedJson.safe_to_send === "boolean" &&
-    typeof parsedJson.requires_handoff === "boolean" &&
-    typeof parsedJson.recoverable === "boolean" &&
-    (typeof parsedJson.error_code === "string" || parsedJson.error_code === null);
-
-  if (!isStrictJson || !isValidContract) {
-    return {
-      ok: false, reply: "", message_for_client: "",
-      operation: { type: "technical_error", status: "failed", summary: "Respuesta final de Hermes rechazada por contrato inválido." },
-      profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-      safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
-    };
-  }
-
-  return {
-    ok: true,
-    reply: parsedJson.message_for_client,
-    message_for_client: parsedJson.message_for_client,
-    operation: parsedJson.operation,
-    profile_patch: parsedJson.profile_patch,
-    state_patch: parsedJson.state_patch,
-    booking_patch: parsedJson.booking_patch,
-    tool_calls: parsedJson.tool_calls,
-    safe_to_send: parsedJson.safe_to_send,
-    response_sent: false,
-    requires_handoff: parsedJson.requires_handoff,
-    recoverable: parsedJson.recoverable,
-    error_code: parsedJson.error_code
-  };
 }
 
   app.get("/health", (req, res) => {
