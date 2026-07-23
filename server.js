@@ -1025,6 +1025,7 @@ async function consumeHermesStream(streamId) {
   }
 
   const rawReply = (finalContent && finalContent.trim()) ? finalContent.trim() : streamedContent.trim();
+  console.log("SSE_STATS:", { streamedContentLen: streamedContent.length, completedContentLen: completedContent.length, assistantCompletedReceived });
   return { answer: rawReply, firstTokenTime };
 }
 
@@ -2744,6 +2745,10 @@ function getDisplayNameSource(patient) {
 }
 
 app.post("/helios/message", async (req, res) => {
+  let processingStage = "request_received";
+  let requestPhone = null;
+  let requestPatientDisplayName = "Contacto sin identificar";
+  processingStage = "telemetry_started";
   const telemetryCtx = await startAdapterEvent(req.body || {});
   const startTime = Date.now();
   const uniqueEventId = crypto.randomUUID();
@@ -2892,6 +2897,7 @@ const hermesStartTime = Date.now();
     let hermesDurationMs = null;
     let result;
     try {
+      processingStage = "message_sent";
       result = await sendMessageToHermes(payload);
       hermesDurationMs = Date.now() - hermesStartTime;
     } catch(err) {
@@ -2962,9 +2968,12 @@ const hermesStartTime = Date.now();
         "ACTIVE_STREAM_CONFLICT",
         hermesDurationMs,
         {
-          patient_display_name: getPatientDisplayName(normalized?.patient),
-          phone: extractPhone(normalized, payload),
+          patient_display_name: requestPatientDisplayName,
+          phone: requestPhone,
           hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+          session_id: sessionId,
+          stream_id: streamId,
+          processing_stage: processingStage,
           display_name_source: getDisplayNameSource(normalized?.patient),
           message_preview: maskPreview(normalized?.message_text),
           message_count: normalized?.message_count,
@@ -2986,7 +2995,9 @@ const hermesStartTime = Date.now();
       return res.json(conflictResponse);
     }
 
+    processingStage = "contract_parsing";
     const normalizedResponse = normalizeAdapterResponse(result);
+    processingStage = "contract_validated";
     finalReply = normalizedResponse.reply || "";
     finalStatus = normalizedResponse.ok ? "ok" : "handoff";
     finalRoute = normalizedResponse.route || "hermes";
@@ -3032,9 +3043,12 @@ const hermesStartTime = Date.now();
       hermesDurationMs,
       debugEvent.token_usage,
       {
-        patient_display_name: getPatientDisplayName(normalized?.patient),
-          phone: extractPhone(normalized, payload),
+        patient_display_name: requestPatientDisplayName,
+          phone: requestPhone,
           hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+          session_id: sessionId,
+          stream_id: streamId,
+          processing_stage: processingStage,
         display_name_source: getDisplayNameSource(normalized?.patient),
         message_preview: maskPreview(normalized?.message_text),
         message_count: normalized?.message_count,
@@ -3044,6 +3058,7 @@ const hermesStartTime = Date.now();
       }
     );
 
+    processingStage = "response_returned";
     return res.json(normalizedResponse);
 
   } catch (error) {
@@ -3053,7 +3068,18 @@ const hermesStartTime = Date.now();
     finalIntent = "error_tecnico";
     errorMsg = error.message;
 
-    const normalizedError = normalizeProviderError(error);
+    let normalizedError = normalizeProviderError(error);
+    if (["assistant_completed_received", "contract_parsing", "contract_validated"].includes(processingStage) && (error.name === "SyntaxError" || error.message.includes("JSON") || error.message.includes("contrato"))) {
+      normalizedError = {
+        ok: false,
+        intent: "technical_error",
+        requires_handoff: false,
+        safe_to_send: false,
+        response_sent: false,
+        recoverable: true,
+        error_code: "INVALID_HERMES_CONTRACT"
+      };
+    }
     const errorResponse = {
       ok: false,
       route: "error",
@@ -3106,9 +3132,12 @@ const hermesStartTime = Date.now();
       normalizedError.error_code,
       typeof hermesDurationMs !== 'undefined' ? hermesDurationMs : null,
       {
-        patient_display_name: getPatientDisplayName(normalized?.patient),
-          phone: extractPhone(normalized, payload),
+        patient_display_name: requestPatientDisplayName,
+          phone: requestPhone,
           hermes_first_token_ms: typeof hermesFirstTokenMs !== 'undefined' ? hermesFirstTokenMs : null,
+          session_id: sessionId,
+          stream_id: streamId,
+          processing_stage: processingStage,
         display_name_source: getDisplayNameSource(normalized?.patient),
         message_preview: maskPreview(normalized?.message_text),
         message_count: normalized?.message_count,
