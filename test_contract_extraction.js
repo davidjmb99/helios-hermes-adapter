@@ -130,19 +130,37 @@ const testCases = {
     input: makeContractStr({ safe_to_send: false, message_for_client: "Mensaje no seguro" }),
     expectedOk: false,
     expectedReply: "",
-    expectedErrorCode: null // El contrato es válido, pero safe_to_send es false, por lo que ok es false y reply es vacío
+    expectedErrorCode: null
   },
   "P. El texto de reasoning nunca aparece en reply": {
     input: "Razonamiento secreto del modelo que no debe filtrarse.\n" + makeContractStr({ message_for_client: "Respuesta correcta." }),
     expectedOk: true,
     expectedReply: "Respuesta correcta.",
     expectedErrorCode: null
+  },
+  "T. Contrato con razonamiento dentro de message_for_client": {
+    input: makeContractStr({ message_for_client: "<think>razonamiento interno</think> Hola paciente." }),
+    expectedOk: false,
+    expectedReply: "",
+    expectedErrorCode: "INTERNAL_REASONING_IN_CLIENT_MESSAGE"
+  },
+  "U. Frase legítima con responder": {
+    input: makeContractStr({ message_for_client: "Puedes responder este mensaje con tu disponibilidad." }),
+    expectedOk: true,
+    expectedReply: "Puedes responder este mensaje con tu disponibilidad.",
+    expectedErrorCode: null
+  },
+  "V. Frase legítima con el paciente": {
+    input: makeContractStr({ message_for_client: "El paciente puede traer sus estudios anteriores." }),
+    expectedOk: true,
+    expectedReply: "El paciente puede traer sus estudios anteriores.",
+    expectedErrorCode: null
   }
 };
 
 let allPass = true;
 
-console.log("=== EJECUTANDO PRUEBAS OBLIGATORIAS (A-P) ===");
+console.log("=== EJECUTANDO PRUEBAS OBLIGATORIAS (A-V) ===");
 for (const [name, test] of Object.entries(testCases)) {
   try {
     const res = normalizeAdapterResponse({ answer: test.input });
@@ -160,9 +178,28 @@ for (const [name, test] of Object.entries(testCases)) {
       throw new Error(`Expected error_code=${test.expectedErrorCode}, got error_code=${res.error_code}`);
     }
     
+    // W. Nunca existe una salida con ok=false y safe_to_send=true
+    if (res.ok === false && res.safe_to_send === true) {
+      throw new Error("Violación de seguridad W: salida tiene ok=false pero safe_to_send=true");
+    }
+
     // Regla P: El texto de reasoning nunca aparece en reply
     if (test.expectedOk && test.input.includes("Razonamiento") && res.reply.includes("Razonamiento")) {
       throw new Error("El razonamiento se filtró en reply!");
+    }
+
+    // Corrección 2 para caso T (patches vacíos y tool_calls vacío)
+    if (name.startsWith("T.")) {
+      if (
+        Object.keys(res.profile_patch).length !== 0 ||
+        Object.keys(res.state_patch).length !== 0 ||
+        Object.keys(res.booking_patch).length !== 0 ||
+        res.tool_calls.length !== 0 ||
+        res.message_for_client !== "" ||
+        res.safe_to_send !== false
+      ) {
+        throw new Error("Caso T: no devolvió patches vacíos, tool_calls vacío o message_for_client vacío");
+      }
     }
 
     console.log(`✅ ${name}: PASS`);
@@ -172,7 +209,7 @@ for (const [name, test] of Object.entries(testCases)) {
   }
 }
 
-console.log("\n=== EJECUTANDO PRUEBA DE FIXTURE REAL ===");
+console.log("\n=== EJECUTANDO PRUEBA DE FIXTURE REAL (X) ===");
 try {
   const res = normalizeAdapterResponse({ answer: realFixtureText });
   assert.strictEqual(res.ok, true, "El fixture real debería ser válido (ok=true)");
@@ -192,7 +229,7 @@ try {
 }
 
 if (allPass) {
-  console.log("\n🎉 ¡TODAS LAS PRUEBAS PASARON EXITOSAMENTE! 🎉");
+  console.log("\n🎉 ¡TODAS LAS PRUEBAS DE EXTRACCIÓN Y SEGURIDAD PASARON! 🎉");
   process.exit(0);
 } else {
   console.error("\n❌ ALGUNAS PRUEBAS FALLARON.");

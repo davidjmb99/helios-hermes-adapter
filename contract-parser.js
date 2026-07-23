@@ -2,42 +2,38 @@ function containsInternalReasoning(text) {
   if (!text) return false;
   const lowerText = text.toLowerCase();
   const patterns = [
-    "estado:",
-    "**estado:**",
+    "<think",
+    "</think>",
     "siguiendo el flujo interno",
     "validar estado",
-    "señales",
-    "clasificar intención",
-    "clasificar intencion",
     "consultar rag",
     "rag/tools",
-    "responder",
     "ai enabled",
-    "handoff humano",
     "kill switch",
-    "status:",
-    "perfil:",
+    "pending_question",
+    "pending_intent",
+    "profile_patch",
+    "state_patch",
+    "booking_patch",
+    "tool_calls",
+    "safe_to_send",
+    "requires_handoff",
+    "**estado:**",
     "**perfil:**",
-    "clínica:",
-    "clinica:",
     "**clínica:**",
     "**clinica:**",
-    "no hay herramienta",
-    "herramienta de agenda",
-    "base de conocimiento",
+    "clasificar intención",
+    "clasificar intencion",
     "flujo interno",
-    "debo responder",
-    "la respuesta debe",
     "voy a procesar",
-    "el paciente",
     "detecto que",
-    "no tengo acceso directo",
-    "no tengo conectado",
     "esta simulación",
     "esta simulacion",
     "voy a intentar",
     "perfil está incompleto",
-    "perfil esta incompleto"
+    "perfil esta incompleto",
+    "no tengo acceso directo",
+    "no tengo conectado"
   ];
   return patterns.some(pattern => lowerText.includes(pattern));
 }
@@ -219,11 +215,28 @@ function normalizeAdapterResponse(result) {
   }
 
   // Validaciones de seguridad adicionales:
-  // La presencia de razonamiento fuera del JSON no debe invalidar el contrato,
-  // siempre que el JSON extraído cumpla el contrato, message_for_client no contenga
-  // razonamiento interno, y safe_to_send sea true para poder enviar al paciente.
+  // Corrección 2: Cuando hasReasoning === true dentro de message_for_client
   const hasReasoning = containsInternalReasoning(parsedJson.message_for_client);
-  const safe = parsedJson.safe_to_send === true && !hasReasoning;
+  if (hasReasoning) {
+    return {
+      ok: false,
+      reply: "",
+      message_for_client: "",
+      operation: { type: "technical_error", status: "failed", summary: "Respuesta final de Hermes rechazada por contener razonamiento interno en el mensaje al cliente." },
+      profile_patch: {},
+      state_patch: {},
+      booking_patch: {},
+      tool_calls: [],
+      safe_to_send: false,
+      response_sent: false,
+      requires_handoff: false,
+      recoverable: true,
+      error_code: "INTERNAL_REASONING_IN_CLIENT_MESSAGE"
+    };
+  }
+
+  // Corrección 1: safe_to_send: safe y ok: safe
+  const safe = parsedJson.safe_to_send === true;
 
   return {
     ok: safe,
@@ -234,7 +247,7 @@ function normalizeAdapterResponse(result) {
     state_patch: parsedJson.state_patch,
     booking_patch: parsedJson.booking_patch,
     tool_calls: parsedJson.tool_calls,
-    safe_to_send: parsedJson.safe_to_send,
+    safe_to_send: safe,
     response_sent: false,
     requires_handoff: parsedJson.requires_handoff,
     recoverable: parsedJson.recoverable,
