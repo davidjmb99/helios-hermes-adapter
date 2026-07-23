@@ -934,11 +934,56 @@ async function consumeHermesStream(streamId) {
     throw new Error(`Hermes stream connection failed HTTP ${response.status}: ${text.slice(0, 300)}`);
   }
 
-  let accumulatedAnswer = "";
+  let streamedContent = "";
+  let finalContent = "";
+  let reasoningContent = "";
+  let toolEvents = [];
+  let firstTokenTime = null;
+
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let currentEvent = "";
+
+  const processEvent = (eventName, dataStr) => {
+    let parsed = {};
+    let isJson = false;
+    try { parsed = JSON.parse(dataStr); isJson = true; } catch (_) {}
+    const evName = eventName || (isJson ? parsed.event : "") || "";
+
+    if (evName === "assistant.delta" || evName === "token") {
+      const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
+      if (!firstTokenTime) firstTokenTime = Date.now();
+      streamedContent += token;
+    } else if (evName === "reasoning_delta" || evName === "reasoning_content" || evName === "reasoning") {
+      const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
+      reasoningContent += token;
+    } else if (evName === "tool.progress" || evName === "tool" || evName === "tool_call") {
+      if (isJson) {
+        const toolName = parsed.tool_name || parsed.name || "";
+        if (toolName !== "_thinking") {
+          toolEvents.push({
+            name: toolName,
+            status: parsed.status || "started",
+            duration_ms: parsed.duration_ms || null,
+            result_code: parsed.result_code || null
+          });
+        }
+      }
+    } else if (evName === "assistant.completed") {
+      if (isJson && typeof parsed.content === "string") {
+        finalContent = parsed.content;
+      } else if (isJson && parsed.message && typeof parsed.message.content === "string") {
+        finalContent = parsed.message.content;
+      }
+    } else if (evName === "error") {
+      const errorMsg = isJson ? (parsed.error || parsed.message || dataStr) : dataStr;
+      throw new Error(`Hermes stream reported error: ${errorMsg}`);
+    } else if (["run.completed", "done", "complete", "completed"].includes(evName)) {
+      return true;
+    }
+    return false;
+  };
 
   try {
     while (true) {
@@ -949,6 +994,7 @@ async function consumeHermesStream(streamId) {
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop(); // Mantener línea incompleta en el buffer
 
+      let shouldBreak = false;
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -957,66 +1003,29 @@ async function consumeHermesStream(streamId) {
           currentEvent = trimmed.slice("event:".length).trim();
         } else if (trimmed.startsWith("data:")) {
           const dataStr = trimmed.slice("data:".length).trim();
-          if (dataStr === "[DONE]" || dataStr === "done") {
-            break;
-          }
-
-          let parsed = {};
-          let isJson = false;
-          try {
-            parsed = JSON.parse(dataStr);
-            isJson = true;
-          } catch (_) {}
-
-          const eventName = currentEvent || (isJson ? parsed.event : "") || "";
-
-          if (eventName === "token") {
-            const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
-            accumulatedAnswer += token;
-          } else if (eventName === "tool" || eventName === "tool_call") {
-              activeTool = true;
-            } else if (eventName === "tool_result" || eventName === "tool_end") {
-              activeTool = false;
-            } else if (eventName === "reasoning") {
-            // Ignorar razonamiento
-          } else if (eventName === "error") {
-            const errorMsg = isJson ? (parsed.error || parsed.message || dataStr) : dataStr;
-            throw new Error(`Hermes stream reported error: ${errorMsg}`);
-          } else if (["done", "complete", "completed"].includes(eventName)) {
-            break;
-          }
+          if (dataStr === "[DONE]" || dataStr === "done") { shouldBreak = true; break; }
+          if (processEvent(currentEvent, dataStr)) { shouldBreak = true; break; }
         }
       }
+      if (shouldBreak) break;
     }
 
-    // Procesar buffer restante
     if (buffer.trim()) {
       const trimmed = buffer.trim();
       if (trimmed.startsWith("data:")) {
         const dataStr = trimmed.slice("data:".length).trim();
         if (dataStr !== "[DONE]" && dataStr !== "done") {
-          let parsed = {};
-          let isJson = false;
-          try {
-            parsed = JSON.parse(dataStr);
-            isJson = true;
-          } catch (_) {}
-          const eventName = currentEvent || (isJson ? parsed.event : "") || "";
-          if (eventName === "token") {
-            const token = isJson ? (parsed.text || parsed.token || parsed.content || "") : dataStr;
-            accumulatedAnswer += token;
-          }
+          processEvent(currentEvent, dataStr);
         }
       }
     }
   } finally {
     clearTimeout(timeout);
-    try {
-      reader.cancel();
-    } catch (_) {}
+    try { reader.cancel(); } catch (_) {}
   }
 
-  return { answer: accumulatedAnswer, firstTokenTime };
+  const rawReply = (finalContent && finalContent.trim()) ? finalContent.trim() : streamedContent.trim();
+  return { answer: rawReply, firstTokenTime };
 }
 
 async function consumeHermesStreamWithRetry(streamId) {
@@ -1232,64 +1241,17 @@ function sanitizePatientReply(text) {
 function normalizeAdapterResponse(result) {
   const rawReply = result.answer || "";
   
-  if (isProviderErrorText(rawReply)) {
-    return {
-      ok: false,
-      reply: "",
-      message_for_client: "",
-      operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por error de proveedor." },
-      profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-      safe_to_send: false, response_sent: false, requires_handoff: true, recoverable: true, error_code: "PROVIDER_ERROR"
-    };
-  }
-
   let parsedJson = null;
   let isStrictJson = false;
-  let jsonError = false;
 
   const trimmed = rawReply.trim();
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
       parsedJson = JSON.parse(trimmed);
       isStrictJson = true;
-    } catch (e) {
-      jsonError = true;
-    }
+    } catch (e) {}
   }
 
-  // If there's text before/after, or multiple JSON objects, it will fail the strict startswith/endswith or JSON.parse.
-  // Also, check for "Pensando" or reasoning tags.
-  if (containsInternalReasoning(rawReply) || jsonError || (!isStrictJson && trimmed.includes("{") && trimmed.includes("}"))) {
-      return {
-        ok: false, reply: "", message_for_client: "",
-        operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
-        profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-        safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
-      };
-  }
-
-  // Fallback a texto plano si no hay llaves de JSON
-  if (!isStrictJson) {
-     const sanitizedReply = sanitizePatientReply(rawReply);
-     const lowerReply = (sanitizedReply || "").toLowerCase();
-     const forbiddenPhrases = ["perfil incompleto", "display_name", "mensajes consolidados", "buffer", "reglas internas", "herramientas", "razonamiento", "estados tǸcnicos", "nombres de campos"];
-     if (forbiddenPhrases.some(p => lowerReply.includes(p)) || containsInternalReasoning(sanitizedReply) || !sanitizedReply) {
-        return {
-          ok: false, reply: "", message_for_client: "",
-          operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
-          profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-          safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
-        };
-     }
-     
-     return {
-        ok: true, reply: sanitizedReply, message_for_client: sanitizedReply,
-        operation: {}, profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-        safe_to_send: true, response_sent: false, requires_handoff: false, recoverable: false, error_code: null
-     };
-  }
-
-  // Es un JSON estricto, validar campos requeridos
   const isValidContract = 
     parsedJson && 
     typeof parsedJson === "object" &&
@@ -1304,33 +1266,29 @@ function normalizeAdapterResponse(result) {
     typeof parsedJson.recoverable === "boolean" &&
     (typeof parsedJson.error_code === "string" || parsedJson.error_code === null);
 
-  if (!isValidContract) {
-     return {
-        ok: false, reply: "", message_for_client: "",
-        operation: { type: "technical_error", status: "failed", summary: "Respuesta de Hermes rechazada por formato inválido." },
-        profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
-        safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
-     };
+  if (!isStrictJson || !isValidContract) {
+    return {
+      ok: false, reply: "", message_for_client: "",
+      operation: { type: "technical_error", status: "failed", summary: "Respuesta final de Hermes rechazada por contrato inválido." },
+      profile_patch: {}, state_patch: {}, booking_patch: {}, tool_calls: [],
+      safe_to_send: false, response_sent: false, requires_handoff: false, recoverable: true, error_code: "INVALID_HERMES_CONTRACT"
+    };
   }
 
-  // Contrato vǭlido
-  const safe = parsedJson.safe_to_send === true;
-  const hasMsg = parsedJson.message_for_client.trim().length > 0;
-  
   return {
-     ok: safe && hasMsg,
-     reply: (safe && hasMsg) ? parsedJson.message_for_client : "",
-     message_for_client: parsedJson.message_for_client,
-     operation: parsedJson.operation,
-     profile_patch: parsedJson.profile_patch,
-     state_patch: parsedJson.state_patch,
-     booking_patch: parsedJson.booking_patch,
-     tool_calls: parsedJson.tool_calls,
-     safe_to_send: safe,
-     response_sent: false,
-     requires_handoff: parsedJson.requires_handoff,
-     recoverable: parsedJson.recoverable,
-     error_code: parsedJson.error_code
+    ok: true,
+    reply: parsedJson.message_for_client,
+    message_for_client: parsedJson.message_for_client,
+    operation: parsedJson.operation,
+    profile_patch: parsedJson.profile_patch,
+    state_patch: parsedJson.state_patch,
+    booking_patch: parsedJson.booking_patch,
+    tool_calls: parsedJson.tool_calls,
+    safe_to_send: parsedJson.safe_to_send,
+    response_sent: false,
+    requires_handoff: parsedJson.requires_handoff,
+    recoverable: parsedJson.recoverable,
+    error_code: parsedJson.error_code
   };
 }
 
