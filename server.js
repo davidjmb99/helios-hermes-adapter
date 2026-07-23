@@ -8,6 +8,8 @@ const {
   normalizeAdapterResponse
 } = require("./contract-parser");
 
+const TELEMETRY_TIMEOUT = Symbol("telemetry_timeout");
+
 function withTimeout(promise, ms, fallbackValue) {
   const safePromise = promise.catch(err => {
     console.error("Secondary operation late rejection:", err.message);
@@ -2767,7 +2769,7 @@ async function finalizeAdapterEventReliably(
   try {
     const ctxClone = { ...telemetryCtx, closed: false };
     
-    await withTimeout(
+    const result = await withTimeout(
       finishAdapterEvent(
         ctxClone,
         finalStatus,
@@ -2777,13 +2779,13 @@ async function finalizeAdapterEventReliably(
         extra
       ),
       3000,
-      Symbol.for("timeout")
-    ).then((result) => {
-      if (result === Symbol.for("timeout")) {
-        throw new Error("Primary telemetry finish timed out (>3000ms)");
-      }
-      primarySuccess = true;
-    });
+      TELEMETRY_TIMEOUT
+    );
+
+    if (result === TELEMETRY_TIMEOUT) {
+      throw new Error("Primary telemetry finish timed out (>3000ms)");
+    }
+    primarySuccess = true;
 
     if (primarySuccess) {
       console.log(JSON.stringify({
@@ -2819,18 +2821,24 @@ async function finalizeAdapterEventReliably(
           finished_at: new Date().toISOString()
         };
 
-        await withTimeout(
+        const result = await withTimeout(
           supabase
             .from('helios_adapter_events')
             .update(fallbackUpdate)
             .eq('id', telemetryCtx.eventId),
           3000,
-          Symbol.for("timeout")
-        ).then((resUpdate) => {
-          if (resUpdate === Symbol.for("timeout")) {
-            throw new Error("Fallback telemetry update timed out (>3000ms)");
-          }
-        });
+          TELEMETRY_TIMEOUT
+        );
+
+        if (result === TELEMETRY_TIMEOUT) {
+          throw new Error("Fallback telemetry update timed out");
+        }
+
+        if (result?.error) {
+          throw new Error(
+            `Fallback telemetry update failed: ${result.error.message}`
+          );
+        }
 
         console.log(JSON.stringify({
           event: "adapter_telemetry_fallback_finished",
@@ -3096,6 +3104,7 @@ const hermesStartTime = Date.now();
       debugEvent.adapter_response_preview = JSON.stringify(conflictResponse).slice(0, 1000);
       debugEvent.adapter_response_detail = JSON.stringify(conflictResponse, null, 2);
 
+      processingStage = "response_returned";
       const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
 
       // OBJETIVO 1 — OBSERVABILIDAD HTTP REAL
@@ -3142,7 +3151,7 @@ const hermesStartTime = Date.now();
       }));
 
       // Cerrar telemetría en segundo plano con manejo explícito
-      (async () => {
+      void (async () => {
         if (sessionId) {
           try {
             const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
@@ -3172,7 +3181,13 @@ const hermesStartTime = Date.now();
             response_preview: extractResponsePreview(conflictResponse)
           }
         );
-      })();
+      })().catch((error) => {
+        console.error(JSON.stringify({
+          event: "adapter_background_finalize_unhandled",
+          trace_id: traceId,
+          error: error?.message || "unknown"
+        }));
+      });
 
       return;
     }
@@ -3211,6 +3226,7 @@ const hermesStartTime = Date.now();
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
 
+    processingStage = "response_returned";
     // Registrar listeners una sola vez antes de responder:
     const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
 
@@ -3259,7 +3275,7 @@ const hermesStartTime = Date.now();
     }));
 
     // Cerrar telemetría en segundo plano con manejo explícito
-    (async () => {
+    void (async () => {
       if (sessionId) {
         try {
           const result = await withTimeout(
@@ -3292,7 +3308,13 @@ const hermesStartTime = Date.now();
           route: finalRoute,
         }
       );
-    })();
+    })().catch((error) => {
+      console.error(JSON.stringify({
+        event: "adapter_background_finalize_unhandled",
+        trace_id: traceId,
+        error: error?.message || "unknown"
+      }));
+    });
 
   } catch (error) {
     if (res.headersSent) {
@@ -3408,7 +3430,7 @@ const hermesStartTime = Date.now();
     }));
 
     // Cerrar telemetría en segundo plano
-    (async () => {
+    void (async () => {
       if (sessionId) {
         try {
           const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
@@ -3452,7 +3474,13 @@ const hermesStartTime = Date.now();
           error: err.message
         }));
       }
-    })();
+    })().catch((error) => {
+      console.error(JSON.stringify({
+        event: "adapter_background_finalize_unhandled",
+        trace_id: traceId,
+        error: error?.message || "unknown"
+      }));
+    });
   }
 });
 
