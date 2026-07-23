@@ -935,7 +935,8 @@ async function consumeHermesStream(streamId) {
   }
 
   let streamedContent = "";
-  let finalContent = "";
+  let completedContent = "";
+  let assistantCompletedReceived = false;
   let reasoningContent = "";
   let toolEvents = [];
   let firstTokenTime = null;
@@ -971,10 +972,18 @@ async function consumeHermesStream(streamId) {
         }
       }
     } else if (evName === "assistant.completed") {
+      let contentToSave = null;
       if (isJson && typeof parsed.content === "string") {
-        finalContent = parsed.content;
+        contentToSave = parsed.content;
       } else if (isJson && parsed.message && typeof parsed.message.content === "string") {
-        finalContent = parsed.message.content;
+        contentToSave = parsed.message.content;
+      } else if (!isJson && dataStr.trim() !== "") {
+        contentToSave = dataStr;
+      }
+      
+      if (typeof contentToSave === "string" && contentToSave.trim()) {
+        completedContent = contentToSave.trim();
+        assistantCompletedReceived = true;
       }
     } else if (evName === "error") {
       const errorMsg = isJson ? (parsed.error || parsed.message || dataStr) : dataStr;
@@ -1024,9 +1033,17 @@ async function consumeHermesStream(streamId) {
     try { reader.cancel(); } catch (_) {}
   }
 
-  const rawReply = (finalContent && finalContent.trim()) ? finalContent.trim() : streamedContent.trim();
+  const rawReply = completedContent.trim() !== "" ? completedContent.trim() : streamedContent.trim();
   console.log("SSE_STATS:", { streamedContentLen: streamedContent.length, completedContentLen: completedContent.length, assistantCompletedReceived });
-  return { answer: rawReply, firstTokenTime };
+  return { 
+    answer: rawReply,
+    firstTokenTime,
+    assistantCompletedReceived,
+    sessionId: null,
+    streamId: null,
+    tokenUsage: null,
+    toolCalls: toolEvents
+  };
 }
 
 async function consumeHermesStreamWithRetry(streamId) {
