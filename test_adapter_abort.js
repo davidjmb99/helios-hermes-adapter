@@ -35,8 +35,10 @@ async function waitForHealth(port, child, timeoutMs = 5000) {
 function gatewayPayload(contactId, message) {
   return {
     event: "patient_message_ready",
+    account_id: "test-account",
     tenant_id: "test-tenant",
     clinic_id: "test-clinic",
+    hermes_profile: "helios",
     channel: "chatwoot",
     conversation: {
       conversation_id: `conversation-${contactId}`,
@@ -153,6 +155,13 @@ test("Hermes stream abort returns HERMES_TIMEOUT without crashing the adapter", 
       HERMES_WEBUI_PASSWORD: "test-password",
       HERMES_WEBUI_BASE_URL: `http://127.0.0.1:${hermesPort}`,
       HERMES_TIMEOUT_MS: "150",
+      CHATWOOT_TENANT_CONTEXTS_JSON: JSON.stringify({
+        "test-account": {
+          tenant_id: "test-tenant",
+          clinic_id: "test-clinic",
+          hermes_profile: "helios"
+        }
+      }),
       HERMES_SESSION_STORE_PATH: sessionStorePath,
       SUPABASE_URL: "",
       SUPABASE_SERVICE_ROLE_KEY: ""

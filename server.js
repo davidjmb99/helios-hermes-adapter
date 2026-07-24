@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+const { validateTenantContext } = require("./tenant-context");
 const {
   findBalancedJsonObjects,
   isValidHermesContract,
@@ -450,9 +451,11 @@ function normalizeGatewayPayload(payload = {}) {
   return {
     event: payload.event || "patient_message_ready",
 
+    account_id: firstNonEmpty(payload.account_id),
     trace_id: firstNonEmpty(payload.trace_id, payload.metadata?.trace_id),
     tenant_id: firstNonEmpty(payload.tenant_id),
     clinic_id: firstNonEmpty(payload.clinic_id),
+    hermes_profile: firstNonEmpty(payload.hermes_profile),
     channel: firstNonEmpty(payload.channel),
 
     conversation_id: firstNonEmpty(
@@ -510,18 +513,23 @@ function getSessionIdentity(normalized) {
   return "";
 }
 
-function conversationKey(normalized) {
-  const tenant = normalized.tenant_id || "default";
-  const clinic = normalized.clinic_id || "default";
-  const identity = getSessionIdentity(normalized);
-
-  if (!identity) {
+function conversationKey(normalized, tenantContext) {
+  if (
+    !normalized.conversation_id ||
+    !normalized.contact_id ||
+    !tenantContext?.tenant_id ||
+    !tenantContext?.hermes_profile
+  ) {
     throw new Error(
-      "No se pudo construir session key: faltan conversation_id, contact_id, phone y trace_id"
+      "No se pudo construir session key: faltan tenant_id, hermes_profile, conversation_id o contact_id"
     );
   }
-
-  return `${tenant}:${clinic}:${identity}`;
+  return [
+    `tenant:${tenantContext.tenant_id}`,
+    `profile:${tenantContext.hermes_profile}`,
+    `conversation:${normalized.conversation_id}`,
+    `contact:${normalized.contact_id}`
+  ].join(":");
 }
 
 function buildHermesMessage(normalized) {
@@ -697,13 +705,13 @@ async function hermesGetRequest(path, retryLogin = true) {
   return data;
 }
 
-async function fetchHermesSessionData(sessionId) {
+async function fetchHermesSessionData(sessionId, hermesProfile) {
   if (!sessionId) return { sessionData: null, attempts: [] };
 
   const pathsToTry = [
     `/api/session?session_id=${encodeURIComponent(sessionId)}&messages=0&resolve_model=1`,
     `/api/session?session_id=${encodeURIComponent(sessionId)}&messages=1&resolve_model=1&msg_limit=5`,
-    `/api/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(HERMES_PROFILE)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(hermesProfile)}`,
     `/api/sessions/${encodeURIComponent(sessionId)}`
   ];
 
@@ -850,12 +858,12 @@ function withOptionalModel(body) {
   return next;
 }
 
-async function createHermesSession(normalized) {
+async function createHermesSession(normalized, tenantContext) {
   const data = await hermesRequest(
     "/api/session/new",
     withOptionalModel({
       workspace: HERMES_CWD,
-      profile: HERMES_PROFILE
+      profile: tenantContext.hermes_profile
     })
   );
 
@@ -865,10 +873,11 @@ async function createHermesSession(normalized) {
     throw new Error("Hermes no devolvió session_id al crear sesión");
   }
 
-  const key = conversationKey(normalized);
+  const key = conversationKey(normalized, tenantContext);
 
   sessionMap[key] = {
     session_id: sessionId,
+    profile: tenantContext.hermes_profile,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   };
@@ -878,14 +887,14 @@ async function createHermesSession(normalized) {
   return sessionId;
 }
 
-async function getHermesSessionId(normalized) {
-  const key = conversationKey(normalized);
+async function getHermesSessionId(normalized, tenantContext) {
+  const key = conversationKey(normalized, tenantContext);
 
   if (sessionMap[key]?.session_id) {
     return sessionMap[key].session_id;
   }
 
-  return createHermesSession(normalized);
+  return createHermesSession(normalized, tenantContext);
 }
 
 function isSessionMissingError(errorOrData) {
@@ -917,11 +926,11 @@ function isProviderErrorText(text) {
   );
 }
 
-async function startHermesStream(sessionId, normalized) {
+async function startHermesStream(sessionId, normalized, tenantContext) {
   const body = withOptionalModel({
     session_id: sessionId,
     workspace: HERMES_CWD,
-    profile: HERMES_PROFILE,
+    profile: tenantContext.hermes_profile,
     message: buildHermesMessage(normalized)
   });
 
@@ -1119,16 +1128,19 @@ async function consumeHermesStreamWithRetry(streamId) {
 
 async function sendMessageToHermes(payload) {
   const normalized = normalizeGatewayPayload(payload);
-  const key = conversationKey(normalized);
+  const tenantContext = validateTenantContext(normalized);
+  const key = conversationKey(normalized, tenantContext);
 
-  let sessionId = await getHermesSessionId(normalized);
+  let sessionId = await getHermesSessionId(normalized, tenantContext);
 
   console.log(
     JSON.stringify({
       event: "adapter_payload_normalized",
+      normalized_account_id: tenantContext.account_id,
       normalized_trace_id: normalized.trace_id || null,
       normalized_tenant_id: normalized.tenant_id || null,
       normalized_clinic_id: normalized.clinic_id || null,
+      normalized_hermes_profile: tenantContext.hermes_profile,
       normalized_conversation_id: normalized.conversation_id || null,
       normalized_contact_id: normalized.contact_id || null,
       normalized_phone_exists: Boolean(normalized.phone),
@@ -1147,7 +1159,7 @@ async function sendMessageToHermes(payload) {
   const runStreamFlow = async (sid) => {
     let startData;
     try {
-      startData = await startHermesStream(sid, normalized);
+      startData = await startHermesStream(sid, normalized, tenantContext);
     } catch (error) {
       if (error.status === 409) {
         console.error(
@@ -1222,7 +1234,7 @@ async function sendMessageToHermes(payload) {
     delete sessionMap[key];
     saveSessionMap();
 
-    sessionId = await createHermesSession(normalized);
+    sessionId = await createHermesSession(normalized, tenantContext);
     await runStreamFlow(sessionId);
   }
 
@@ -1236,7 +1248,8 @@ async function sendMessageToHermes(payload) {
     streamId,
     answer,
     conflict,
-    activeStreamId
+    activeStreamId,
+    hermesProfile: tenantContext.hermes_profile
   };
 }
 
@@ -2687,6 +2700,22 @@ function serveDashboard(req, res) {
 app.get("/", requireDebugAuth, serveDashboard);
 
 function normalizeProviderError(error) {
+  if (
+    error.code === "TENANT_NOT_CONFIGURED" ||
+    error.code === "TENANT_CONTEXT_INVALID" ||
+    error.code === "TENANT_CONTEXT_MISMATCH"
+  ) {
+    return {
+      error_code: error.code,
+      intent: "tenant_configuration_error",
+      recoverable: false,
+      requires_handoff: false,
+      safe_to_send: false,
+      response_sent: false,
+      http_status: 422
+    };
+  }
+
   const errStr = String(error.message || "").toLowerCase();
   const isTimeout = 
     error.name === "AbortError" || 
@@ -2721,9 +2750,7 @@ function normalizeProviderError(error) {
 
 function maskPreview(text) {
   if (!text) return "";
-  let masked = text.replace(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/gi, "[EMAIL]");
-  masked = masked.replace(/(\+?\d{7,15})/g, "[PHONE]");
-  return masked.slice(0, 160);
+  return "[REDACTED_MESSAGE]";
 }
 
 function extractResponsePreview(responseObj) {
@@ -2759,7 +2786,7 @@ function extractResponsePreview(responseObj) {
     return "";
   }
 
-  return reply.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/```json[\s\S]*?```/gi, "").trim().slice(0, 200);
+  return "[REDACTED_RESPONSE]";
 }
 
 function extractPhone(normalized, payload, input) {
@@ -2925,7 +2952,7 @@ app.post("/helios/message", async (req, res) => {
     requires_handoff: false,
     duration_ms: null,
 
-    input_preview: normalized.message_text ? normalized.message_text.slice(0, 1000) : "",
+    input_preview: maskPreview(normalized.message_text),
     input_detail: null,
 
     hermes_request_preview: null,
@@ -2981,21 +3008,24 @@ app.post("/helios/message", async (req, res) => {
       patient: {
         profile_exists: normalized.patient?.profile_exists,
         profile_complete: normalized.patient?.profile_complete,
-        name: normalized.patient?.name,
-        email: normalized.patient?.email ? maskEmail(normalized.patient.email) : undefined
+        name_present: Boolean(normalized.patient?.name),
+        email_present: Boolean(normalized.patient?.email)
       },
       state: normalized.state,
       message: {
-        text: normalized.message_text,
+        text: maskPreview(normalized.message_text),
         message_count: normalized.message_count,
-        messages: normalized.message_items
+        messages: normalized.message_items.map((item) => ({
+          id: item?.id,
+          created_at: item?.created_at,
+          body: item?.body ? "[REDACTED_MESSAGE]" : item?.body
+        }))
       }
     };
     debugEvent.input_detail = JSON.stringify(input_detail, null, 2);
 
-    const messageToHermes = buildHermesMessage(normalized);
-    debugEvent.hermes_request_preview = messageToHermes.slice(0, 1000);
-    debugEvent.hermes_request_detail = messageToHermes;
+    debugEvent.hermes_request_preview = "[OPERATIONAL_PAYLOAD_REDACTED]";
+    debugEvent.hermes_request_detail = debugEvent.input_detail;
   } catch (_) {}
 
   let sessionId = "";
@@ -3116,7 +3146,7 @@ const hermesStartTime = Date.now();
           reason: "active_stream_conflict"
         },
         metadata: {
-          profile: HERMES_PROFILE,
+          profile: result.hermesProfile,
           hermes_session_id: sessionId,
           active_stream_id: result.activeStreamId || "",
           reason: "active_stream_conflict"
@@ -3181,7 +3211,10 @@ const hermesStartTime = Date.now();
       void (async () => {
         if (sessionId) {
           try {
-            const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+            const { sessionData, attempts } = await fetchHermesSessionData(
+              sessionId,
+              result.hermesProfile
+            );
             debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
           } catch (_) {}
         }
@@ -3305,12 +3338,15 @@ const hermesStartTime = Date.now();
     void (async () => {
       if (sessionId) {
         try {
-          const result = await withTimeout(
-            fetchHermesSessionData(sessionId),
+          const sessionResult = await withTimeout(
+            fetchHermesSessionData(sessionId, result.hermesProfile),
             3000,
             { sessionData: null, attempts: [] }
           );
-          debugEvent.token_usage = extractTokenUsage(result.sessionData, result.attempts);
+          debugEvent.token_usage = extractTokenUsage(
+            sessionResult.sessionData,
+            sessionResult.attempts
+          );
         } catch (_) {}
       }
 
@@ -3460,7 +3496,10 @@ const hermesStartTime = Date.now();
     void (async () => {
       if (sessionId) {
         try {
-          const { sessionData, attempts } = await fetchHermesSessionData(sessionId);
+          const { sessionData, attempts } = await fetchHermesSessionData(
+            sessionId,
+            normalized?.hermes_profile
+          );
           debugEvent.token_usage = extractTokenUsage(sessionData, attempts);
         } catch (_) {}
       }

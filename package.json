@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test_adapter_abort.js test_contract_extraction.js test_normalize.js test_normalize2.js"
+    "test": "node --test --test-concurrency=1 test_adapter_abort.js test_contract_extraction.js test_normalize.js test_normalize2.js test_multitenant.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",
