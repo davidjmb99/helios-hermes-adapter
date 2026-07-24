@@ -928,6 +928,18 @@ async function startHermesStream(sessionId, normalized) {
   return hermesRequest("/api/chat/start", body);
 }
 
+function isAbortError(error) {
+  return error?.name === "AbortError" || error?.code === "ABORT_ERR";
+}
+
+function createHermesTimeoutError(cause) {
+  const error = new Error(`Hermes stream timed out after ${HERMES_TIMEOUT_MS} ms`, {
+    cause
+  });
+  error.code = "HERMES_TIMEOUT";
+  return error;
+}
+
 async function consumeHermesStream(streamId) {
   if (!hermesCookie) {
     await hermesLogin();
@@ -949,6 +961,9 @@ async function consumeHermesStream(streamId) {
     });
   } catch (error) {
     clearTimeout(timeout);
+    if (isAbortError(error)) {
+      throw createHermesTimeoutError(error);
+    }
     throw error;
   }
 
@@ -1059,9 +1074,20 @@ async function consumeHermesStream(streamId) {
         }
       }
     }
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw createHermesTimeoutError(error);
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
-    try { reader.cancel(); } catch (_) {}
+    try {
+      await reader.cancel();
+    } catch (error) {
+      if (!isAbortError(error)) {
+        throw error;
+      }
+    }
   }
 
   const rawReply = completedContent.trim() !== "" ? completedContent.trim() : streamedContent.trim();
@@ -2664,6 +2690,7 @@ function normalizeProviderError(error) {
   const errStr = String(error.message || "").toLowerCase();
   const isTimeout = 
     error.name === "AbortError" || 
+    error.code === "HERMES_TIMEOUT" ||
     error.code === "ECONNABORTED" || 
     error.code === "ETIMEDOUT" || 
     errStr.includes("timeout") ||
