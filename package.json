@@ -1,6 +1,6 @@
 {
   "name": "helios-hermes-adapter",
-  "version": "2.0.0",
+  "version": "2.5.0",
   "description": "Adapter service between Helios Gateway and the dedicated Hermes profile helios.",
   "main": "server.js",
   "scripts": {

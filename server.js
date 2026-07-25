@@ -1418,7 +1418,7 @@ function sanitizePatientReply(text) {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.4.14",
+    version: "2.5.0",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: HERMES_TRANSPORT === "agent_api"
@@ -2318,7 +2318,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.4.14</div>
+      <div class="stat-value" style="color: var(--primary);">2.5.0</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -3630,5 +3630,5 @@ const hermesStartTime = Date.now();
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.4.14 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.5.0 listening on port ${PORT}`);
 });
