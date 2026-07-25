@@ -6,7 +6,7 @@ COPY package.json package-lock.json* ./
 
 RUN npm install --omit=dev
 
-COPY server.js contract-parser.js ./
+COPY server.js contract-parser.js tenant-context.js ./
 
 EXPOSE 3000
 
