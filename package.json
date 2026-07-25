@@ -1,11 +1,11 @@
 {
   "name": "helios-hermes-adapter",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "Adapter service between Helios Gateway and the dedicated Hermes profile helios.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test --test-concurrency=1 test_adapter_abort.js test_contract_extraction.js test_normalize.js test_normalize2.js test_multitenant.js test_hermes_agent_client.js test_agent_api_transport.js"
+    "test": "node --test --test-concurrency=1 test_adapter_abort.js test_contract_extraction.js test_normalize.js test_normalize2.js test_multitenant.js test_hermes_agent_client.js test_agent_api_transport.js test_request_identity.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",

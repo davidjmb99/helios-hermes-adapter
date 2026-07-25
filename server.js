@@ -3,6 +3,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
+const { createStableRequestIdentity } = require("./request-identity");
 const {
   findBalancedJsonObjects,
   isValidHermesContract,
@@ -1272,6 +1273,7 @@ async function sendMessageToHermesAgentApi(payload) {
   const tenantContext = validateTenantContext(normalized);
   const key = conversationKey(normalized, tenantContext);
   const conversation = `helios-${hashShort(key)}`;
+  const requestIdentity = createStableRequestIdentity(normalized, tenantContext);
 
   console.log(
     JSON.stringify({
@@ -1288,6 +1290,10 @@ async function sendMessageToHermesAgentApi(payload) {
       message_count: normalized.message_count,
       session_key_hash: hashShort(key),
       hermes_conversation: conversation,
+      idempotency_strategy: requestIdentity.strategy,
+      request_fingerprint_hash: requestIdentity.fingerprintHash,
+      source_message_id_count: requestIdentity.sourceMessageIdCount,
+      recovery_request: normalized.trace_id.startsWith("recovery-"),
       using_model_override: Boolean(process.env.HERMES_AGENT_MODEL)
     })
   );
@@ -1295,7 +1301,7 @@ async function sendMessageToHermesAgentApi(payload) {
   const result = await hermesAgentClient.sendMessage({
     input: buildHermesMessage(normalized),
     conversation,
-    idempotencyKey: normalized.trace_id || undefined
+    idempotencyKey: requestIdentity.key || normalized.trace_id || undefined
   });
 
   return {
@@ -1418,7 +1424,7 @@ function sanitizePatientReply(text) {
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.5.0",
+    version: "2.5.1",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
     mode: HERMES_TRANSPORT === "agent_api"
@@ -2318,7 +2324,7 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.5.0</div>
+      <div class="stat-value" style="color: var(--primary);">2.5.1</div>
       <div class="stat-detail">Node.js 20+</div>
     </div>
     <div class="stat-card">
@@ -3630,5 +3636,5 @@ const hermesStartTime = Date.now();
 });
 
 app.listen(PORT, () => {
-  console.log(`helios-hermes-adapter v2.5.0 listening on port ${PORT}`);
+  console.log(`helios-hermes-adapter v2.5.1 listening on port ${PORT}`);
 });

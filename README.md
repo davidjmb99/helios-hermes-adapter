@@ -31,7 +31,8 @@ El adaptador:
 2. Valida y aísla el contexto de tenant, clínica y perfil.
 3. Construye una conversación opaca y estable por contacto/conversación.
 4. Llama a `POST /v1/responses` del gateway oficial de Hermes Agent.
-5. Usa el `trace_id` como clave de idempotencia.
+5. Deriva una clave de idempotencia estable desde los IDs originales de los
+   mensajes; usa `trace_id` solo cuando el origen no aporta esos IDs.
 6. Extrae solo el mensaje final del asistente.
 7. Normaliza el contrato moderno y sus campos de compatibilidad.
 8. Registra telemetría sin exponer secretos ni datos del paciente.
@@ -131,6 +132,12 @@ supervisión tras reinicio: PASS
 No existe fallback automático entre API y WebUI. Es intencionado: repetir una
 petición después de una herramienta de HubSpot o Cal.com podría duplicar una
 acción.
+
+La idempotencia del Adapter evita volver a ejecutar el mismo lote de mensajes
+en Hermes dentro de la ventana de deduplicación del API. No sustituye la
+garantía de entrega del Gateway: el envío a Chatwoot debe usar una bandeja de
+salida persistente con clave única por mensaje de origen y registrar el ID del
+mensaje saliente antes de considerar completado el evento.
 
 Para volver temporalmente al transporte anterior:
 

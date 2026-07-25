@@ -183,7 +183,8 @@ test("adapter completes the production route through Hermes Agent API", async (t
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].authorization, "Bearer agent-api-secret");
-  assert.equal(requests[0].idempotencyKey, "trace-agent-api-1");
+  assert.match(requests[0].idempotencyKey, /^helios-[a-f0-9]{64}$/);
+  assert.notEqual(requests[0].idempotencyKey, "trace-agent-api-1");
   assert.equal(requests[0].body.model, "helios");
   assert.equal(requests[0].body.store, true);
   assert.match(requests[0].body.conversation, /^helios-[a-f0-9]{12}$/);
