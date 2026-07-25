@@ -2,6 +2,7 @@ const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
+const { createHermesAgentClient } = require("./hermes-agent-client");
 const {
   findBalancedJsonObjects,
   isValidHermesContract,
@@ -67,6 +68,7 @@ function getCookie(req, name) {
 }
 
 const HERMES_PROFILE = process.env.HERMES_PROFILE || "helios";
+const HERMES_TRANSPORT = String(process.env.HERMES_TRANSPORT || "webui").toLowerCase();
 const HERMES_CWD =
   process.env.HERMES_CWD ||
   "/home/hermeswebui/.hermes/profiles/helios/workspace/helios";
@@ -76,6 +78,11 @@ const HERMES_WEBUI_BASE_URL = (
 ).replace(/\/+$/, "");
 
 const HERMES_WEBUI_PASSWORD = process.env.HERMES_WEBUI_PASSWORD || "";
+const HERMES_AGENT_API_BASE_URL = (
+  process.env.HERMES_AGENT_API_BASE_URL || ""
+).replace(/\/+$/, "");
+const HERMES_AGENT_API_KEY = process.env.HERMES_AGENT_API_KEY || "";
+const HERMES_AGENT_MODEL = process.env.HERMES_AGENT_MODEL || HERMES_PROFILE;
 const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
 
 const SESSION_STORE_PATH =
@@ -87,6 +94,12 @@ const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 
 let hermesCookie = "";
 let sessionMap = {};
+const hermesAgentClient = createHermesAgentClient({
+  baseUrl: HERMES_AGENT_API_BASE_URL,
+  apiKey: HERMES_AGENT_API_KEY,
+  model: HERMES_AGENT_MODEL,
+  timeoutMs: HERMES_TIMEOUT_MS
+});
 
 
 function normalizeTelemetryIdentity(payload) {
@@ -1126,7 +1139,7 @@ async function consumeHermesStreamWithRetry(streamId) {
   }
 }
 
-async function sendMessageToHermes(payload) {
+async function sendMessageToHermesWebUi(payload) {
   const normalized = normalizeGatewayPayload(payload);
   const tenantContext = validateTenantContext(normalized);
   const key = conversationKey(normalized, tenantContext);
@@ -1249,8 +1262,65 @@ async function sendMessageToHermes(payload) {
     answer,
     conflict,
     activeStreamId,
-    hermesProfile: tenantContext.hermes_profile
+    hermesProfile: tenantContext.hermes_profile,
+    transport: "webui"
   };
+}
+
+async function sendMessageToHermesAgentApi(payload) {
+  const normalized = normalizeGatewayPayload(payload);
+  const tenantContext = validateTenantContext(normalized);
+  const key = conversationKey(normalized, tenantContext);
+  const conversation = `helios-${hashShort(key)}`;
+
+  console.log(
+    JSON.stringify({
+      event: "adapter_payload_normalized",
+      transport: "agent_api",
+      normalized_account_id: tenantContext.account_id,
+      normalized_trace_id: normalized.trace_id || null,
+      normalized_tenant_id: normalized.tenant_id || null,
+      normalized_clinic_id: normalized.clinic_id || null,
+      normalized_hermes_profile: tenantContext.hermes_profile,
+      normalized_conversation_id: normalized.conversation_id || null,
+      normalized_contact_id: normalized.contact_id || null,
+      normalized_phone_exists: Boolean(normalized.phone),
+      message_count: normalized.message_count,
+      session_key_hash: hashShort(key),
+      hermes_conversation: conversation,
+      using_model_override: Boolean(process.env.HERMES_AGENT_MODEL)
+    })
+  );
+
+  const result = await hermesAgentClient.sendMessage({
+    input: buildHermesMessage(normalized),
+    conversation,
+    idempotencyKey: normalized.trace_id || undefined
+  });
+
+  return {
+    sessionId: result.responseId,
+    streamId: "",
+    answer: result.answer,
+    conflict: false,
+    activeStreamId: "",
+    hermesProfile: tenantContext.hermes_profile,
+    transport: "agent_api",
+    tokenUsage: result.tokenUsage,
+    toolCalls: result.toolCalls
+  };
+}
+
+async function sendMessageToHermes(payload) {
+  if (HERMES_TRANSPORT === "agent_api") {
+    return sendMessageToHermesAgentApi(payload);
+  }
+  if (HERMES_TRANSPORT === "webui") {
+    return sendMessageToHermesWebUi(payload);
+  }
+  const error = new Error(`Transporte Hermes no soportado: ${HERMES_TRANSPORT}`);
+  error.code = "HERMES_TRANSPORT_INVALID";
+  throw error;
 }
 
 function containsInternalReasoning(text) {
@@ -1351,7 +1421,13 @@ function sanitizePatientReply(text) {
     version: "2.4.14",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
     profile: HERMES_PROFILE,
-    mode: "HERMES_WEBUI_STREAM_API",
+    mode: HERMES_TRANSPORT === "agent_api"
+      ? "HERMES_AGENT_RESPONSES_API"
+      : "HERMES_WEBUI_STREAM_API",
+    hermes_transport: HERMES_TRANSPORT,
+    hermes_agent_api_base_url_configured: Boolean(HERMES_AGENT_API_BASE_URL),
+    hermes_agent_api_key_configured: Boolean(HERMES_AGENT_API_KEY),
+    hermes_agent_model: HERMES_AGENT_MODEL,
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
     hermes_webui_password_configured: Boolean(HERMES_WEBUI_PASSWORD),
     using_model_override: Boolean(HERMES_MODEL || HERMES_MODEL_PROVIDER),
@@ -3108,6 +3184,9 @@ const hermesStartTime = Date.now();
 
     debugEvent.hermes_session_id = sessionId;
     debugEvent.hermes_stream_id = streamId;
+    if (result.tokenUsage) {
+      debugEvent.token_usage = result.tokenUsage;
+    }
 
     if (result.conflict) {
       finalStatus = "error";
@@ -3209,7 +3288,7 @@ const hermesStartTime = Date.now();
 
       // Cerrar telemetría en segundo plano con manejo explícito
       void (async () => {
-        if (sessionId) {
+        if (sessionId && result.transport !== "agent_api") {
           try {
             const { sessionData, attempts } = await fetchHermesSessionData(
               sessionId,
@@ -3336,7 +3415,7 @@ const hermesStartTime = Date.now();
 
     // Cerrar telemetría en segundo plano con manejo explícito
     void (async () => {
-      if (sessionId) {
+      if (sessionId && result.transport !== "agent_api") {
         try {
           const sessionResult = await withTimeout(
             fetchHermesSessionData(sessionId, result.hermesProfile),
@@ -3494,7 +3573,7 @@ const hermesStartTime = Date.now();
 
     // Cerrar telemetría en segundo plano
     void (async () => {
-      if (sessionId) {
+      if (sessionId && HERMES_TRANSPORT !== "agent_api") {
         try {
           const { sessionData, attempts } = await fetchHermesSessionData(
             sessionId,

@@ -1,173 +1,170 @@
 # helios-hermes-adapter
 
-Adapter de producción entre Helios Gateway y Hermes WebUI usando el perfil `helios`.
+Adaptador de producción entre Helios Gateway y el perfil dedicado `helios` de
+Hermes Agent.
 
-Este servicio recibe eventos estructurados desde `helios-gateway`, valida la solicitud con un token compartido, crea o reutiliza una sesión de Hermes por conversación/contacto de Chatwoot, envía el payload original del gateway a Hermes y devuelve una respuesta normalizada al gateway.
+Hermes se utiliza como arnés: su código no se modifica ni se mantiene un fork.
+El perfil `helios` conserva su SOUL, modelo, memoria y herramientas MCP. El
+adaptador se limita al transporte, aislamiento de conversaciones, validación y
+normalización del contrato.
 
-El adapter no toma decisiones clínicas, comerciales ni de agenda. Hermes perfil `helios` es el cerebro.
-
-## Flujo de producción
+## Flujo recomendado
 
 ```text
 Chatwoot / WhatsApp
-→ helios-gateway
+→ Helios Gateway
 → helios-hermes-adapter
-→ Hermes WebUI perfil helios
-→ helios-gateway
-→ Respuesta al paciente en Chatwoot
+→ Hermes Agent API, perfil helios, puerto 8643
+→ helios-hermes-adapter
+→ Helios Gateway
+→ paciente
 ```
 
-## Responsabilidad del adapter
+El transporte antiguo por Hermes WebUI continúa disponible únicamente para un
+rollback controlado.
 
-Este servicio debe actuar solo como capa técnica de transporte entre Helios Gateway y Hermes.
+## Responsabilidades
 
-Debe hacer:
+El adaptador:
 
-```text
-1. Validar la API key compartida.
-2. Recibir el payload del gateway.
-3. Crear o reutilizar una sesión Hermes por conversación/contacto.
-4. Enviar el payload a Hermes.
-5. Recibir la respuesta de Hermes.
-6. Devolver una respuesta normalizada al gateway.
-```
+1. Valida el token compartido con Helios Gateway.
+2. Valida y aísla el contexto de tenant, clínica y perfil.
+3. Construye una conversación opaca y estable por contacto/conversación.
+4. Llama a `POST /v1/responses` del gateway oficial de Hermes Agent.
+5. Usa el `trace_id` como clave de idempotencia.
+6. Extrae solo el mensaje final del asistente.
+7. Normaliza el contrato moderno y sus campos de compatibilidad.
+8. Registra telemetría sin exponer secretos ni datos del paciente.
 
-No debe hacer:
-
-```text
-- Decidir intención clínica.
-- Decidir si agenda, cancela o reprograma.
-- Inventar respuestas al paciente.
-- Cambiar reglas del perfil helios.
-- Forzar lógica dental.
-- Modificar el comportamiento del cerebro Hermes.
-```
+El adaptador no decide lógica clínica, comercial ni de agenda y no modifica el
+comportamiento del perfil `helios`.
 
 ## Endpoints
 
-### GET /
-
-Devuelve información básica del servicio.
-
-### GET /health
-
-Devuelve el estado del servicio y configuración segura.
-
-No expone claves ni contraseñas.
-
-### POST /helios/message
-
-Endpoint principal usado por `helios-gateway`.
-
-Headers requeridos:
+- `GET /`: información básica.
+- `GET /health`: configuración segura, sin valores secretos.
+- `POST /helios/message`: endpoint autenticado para Helios Gateway.
 
 ```http
 Authorization: Bearer <HERMES_API_KEY>
 Content-Type: application/json
 ```
 
-## Variables de entorno requeridas
+## Configuración recomendada en Coolify
 
-Estas variables se configuran en Coolify.
-
-No colocar valores reales dentro de GitHub.
+No guardar valores reales en GitHub.
 
 ```env
 NODE_ENV=production
 PORT=3000
 
+# Token compartido Gateway → Adapter
 HERMES_API_KEY=
+
+# Transporte oficial por perfil
+HERMES_TRANSPORT=agent_api
 HERMES_PROFILE=helios
-HERMES_CWD=/home/hermeswebui/.hermes/profiles/helios/workspace/helios
-
-HERMES_WEBUI_BASE_URL=https://hermes.servicios.escala365.com
-HERMES_WEBUI_PASSWORD=
-
+HERMES_AGENT_API_BASE_URL=http://<servicio-interno-hermes>:8643
+HERMES_AGENT_API_KEY=
+HERMES_AGENT_MODEL=helios
 HERMES_TIMEOUT_MS=30000
-HERMES_SESSION_STORE_PATH=/tmp/helios-hermes-sessions.json
 
-DEBUG_USERNAME=democoi1
-DEBUG_PASSWORD=democoi1
+# Mapa autorizado de cuentas/tenants
+CHATWOOT_TENANT_CONTEXTS_JSON=
+
+DEBUG_USERNAME=
+DEBUG_PASSWORD=
 DEBUG_TOKEN=
 ```
 
-## Modelo de IA
+`HERMES_AGENT_API_BASE_URL` debe usar la red privada de Coolify siempre que
+ambos servicios estén en el mismo servidor o red. No se necesita publicar el
+puerto 8643 en Internet.
 
-El adapter no debe forzar el modelo si Hermes perfil `helios` ya tiene configurado su modelo principal.
+La clave de `HERMES_AGENT_API_KEY` pertenece al gateway de Hermes Agent. Es
+distinta del token `HERMES_API_KEY` que protege la entrada al adaptador.
 
-Estas variables son opcionales:
+## Requisito previo de producción
 
-```env
-HERMES_MODEL=
-HERMES_MODEL_PROVIDER=
+El proceso siguiente debe estar supervisado de forma permanente:
+
+```bash
+hermes -p helios gateway run
 ```
 
-Déjalas vacías o sin crear en Coolify si Hermes ya tiene configurado el modelo correcto.
+No basta con dejarlo en segundo plano dentro de una sesión de terminal. En
+Coolify debe ejecutarse como proceso principal de un servicio o mediante el
+supervisor ya utilizado por el contenedor. El perfil y su estado deben residir
+en un volumen persistente.
+
+Antes de activar el nuevo transporte deben pasar:
+
+```text
+gateway iniciado: sí
+puerto: 8643
+health: PASS
+readiness: PASS
+modelo anunciado: helios
+chat completion: PASS
+HubSpot MCP disponible: sí
+Cal.com MCP disponibles: 4
+supervisión tras reinicio: PASS
+```
+
+## Activación gradual
+
+1. Hacer permanente el proceso `helios` en Coolify.
+2. Reiniciar el servicio Hermes y repetir health, readiness y chat completion.
+3. Desplegar esta versión del adaptador sin cambiar todavía el Gateway.
+4. Confirmar en `/health`:
+   - `hermes_transport: "agent_api"`
+   - `hermes_agent_api_base_url_configured: true`
+   - `hermes_agent_api_key_configured: true`
+   - `hermes_agent_model: "helios"`
+5. Probar `POST /helios/message` con una conversación de prueba.
+6. Probar desde WhatsApp: conversación simple, creación de contacto y consulta
+   de disponibilidad.
+7. Observar errores, latencia y duplicados antes de ampliar tráfico.
+
+## Rollback
+
+No existe fallback automático entre API y WebUI. Es intencionado: repetir una
+petición después de una herramienta de HubSpot o Cal.com podría duplicar una
+acción.
+
+Para volver temporalmente al transporte anterior:
+
+```env
+HERMES_TRANSPORT=webui
+HERMES_WEBUI_BASE_URL=https://<hermes-webui>
+HERMES_WEBUI_PASSWORD=
+HERMES_CWD=/home/hermeswebui/.hermes/profiles/helios/workspace/helios
+HERMES_SESSION_STORE_PATH=/tmp/helios-hermes-sessions.json
+```
+
+Después se redepliega únicamente el adaptador.
 
 ## Seguridad
 
-Nunca subir claves reales a este repositorio.
+Los secretos deben permanecer únicamente en Coolify:
 
-Los secretos deben quedarse únicamente en Coolify:
+- `HERMES_API_KEY`
+- `HERMES_AGENT_API_KEY`
+- `HERMES_WEBUI_PASSWORD`
+- claves de proveedores, Supabase y Chatwoot
 
-```text
-- HERMES_API_KEY
-- HERMES_WEBUI_PASSWORD
-- claves de proveedores de IA
-- tokens de Chatwoot
-- claves de Supabase
-- contraseñas
-- bearer tokens
-```
+El endpoint `/health` solo indica si cada valor está configurado. No devuelve
+claves, contraseñas ni tokens.
 
-## Estrategia de despliegue en producción
-
-No reemplazar el adapter actual directamente sin prueba previa.
-
-Orden recomendado:
-
-```text
-1. Desplegar este repositorio como una nueva app en Coolify.
-2. Usar un dominio temporal.
-3. Copiar las variables reales desde el adapter actual.
-4. Probar /health.
-5. Probar POST /helios/message.
-6. Apuntar temporalmente helios-gateway hacia el nuevo adapter.
-7. Probar una conversación real desde WhatsApp/Chatwoot.
-8. Si todo funciona, mover el dominio final al nuevo adapter.
-9. Mantener el adapter viejo disponible unos días como rollback.
-```
-
-## Dominio temporal recomendado
-
-```text
-helioshermesadapter-v2.servicios.escala365.com
-```
-
-## Dominio de producción final
-
-```text
-helioshermesadapter.servicios.escala365.com
-```
-
-## Ejecución local
+## Desarrollo y verificación
 
 ```bash
-npm install
+npm ci
+npm test
 npm start
 ```
-
-## Docker
 
 ```bash
 docker build -t helios-hermes-adapter .
 docker run --env-file .env -p 3000:3000 helios-hermes-adapter
 ```
-
-## Notas importantes
-
-El adapter debe pasar el payload del gateway a Hermes sin convertirlo en una decisión.
-
-Hermes perfil `helios` contiene el contexto, la memoria, las reglas, el modelo y la lógica de respuesta.
-
-Si Hermes devuelve un error técnico del proveedor, el adapter puede proteger al paciente devolviendo una respuesta segura de handoff técnico, pero no debe tomar decisiones clínicas.
