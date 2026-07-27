@@ -6,7 +6,7 @@ COPY package.json package-lock.json* ./
 
 RUN npm install --omit=dev
 
-COPY server.js contract-parser.js tenant-context.js hermes-agent-client.js request-identity.js ./
+COPY server.js contract-parser.js tenant-context.js hermes-agent-client.js request-identity.js execution-store.js supabase-assert.js ./
 
 EXPOSE 3000
 

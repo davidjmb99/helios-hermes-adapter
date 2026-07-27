@@ -42,6 +42,9 @@ function sha256(value) {
 
 function createStableRequestIdentity(normalized = {}, tenantContext = {}) {
   const sourceMessageIds = extractSourceMessageIds(normalized);
+  const sourceMessageIdsHash = sourceMessageIds.length > 0
+    ? sha256(sourceMessageIds.join("|"))
+    : null;
   const scope = [
     `account:${nonEmpty(tenantContext.account_id || normalized.account_id) || "none"}`,
     `tenant:${nonEmpty(tenantContext.tenant_id || normalized.tenant_id) || "none"}`,
@@ -66,7 +69,8 @@ function createStableRequestIdentity(normalized = {}, tenantContext = {}) {
       key: null,
       strategy,
       fingerprintHash: null,
-      sourceMessageIdCount: 0
+      sourceMessageIdCount: 0,
+      sourceMessageIdsHash
     };
   }
 
@@ -75,7 +79,8 @@ function createStableRequestIdentity(normalized = {}, tenantContext = {}) {
     key: `helios-${digest}`,
     strategy,
     fingerprintHash: digest.slice(0, 12),
-    sourceMessageIdCount: sourceMessageIds.length
+    sourceMessageIdCount: sourceMessageIds.length,
+    sourceMessageIdsHash
   };
 }
 

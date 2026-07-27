@@ -4,6 +4,9 @@ const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
+const { createExecutionStore } = require("./execution-store");
+const { assertSupabaseSuccess } = require("./supabase-assert");
+const { version: PACKAGE_VERSION } = require("./package.json");
 const {
   findBalancedJsonObjects,
   isValidHermesContract,
@@ -37,6 +40,14 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 const app = reportExpressErrorsAndConfigure();
+app.use((req, res, next) => {
+  if (req.path === "/" || req.path.startsWith("/debug")) {
+    res.setHeader("Cache-Control", "no-store, private, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+  }
+  next();
+});
 
 function reportExpressErrorsAndConfigure() {
   const expressApp = express();
@@ -52,6 +63,8 @@ const DEBUG_PASSWORD = process.env.DEBUG_PASSWORD || "";
 const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
 const TOKEN_ESTIMATION_ENABLED = process.env.TOKEN_ESTIMATION_ENABLED === "true";
+const HELIOS_ADMIN_SHOW_PII = process.env.HELIOS_ADMIN_SHOW_PII === "true";
+const ADAPTER_EXECUTION_LEASE_MS_CONFIGURED = Number(process.env.ADAPTER_EXECUTION_LEASE_MS || 180000);
 const TOKEN_ESTIMATION_CHARS_PER_TOKEN = Number(process.env.TOKEN_ESTIMATION_CHARS_PER_TOKEN || 4);
 
 const sessionSecret = crypto.randomBytes(32).toString('hex');
@@ -85,6 +98,10 @@ const HERMES_AGENT_API_BASE_URL = (
 const HERMES_AGENT_API_KEY = process.env.HERMES_AGENT_API_KEY || "";
 const HERMES_AGENT_MODEL = process.env.HERMES_AGENT_MODEL || HERMES_PROFILE;
 const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
+const ADAPTER_EXECUTION_LEASE_MS = Math.max(
+  ADAPTER_EXECUTION_LEASE_MS_CONFIGURED,
+  HERMES_TIMEOUT_MS + 60000
+);
 
 const SESSION_STORE_PATH =
   process.env.HERMES_SESSION_STORE_PATH || "/tmp/helios-hermes-sessions.json";
@@ -101,6 +118,11 @@ const hermesAgentClient = createHermesAgentClient({
   model: HERMES_AGENT_MODEL,
   timeoutMs: HERMES_TIMEOUT_MS
 });
+const executionStore = createExecutionStore({
+  supabase,
+  leaseMs: ADAPTER_EXECUTION_LEASE_MS
+});
+let lastHermesResponseCompletedAt = null;
 
 
 function normalizeTelemetryIdentity(payload) {
@@ -129,21 +151,43 @@ async function startAdapterEvent(payload) {
         .insert({
           trace_id: identity.trace_id,
           tenant_id: identity.tenant_id,
+          account_id: payload?.account_id || null,
+          clinic_id: payload?.clinic_id || null,
+          hermes_profile: payload?.hermes_profile || null,
           conversation_id: identity.conversation_id,
           contact_id: identity.contact_id,
+          patient_first_name: payload?.patient?.first_name || null,
+          patient_last_name: payload?.patient?.last_name || null,
+          patient_display_name: getPatientDisplayName(payload?.patient),
+          phone: extractPhone(payload, payload, payload),
+          message_content: payload?.message?.text || null,
           status: 'processing',
+          processing_stage: 'request_received',
+          hermes_transport: HERMES_TRANSPORT,
           started_at: new Date().toISOString()
         })
         .select('id')
         .single();
-      if (error) throw error;
+      assertSupabaseSuccess({ data, error }, "adapter_events.start", {
+        tenant_id: identity.tenant_id,
+        trace_id: identity.trace_id
+      });
       return { eventId: data.id, identity, startedAt: Date.now(), closed: false };
     } else {
        return { eventId: null, identity, startedAt: Date.now(), closed: false };
     }
   } catch (err) {
-    console.error('[Adapter] Fallo al iniciar telemetría:', err.message);
-    return { eventId: null, identity: normalizeTelemetryIdentity(payload), startedAt: Date.now(), closed: false };
+    console.error(JSON.stringify({
+      event: "adapter_telemetry_start_failed",
+      error_code: err.code || "SUPABASE_UNKNOWN"
+    }));
+    return {
+      eventId: null,
+      identity: normalizeTelemetryIdentity(payload),
+      startedAt: Date.now(),
+      closed: false,
+      startError: err
+    };
   }
 }
 
@@ -171,7 +215,7 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
       }
     }
     const isSent = result?.response_sent === true;
-    await supabase.from('helios_adapter_events')
+    const update = await supabase.from('helios_adapter_events')
       .update({
         status: finalStatus,
         finished_at: new Date().toISOString(),
@@ -188,10 +232,8 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
         phone: extra.phone || null,
         hermes_first_token_ms: extra.hermes_first_token_ms || null,
         tool_duration_ms: extra.tool_duration_ms || null,
-          session_id: extra.session_id || null,
-          stream_id: extra.stream_id || null,
-          session_id: extra.session_id || null,
-          stream_id: extra.stream_id || null,
+        session_id: extra.session_id || null,
+        stream_id: extra.stream_id || null,
         phone: extra.phone || null,
         hermes_first_token_ms: extra.hermes_first_token_ms || null,
         tool_duration_ms: extra.tool_duration_ms || null,
@@ -210,6 +252,11 @@ async function finishAdapterEvent(ctx, status, result, hermesDuration, tokenUsag
         tool_duration_ms: tokenUsage?.tool_duration_ms || null
       })
       .eq('id', ctx.eventId);
+    assertSupabaseSuccess(update, "adapter_events.finish_legacy", {
+      tenant_id: ctx.identity?.tenant_id,
+      trace_id: ctx.identity?.trace_id,
+      row_id: ctx.eventId
+    });
   } catch (err) {
     console.error('[Adapter] Fallo al finalizar telemetría:', err.message);
   }
@@ -221,7 +268,7 @@ async function failAdapterEvent(ctx, errorCode, hermesDuration = null, extra = {
   ctx.closed = true;
   try {
     const durationMs = Date.now() - ctx.startedAt;
-    await supabase.from('helios_adapter_events')
+    const update = await supabase.from('helios_adapter_events')
       .update({
         status: 'error',
         finished_at: new Date().toISOString(),
@@ -240,6 +287,11 @@ async function failAdapterEvent(ctx, errorCode, hermesDuration = null, extra = {
         response_preview: extra.response_preview || null
       })
       .eq('id', ctx.eventId);
+    assertSupabaseSuccess(update, "adapter_events.fail_legacy", {
+      tenant_id: ctx.identity?.tenant_id,
+      trace_id: ctx.identity?.trace_id,
+      row_id: ctx.eventId
+    });
   } catch (err) {
     console.error('[Adapter] Fallo al reportar error en telemetría:', err.message);
   }
@@ -384,12 +436,9 @@ function isDebugAuthorized(req) {
     }
   }
 
-  // B y C) Verificar token Bearer o parámetro query
+  // B) Verificar token Bearer. Nunca aceptar credenciales por query string.
   if (DEBUG_TOKEN) {
     let token = getBearerToken(req);
-    if (!token && req.query.token) {
-      token = String(req.query.token).trim();
-    }
     if (token && safeCompare(token, DEBUG_TOKEN)) {
       return true;
     }
@@ -405,6 +454,10 @@ function isDebugAuthorized(req) {
 
 function requireDebugAuth(req, res, next) {
   if (isDebugAuthorized(req)) {
+    console.log(JSON.stringify({
+      event: "admin_dashboard_access",
+      path: req.path
+    }));
     return next();
   }
 
@@ -1274,6 +1327,58 @@ async function sendMessageToHermesAgentApi(payload) {
   const key = conversationKey(normalized, tenantContext);
   const conversation = `helios-${hashShort(key)}`;
   const requestIdentity = createStableRequestIdentity(normalized, tenantContext);
+  if (!requestIdentity.key || !requestIdentity.sourceMessageIdsHash) {
+    const error = new Error("Stable source message identity is required");
+    error.code = "ADAPTER_REQUEST_IDENTITY_MISSING";
+    throw error;
+  }
+  const executionIdentity = {
+    request_key: requestIdentity.key,
+    tenant_id: tenantContext.tenant_id,
+    account_id: tenantContext.account_id,
+    clinic_id: tenantContext.clinic_id,
+    hermes_profile: tenantContext.hermes_profile,
+    conversation_id: normalized.conversation_id,
+    contact_id: normalized.contact_id,
+    source_message_ids_hash: requestIdentity.sourceMessageIdsHash
+  };
+  const executionClaim = await executionStore.claim(executionIdentity);
+
+  if (executionClaim.action === "completed") {
+    return {
+      sessionId: executionClaim.execution.hermes_response_id || "",
+      streamId: "",
+      answer: "",
+      persistedNormalizedResult: executionClaim.execution.normalized_result,
+      conflict: false,
+      activeStreamId: "",
+      hermesProfile: tenantContext.hermes_profile,
+      transport: "agent_api",
+      tokenUsage: {
+        model: HERMES_AGENT_MODEL,
+        input_tokens: executionClaim.execution.input_tokens,
+        output_tokens: executionClaim.execution.output_tokens,
+        total_tokens: executionClaim.execution.total_tokens,
+        tool_calls: executionClaim.execution.tool_calls || []
+      },
+      toolCalls: executionClaim.execution.tool_calls || [],
+      executionRequestKey: requestIdentity.key,
+      hermesConversationId: executionClaim.execution.hermes_conversation_id,
+      idempotencyStatus: "deduplicated"
+    };
+  }
+  if (executionClaim.action === "waiting") {
+    const error = new Error("An execution with the same source messages is already active");
+    error.code = "ADAPTER_EXECUTION_IN_PROGRESS";
+    error.executionRequestKey = requestIdentity.key;
+    throw error;
+  }
+  if (executionClaim.action === "failed_final") {
+    const error = new Error("The stable execution is final and cannot be retried");
+    error.code = "ADAPTER_EXECUTION_FAILED_FINAL";
+    error.executionRequestKey = requestIdentity.key;
+    throw error;
+  }
 
   console.log(
     JSON.stringify({
@@ -1298,11 +1403,18 @@ async function sendMessageToHermesAgentApi(payload) {
     })
   );
 
-  const result = await hermesAgentClient.sendMessage({
-    input: buildHermesMessage(normalized),
-    conversation,
-    idempotencyKey: requestIdentity.key || normalized.trace_id || undefined
-  });
+  let result;
+  try {
+    result = await hermesAgentClient.sendMessage({
+      input: buildHermesMessage(normalized),
+      conversation,
+      idempotencyKey: requestIdentity.key
+    });
+    lastHermesResponseCompletedAt = new Date().toISOString();
+  } catch (error) {
+    error.executionRequestKey = requestIdentity.key;
+    throw error;
+  }
 
   return {
     sessionId: result.responseId,
@@ -1313,8 +1425,73 @@ async function sendMessageToHermesAgentApi(payload) {
     hermesProfile: tenantContext.hermes_profile,
     transport: "agent_api",
     tokenUsage: result.tokenUsage,
-    toolCalls: result.toolCalls
+    toolCalls: result.toolCalls,
+    executionRequestKey: requestIdentity.key,
+    hermesConversationId: conversation,
+    hermesResponseId: result.responseId,
+    idempotencyStatus: "new"
   };
+}
+
+async function closeAdapterEventDurably(ctx, {
+  status,
+  processingStage,
+  normalized,
+  normalizedResponse,
+  result,
+  hermesDurationMs,
+  httpStatus,
+  errorCode = null
+}) {
+  if (!ctx || !supabase) return;
+  if (ctx.startError) throw ctx.startError;
+  if (!ctx.eventId || ctx.closed) return;
+
+  const tokenUsage = result?.tokenUsage || {};
+  const toolCalls = result?.toolCalls || tokenUsage.tool_calls || [];
+  const completedAt = new Date().toISOString();
+  const payload = {
+    request_key: result?.executionRequestKey || null,
+    parent_trace_id: normalized?.metadata?.parent_trace_id || null,
+    account_id: normalized?.account_id || null,
+    clinic_id: normalized?.clinic_id || null,
+    hermes_profile: normalized?.hermes_profile || null,
+    patient_first_name: normalized?.patient?.first_name || null,
+    patient_last_name: normalized?.patient?.last_name || null,
+    patient_display_name: getPatientDisplayName(normalized?.patient),
+    phone: normalized?.phone || null,
+    message_content: normalized?.message_text || null,
+    response_content: normalizedResponse?.message_for_client || normalizedResponse?.reply || null,
+    status,
+    processing_stage: processingStage,
+    hermes_transport: result?.transport || HERMES_TRANSPORT,
+    hermes_conversation_id: result?.hermesConversationId || null,
+    hermes_response_id: result?.hermesResponseId || result?.sessionId || null,
+    idempotency_status: result?.idempotencyStatus || null,
+    input_tokens: tokenUsage.input_tokens ?? null,
+    output_tokens: tokenUsage.output_tokens ?? null,
+    total_tokens: tokenUsage.total_tokens ?? null,
+    model: tokenUsage.model || HERMES_AGENT_MODEL,
+    tool_names: [...new Set(toolCalls.map(tool => tool?.name).filter(Boolean))],
+    tool_count: toolCalls.length,
+    duration_ms: Date.now() - ctx.startedAt,
+    hermes_duration_ms: hermesDurationMs ?? null,
+    http_status: httpStatus,
+    error_code: errorCode,
+    safe_to_send: normalizedResponse?.safe_to_send === true,
+    finished_at: completedAt,
+    completed_at: completedAt
+  };
+  const update = await supabase
+    .from("helios_adapter_events")
+    .update(payload)
+    .eq("id", ctx.eventId);
+  assertSupabaseSuccess(update, "adapter_events.close", {
+    tenant_id: normalized?.tenant_id,
+    trace_id: ctx.identity?.trace_id,
+    row_id: ctx.eventId
+  });
+  ctx.closed = true;
 }
 
 async function sendMessageToHermes(payload) {
@@ -1420,13 +1597,65 @@ function sanitizePatientReply(text) {
   return text;
 }
 
-  app.get("/health", (req, res) => {
+async function probeHermesAgentApi() {
+  if (HERMES_TRANSPORT !== "agent_api" || !HERMES_AGENT_API_BASE_URL) {
+    return { state: "NOT_CONFIGURED", authenticated: false, models_endpoint: false, latency_ms: null };
+  }
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(`${HERMES_AGENT_API_BASE_URL}/v1/models`, {
+      headers: HERMES_AGENT_API_KEY ? { Authorization: `Bearer ${HERMES_AGENT_API_KEY}` } : {},
+      signal: AbortSignal.timeout(Math.min(HERMES_TIMEOUT_MS, 3000))
+    });
+    return {
+      state: response.ok ? "HERMES_OK" : "HERMES_UNAVAILABLE",
+      authenticated: response.status !== 401 && response.status !== 403,
+      models_endpoint: response.ok,
+      http_status: response.status,
+      latency_ms: Date.now() - startedAt,
+      last_response_completed_at: lastHermesResponseCompletedAt
+    };
+  } catch (error) {
+    return {
+      state: "HERMES_UNAVAILABLE",
+      authenticated: false,
+      models_endpoint: false,
+      latency_ms: Date.now() - startedAt,
+      error_code: error?.name === "TimeoutError" ? "HERMES_HEALTH_TIMEOUT" : "HERMES_HEALTH_NETWORK",
+      last_response_completed_at: lastHermesResponseCompletedAt
+    };
+  }
+}
+
+async function probeSupabaseTelemetry() {
+  if (!supabase) return { state: "SUPABASE_DEGRADED", read: false, latency_ms: null };
+  const startedAt = Date.now();
+  const result = await supabase.from("helios_adapter_events").select("id").limit(1);
+  if (result.error) {
+    return {
+      state: "SUPABASE_DEGRADED",
+      read: false,
+      latency_ms: Date.now() - startedAt,
+      error_code: result.error.code || "SUPABASE_UNKNOWN"
+    };
+  }
+  return { state: "SUPABASE_OK", read: true, latency_ms: Date.now() - startedAt };
+}
+
+app.get("/health", async (req, res) => {
+  const [hermesAgentApi, supabaseTelemetry] = await Promise.all([
+    probeHermesAgentApi(),
+    probeSupabaseTelemetry()
+  ]);
   res.json({
     ok: true,
     service: "helios-hermes-adapter",
-    version: "2.5.1",
+    version: PACKAGE_VERSION,
+    runtime_status: "ADAPTER_OK",
     token_estimation_enabled: TOKEN_ESTIMATION_ENABLED,
+    runtime: `Node.js ${process.version}`,
     profile: HERMES_PROFILE,
+    hermes_profile: HERMES_PROFILE,
     mode: HERMES_TRANSPORT === "agent_api"
       ? "HERMES_AGENT_RESPONSES_API"
       : "HERMES_WEBUI_STREAM_API",
@@ -1434,6 +1663,12 @@ function sanitizePatientReply(text) {
     hermes_agent_api_base_url_configured: Boolean(HERMES_AGENT_API_BASE_URL),
     hermes_agent_api_key_configured: Boolean(HERMES_AGENT_API_KEY),
     hermes_agent_model: HERMES_AGENT_MODEL,
+    hermes_agent_api: hermesAgentApi,
+    execution_store: { mode: executionStore.mode },
+    execution_store_ready: Boolean(supabase),
+    supabase_telemetry_status: supabaseTelemetry.state,
+    supabase_telemetry: supabaseTelemetry,
+    admin_pii_enabled: HELIOS_ADMIN_SHOW_PII,
     hermes_webui_base_url_configured: Boolean(HERMES_WEBUI_BASE_URL),
     hermes_webui_password_configured: Boolean(HERMES_WEBUI_PASSWORD),
     using_model_override: Boolean(HERMES_MODEL || HERMES_MODEL_PROVIDER),
@@ -1462,7 +1697,7 @@ app.post("/login", (req, res) => {
       .digest('hex');
     
     const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=604800`);
+    res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=28800`);
     
     return res.json({ ok: true });
   }
@@ -1734,7 +1969,17 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
     
     const { status, trace_id, conversation_id, limit = '50' } = req.query;
     
-    const allowlistStatus = ['processing', 'ok', 'buffered', 'error'];
+    const allowlistStatus = [
+      'processing',
+      'completed',
+      'failed_recoverable',
+      'failed_final',
+      'deduplicated',
+      'waiting_existing_execution',
+      'ok',
+      'buffered',
+      'error'
+    ];
     if (status && !allowlistStatus.includes(status)) {
       return res.status(400).json({ error: true, error_code: "INVALID_STATUS_FILTER" });
     }
@@ -1746,7 +1991,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     let query = supabase
       .from('helios_adapter_events')
-      .select('id, created_at, trace_id, tenant_id, conversation_id, contact_id, status, started_at, finished_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, attempt_count, safe_to_send, response_sent, error_code, phone, session_id, stream_id, patient_display_name, display_name_source')
+      .select('id, request_key, created_at, trace_id, parent_trace_id, tenant_id, account_id, clinic_id, hermes_profile, conversation_id, contact_id, patient_first_name, patient_last_name, patient_display_name, phone, message_content, response_content, status, processing_stage, hermes_transport, hermes_conversation_id, hermes_response_id, idempotency_status, started_at, finished_at, completed_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, tool_count, attempt_count, safe_to_send, http_status, error_code')
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
@@ -1762,8 +2007,15 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     const maskedEvents = data.map(ev => ({
         ...ev,
-        phone: ev.phone ? maskPhone(ev.phone) : 'N/A'
-      }));
+        phone: HELIOS_ADMIN_SHOW_PII
+          ? (ev.phone || 'N/A')
+          : (ev.phone ? maskPhone(ev.phone) : 'N/A'),
+        patient_first_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_first_name : null,
+        patient_last_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_last_name : null,
+        patient_display_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_display_name : null,
+        message_content: HELIOS_ADMIN_SHOW_PII ? ev.message_content : "[REDACTED_MESSAGE]",
+        response_content: HELIOS_ADMIN_SHOW_PII ? ev.response_content : "[REDACTED_RESPONSE]"
+    }));
       res.json({ count: maskedEvents.length, events: maskedEvents });
   } catch (err) {
     console.error("[Dashboard] Exception:", err.message);
@@ -2023,7 +2275,9 @@ function serveDashboard(req, res) {
       background: rgba(25, 25, 30, 0.7);
     }
 
-    .request-card.status-ok {
+    .request-card.status-ok,
+    .request-card.status-completed,
+    .request-card.status-deduplicated {
       border-left: 4px solid var(--success);
     }
 
@@ -2035,7 +2289,9 @@ function serveDashboard(req, res) {
       border-left: 4px solid var(--warning);
     }
 
-    .request-card.status-error {
+    .request-card.status-error,
+    .request-card.status-failed_recoverable,
+    .request-card.status-failed_final {
       border-left: 4px solid var(--danger);
     }
 
@@ -2076,7 +2332,9 @@ function serveDashboard(req, res) {
       border: 1px solid rgba(99, 102, 241, 0.3);
     }
 
-    .badge-ok {
+    .badge-ok,
+    .badge-completed,
+    .badge-deduplicated {
       background: var(--success-glow);
       color: var(--success);
       border: 1px solid rgba(16, 185, 129, 0.3);
@@ -2088,7 +2346,9 @@ function serveDashboard(req, res) {
       border: 1px solid rgba(245, 158, 11, 0.3);
     }
 
-    .badge-error {
+    .badge-error,
+    .badge-failed_recoverable,
+    .badge-failed_final {
       background: var(--danger-glow);
       color: var(--danger);
       border: 1px solid rgba(239, 68, 68, 0.3);
@@ -2324,13 +2584,13 @@ function serveDashboard(req, res) {
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
-      <div class="stat-value" style="color: var(--primary);">2.5.1</div>
-      <div class="stat-detail">Node.js 20+</div>
+      <div class="stat-value" id="adapter-version" style="color: var(--primary);">-</div>
+      <div class="stat-detail" id="adapter-runtime">Cargando runtime...</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Modo</div>
-      <div class="stat-value" style="font-size: 1.1rem; padding-top: 0.5rem; word-break: break-all;">STREAM_API</div>
-      <div class="stat-detail">Conexión directa SSE</div>
+      <div class="stat-value" id="adapter-mode" style="font-size: 1.1rem; padding-top: 0.5rem; word-break: break-all;">-</div>
+      <div class="stat-detail" id="adapter-mode-detail">Cargando transporte...</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Sesiones Hermes</div>
@@ -2351,7 +2611,7 @@ function serveDashboard(req, res) {
     </div>
     <div class="filter-buttons">
       <button class="btn active" id="filter-all" onclick="setFilter('all')">Todos</button>
-      <button class="btn" id="filter-ok" onclick="setFilter('ok')">OK</button>
+      <button class="btn" id="filter-completed" onclick="setFilter('completed')">Completados</button>
       <button class="btn" id="filter-processing" onclick="setFilter('processing')">Procesando</button>
       <button class="btn" id="filter-buffered" onclick="setFilter('buffered')">Derivados</button>
       <button class="btn" id="filter-error" onclick="setFilter('error')">Errores</button>
@@ -2407,8 +2667,10 @@ function serveDashboard(req, res) {
     const lastEventTimeEl = document.getElementById('last-event-time');
     const searchBox = document.getElementById('search-box');
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token') || '';
+    const adapterVersionEl = document.getElementById('adapter-version');
+    const adapterRuntimeEl = document.getElementById('adapter-runtime');
+    const adapterModeEl = document.getElementById('adapter-mode');
+    const adapterModeDetailEl = document.getElementById('adapter-mode-detail');
 
     function logout() {
       const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
@@ -2437,17 +2699,22 @@ function serveDashboard(req, res) {
     async function loadData() {
       lastLoadError = null;
       try {
-        const queryParam = token ? '?token=' + encodeURIComponent(token) : '';
-
         try {
           const healthRes = await fetch('/health', { credentials: 'include' });
           if (healthRes.ok) {
             const healthData = await healthRes.json();
             sessionCountEl.textContent = healthData.session_count || 0;
+            adapterVersionEl.textContent = healthData.version || 'N/A';
+            adapterRuntimeEl.textContent = healthData.runtime || 'Node.js';
+            adapterModeEl.textContent = healthData.hermes_transport || 'N/A';
+            adapterModeDetailEl.textContent =
+              (healthData.hermes_profile || 'perfil N/A') + ' / ' +
+              (healthData.hermes_model || 'modelo N/A') + ' / ' +
+              (healthData.execution_store?.mode || 'store N/A');
           }
         } catch (_) {}
 
-        const eventsUrl = '/debug/events' + queryParam;
+        const eventsUrl = '/debug/events';
         const res = await fetch(eventsUrl, { credentials: 'include' });
 
         lastLoadStatus = res.status;
@@ -2524,7 +2791,7 @@ function serveDashboard(req, res) {
     function setFilter(filterType) {
       currentFilter = filterType;
       
-      const buttons = ['all', 'ok', 'processing', 'buffered', 'error'];
+      const buttons = ['all', 'completed', 'processing', 'buffered', 'error'];
       buttons.forEach(b => {
         const btn = document.getElementById('filter-' + b);
         if (btn) {
@@ -2545,7 +2812,15 @@ function serveDashboard(req, res) {
       let filtered = rawEventsList;
 
       if (currentFilter !== 'all') {
-        filtered = filtered.filter(ev => ev.status === currentFilter);
+        filtered = filtered.filter(ev => {
+          if (currentFilter === 'completed') {
+            return ['completed', 'deduplicated', 'ok'].includes(ev.status);
+          }
+          if (currentFilter === 'error') {
+            return ['error', 'failed_recoverable', 'failed_final'].includes(ev.status);
+          }
+          return ev.status === currentFilter;
+        });
       }
 
       if (searchTerm) {
@@ -2574,7 +2849,7 @@ function serveDashboard(req, res) {
         const latestTime = latestEv.started_at || latestEv.created_at;
         if (latestTime) {
           const date = new Date(latestTime);
-          if (!isNaN(date)) lastEventTimeEl.textContent = date.toLocaleTimeString();
+          if (!isNaN(date)) lastEventTimeEl.textContent = formatVenezuelaTime(date);
         }
       }
 
@@ -2582,7 +2857,7 @@ function serveDashboard(req, res) {
         const statusClass = 'status-' + ev.status;
         const badgeClass = 'badge-' + ev.status;
         const evTime = ev.started_at || ev.created_at;
-        const formattedDate = evTime ? new Date(evTime).toLocaleString() : 'N/A';
+        const formattedDate = evTime ? formatVenezuelaTime(new Date(evTime)) : 'N/A';
         const durationText = ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + 'ms' : 'N/A';
         const traceShort = ev.trace_id ? ev.trace_id.slice(0, 8) + '...' : 'N/A';
         
@@ -2621,8 +2896,10 @@ function serveDashboard(req, res) {
             '<div class="info-line">Tel: <code>' + escapeHtml(ev.phone || 'N/A') + '</code></div>' +
             '<div class="info-line">Conv: <code>' + escapeHtml(ev.conversation_id || 'N/A') + '</code></div>' +
             '<div class="info-line">Contact: <code>' + escapeHtml(ev.contact_id || 'N/A') + '</code></div>' +
-            '<div class="info-line">Session: <code>' + escapeHtml(ev.session_id ? ev.session_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
-            '<div class="info-line">Stream: <code>' + escapeHtml(ev.stream_id ? ev.stream_id.slice(0, 12) + '...' : 'N/A') + '</code></div>' +
+            '<div class="info-line">Hermes Conv: <code>' + escapeHtml(abbreviate(ev.hermes_conversation_id)) + '</code></div>' +
+            '<div class="info-line">Hermes Resp: <code>' + escapeHtml(abbreviate(ev.hermes_response_id)) + '</code></div>' +
+            '<div class="info-line">Request: <code>' + escapeHtml(abbreviate(ev.request_key)) + '</code></div>' +
+            '<div class="info-line">Idempotencia: <code>' + escapeHtml(ev.idempotency_status || 'N/A') + '</code></div>' +
           '</div>' +
           (ev.error_code ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error_code) + '</div>' : '') +
         '</div>';
@@ -2648,20 +2925,29 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section">' +
         '<div class="detail-section-title">A. Resumen de la Traza</div>' +
         '<div class="grid-2col">' +
-          '<div class="grid-item"><span>Timestamp</span><div>' + (evTime ? new Date(evTime).toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Timestamp Venezuela</span><div>' + (evTime ? formatVenezuelaTime(new Date(evTime)) : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Nombre</span><div>' + escapeHtml(ev.patient_display_name || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Nombre verificado</span><div>' + escapeHtml(ev.patient_first_name || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Apellido verificado</span><div>' + escapeHtml(ev.patient_last_name || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Teléfono</span><div>' + escapeHtml(ev.phone || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Session ID</span><div>' + escapeHtml(ev.session_id || 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Stream ID</span><div>' + escapeHtml(ev.stream_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Request Key</span><div>' + escapeHtml(ev.request_key || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Hermes Conversation ID</span><div>' + escapeHtml(ev.hermes_conversation_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Hermes Response ID</span><div>' + escapeHtml(ev.hermes_response_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Idempotencia</span><div>' + escapeHtml(ev.idempotency_status || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Transporte</span><div>' + escapeHtml(ev.hermes_transport || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Trace ID Completo</span><div>' + escapeHtml(ev.trace_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Tenant ID</span><div>' + escapeHtml(ev.tenant_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Account ID</span><div>' + escapeHtml(ev.account_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Clinic ID</span><div>' + escapeHtml(ev.clinic_id || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Hermes Profile</span><div>' + escapeHtml(ev.hermes_profile || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Conv ID</span><div>' + escapeHtml(ev.conversation_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Contact ID</span><div>' + escapeHtml(ev.contact_id || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Duración</span><div>' + (ev.duration_ms !== null && ev.duration_ms !== undefined ? ev.duration_ms + ' ms' : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Hermes Duración</span><div>' + (ev.hermes_duration_ms !== null && ev.hermes_duration_ms !== undefined ? ev.hermes_duration_ms + ' ms' : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Intentos</span><div>' + (ev.attempt_count || '1') + '</div></div>' +
           '<div class="grid-item"><span>Safe to Send</span><div>' + (ev.safe_to_send ? 'SÍ' : 'NO') + '</div></div>' +
-          '<div class="grid-item"><span>Response Sent</span><div>' + (ev.response_sent ? 'SÍ' : 'NO') + '</div></div>' +
+          '<div class="grid-item"><span>HTTP Status</span><div>' + escapeHtml(ev.http_status ?? 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Etapa</span><div>' + escapeHtml(ev.processing_stage || 'N/A') + '</div></div>' +
         '</div>' +
       '</div>';
 
@@ -2672,11 +2958,16 @@ function serveDashboard(req, res) {
           '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Total Tool Calls</span><div>' + escapeHtml(ev.tool_count ?? '0') + '</div></div>' +
           '<div class="grid-item"><span>Herramientas Usadas</span><div>' + (function(t){if(!t)return 'Ninguna';try{if(typeof t==='string')t=JSON.parse(t);}catch(e){}if(Array.isArray(t)&&t.length>0)return escapeHtml(t.join(', '));return 'Ninguna'})(ev.tool_names) + '</div></div>' +
         '</div>' +
       '</div>';
 
-      // Payload details were omitted for privacy.
+      bodyHtml += '<div class="detail-section">' +
+        '<div class="detail-section-title">Contenido operativo (según política administrativa)</div>' +
+        '<div class="grid-item"><span>Mensaje recibido</span><div>' + escapeHtml(ev.message_content || 'N/A') + '</div></div>' +
+        '<div class="grid-item" style="margin-top:0.75rem"><span>Respuesta generada</span><div>' + escapeHtml(ev.response_content || 'N/A') + '</div></div>' +
+      '</div>';
 
       if (ev.status === 'error' || ev.error_code) {
         bodyHtml += '<div class="detail-section" style="background: rgba(239, 68, 68, 0.05); border-color: rgba(239, 68, 68, 0.2);">' +
@@ -2738,6 +3029,24 @@ function serveDashboard(req, res) {
         .replace(/'/g, "&#039;");
     }
 
+    function abbreviate(value) {
+      const text = String(value || '');
+      if (!text) return 'N/A';
+      return text.length > 20 ? text.slice(0, 12) + '...' + text.slice(-6) : text;
+    }
+
+    function formatVenezuelaTime(value) {
+      return value.toLocaleString('es-VE', {
+        timeZone: 'America/Caracas',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    }
+
     function startInterval() {
       if (refreshInterval) clearInterval(refreshInterval);
       refreshInterval = setInterval(loadData, 5000);
@@ -2782,6 +3091,39 @@ function serveDashboard(req, res) {
 app.get("/", requireDebugAuth, serveDashboard);
 
 function normalizeProviderError(error) {
+  if (error.code === "ADAPTER_EXECUTION_IN_PROGRESS") {
+    return {
+      error_code: error.code,
+      intent: "waiting_existing_execution",
+      recoverable: true,
+      requires_handoff: false,
+      safe_to_send: false,
+      response_sent: false,
+      http_status: 409
+    };
+  }
+  if (error.code === "ADAPTER_EXECUTION_FAILED_FINAL") {
+    return {
+      error_code: error.code,
+      intent: "execution_failed_final",
+      recoverable: false,
+      requires_handoff: false,
+      safe_to_send: false,
+      response_sent: false,
+      http_status: 409
+    };
+  }
+  if (String(error.code || "").startsWith("SUPABASE_")) {
+    return {
+      error_code: error.code,
+      intent: "adapter_persistence_error",
+      recoverable: true,
+      requires_handoff: false,
+      safe_to_send: false,
+      response_sent: false,
+      http_status: 503
+    };
+  }
   if (
     error.code === "TENANT_NOT_CONFIGURED" ||
     error.code === "TENANT_CONTEXT_INVALID" ||
@@ -2877,18 +3219,18 @@ function extractPhone(normalized, payload, input) {
 
 function getPatientDisplayName(patient) {
   if (!patient) return "Contacto sin identificar";
-  if (patient.profile_complete === true && patient.first_name && patient.last_name) {
+  const firstName = String(patient.first_name || "").trim();
+  const lastName = String(patient.last_name || "").trim();
+  const invalid = value => !value || ["[REDACTED]", "UNKNOWN", "N/A"].includes(value.toUpperCase());
+  if (!invalid(firstName) && !invalid(lastName)) {
     return patient.first_name + " " + patient.last_name;
   }
-  if (patient.chatwoot_display_name) return patient.chatwoot_display_name;
-  
   return "Contacto sin identificar";
 }
 
 function getDisplayNameSource(patient) {
   if (!patient) return "unknown";
   if (patient.profile_complete === true && patient.first_name && patient.last_name) return "verified_profile";
-  if (patient.chatwoot_display_name) return "chatwoot";
   return "unknown";
 }
 
@@ -2900,6 +3242,7 @@ async function finalizeAdapterEventReliably(
   debugEvent,
   extra
 ) {
+  if (telemetryCtx?.closed) return;
   const traceId = telemetryCtx?.identity?.trace_id || "";
   let primarySuccess = false;
   try {
@@ -3003,15 +3346,23 @@ app.post("/helios/message", async (req, res) => {
   let processingStage = "request_received";
   let requestPhone = null;
   let requestPatientDisplayName = "Contacto sin identificar";
+  let requestPatientFirstName = null;
+  let requestPatientLastName = null;
   processingStage = "telemetry_started";
   const telemetryCtx = await startAdapterEvent(req.body || {});
   const startTime = Date.now();
   const uniqueEventId = crypto.randomUUID();
   const payload = req.body || {};
+  let hermesDurationMs = null;
+  let result = null;
   
   let normalized;
   try {
     normalized = normalizeGatewayPayload(payload);
+    requestPhone = normalized.phone || null;
+    requestPatientFirstName = normalized.patient?.first_name || null;
+    requestPatientLastName = normalized.patient?.last_name || null;
+    requestPatientDisplayName = getPatientDisplayName(normalized.patient);
   } catch (err) {
     normalized = { raw: payload };
   }
@@ -3076,6 +3427,9 @@ app.post("/helios/message", async (req, res) => {
   };
 
   try {
+    if (telemetryCtx?.startError && supabase) {
+      throw telemetryCtx.startError;
+    }
     const input_detail = {
       event: normalized.event,
       tenant_id: normalized.tenant_id,
@@ -3173,9 +3527,13 @@ app.post("/helios/message", async (req, res) => {
       return res.status(401).json(authErrorResponse);
     }
 
-const hermesStartTime = Date.now();
-    let hermesDurationMs = null;
-    let result;
+    if (NODE_ENV === "production" && !supabase) {
+      const persistenceError = new Error("Durable execution store is not configured");
+      persistenceError.code = "SUPABASE_NOT_CONFIGURED";
+      throw persistenceError;
+    }
+
+    const hermesStartTime = Date.now();
     try {
       processingStage = "message_sent";
       result = await sendMessageToHermes(payload);
@@ -3281,7 +3639,17 @@ const hermesStartTime = Date.now();
         }));
       });
 
-      res.json(conflictResponse);
+      await closeAdapterEventDurably(telemetryCtx, {
+        status: "failed_recoverable",
+        processingStage: "response_returned",
+        normalized,
+        normalizedResponse: conflictResponse,
+        result,
+        hermesDurationMs,
+        httpStatus: 409,
+        errorCode: "ACTIVE_STREAM_CONFLICT"
+      });
+      res.status(409).json(conflictResponse);
 
       console.log(JSON.stringify({
         event: "adapter_http_response_invoked",
@@ -3338,7 +3706,18 @@ const hermesStartTime = Date.now();
     }
 
     processingStage = "contract_parsing";
-    const normalizedResponse = normalizeAdapterResponse(result);
+    const normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result);
+    normalizedResponse.request_key = result.executionRequestKey || null;
+    if (result.idempotencyStatus === "new") {
+      await executionStore.complete(result.executionRequestKey, {
+        hermes_conversation_id: result.hermesConversationId,
+        hermes_response_id: result.hermesResponseId || result.sessionId,
+        normalized_result: normalizedResponse,
+        tool_calls: result.toolCalls || [],
+        token_usage: result.tokenUsage || {},
+        duration_ms: hermesDurationMs
+      });
+    }
     processingStage = "contract_validated";
     finalReply = normalizedResponse.reply || "";
     finalStatus = normalizedResponse.ok ? "ok" : "handoff";
@@ -3407,7 +3786,20 @@ const hermesStartTime = Date.now();
       }));
     });
 
-    // Enviar respuesta al Gateway INMEDIATAMENTE
+    await closeAdapterEventDurably(telemetryCtx, {
+      status: result.idempotencyStatus === "deduplicated"
+        ? "deduplicated"
+        : normalizedResponse.ok ? "completed" : "failed_recoverable",
+      processingStage: "response_returned",
+      normalized,
+      normalizedResponse,
+      result,
+      hermesDurationMs,
+      httpStatus: 200,
+      errorCode: normalizedResponse.error_code || null
+    });
+
+    // La ejecución y la telemetría ya son durables antes de responder.
     res.json(normalizedResponse);
 
     console.log(JSON.stringify({
@@ -3565,6 +3957,41 @@ const hermesStartTime = Date.now();
         elapsed_ms: Date.now() - startTime
       }));
     });
+
+    try {
+      if (error.executionRequestKey) {
+        await executionStore.fail(
+          error.executionRequestKey,
+          normalizedError.error_code,
+          normalizedError.recoverable !== false
+        );
+      }
+      if (supabase) {
+        await closeAdapterEventDurably(telemetryCtx, {
+          status: normalizedError.recoverable === false ? "failed_final" : "failed_recoverable",
+          processingStage,
+          normalized,
+          normalizedResponse: errorResponse,
+          result: {
+            executionRequestKey: error.executionRequestKey || null,
+            transport: HERMES_TRANSPORT,
+            hermesConversationId: error.hermesConversationId || null,
+            tokenUsage: debugEvent.token_usage,
+            toolCalls: debugEvent.token_usage?.tool_calls || []
+          },
+          hermesDurationMs,
+          httpStatus: normalizedError.http_status,
+          errorCode: normalizedError.error_code
+        });
+      }
+    } catch (persistenceError) {
+      return res.status(503).json({
+        ok: false,
+        safe_to_send: false,
+        recoverable: true,
+        error_code: persistenceError.code || "ADAPTER_PERSISTENCE_FAILED"
+      });
+    }
 
     res.status(normalizedError.http_status).json(errorResponse);
 
