@@ -189,6 +189,21 @@ test("adapter completes the production route through Hermes Agent API", async (t
   assert.equal(requests[0].body.store, true);
   assert.match(requests[0].body.conversation, /^helios-[a-f0-9]{12}$/);
   assert.match(requests[0].body.input, /PRIVATE_AGENT_API_MARKER/);
+  assert.match(requests[0].body.input, /OUTPUT CONTRACT \(REQUIRED\)/);
+  assert.match(requests[0].body.input, /message_for_client/);
+
+  const duplicateResponse = await fetch(`http://127.0.0.1:${adapterPort}/helios/message`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer adapter-shared-secret",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(gatewayPayload())
+  });
+  const duplicateBody = await duplicateResponse.json();
+  assert.equal(duplicateResponse.status, 200);
+  assert.equal(duplicateBody.message_for_client, "Claro, te ayudo con tu cita.");
+  assert.equal(requests.length, 1, "a repeated request_key must not call Hermes twice");
 
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.doesNotMatch(output, /agent-api-secret|adapter-shared-secret/);

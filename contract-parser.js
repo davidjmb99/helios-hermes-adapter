@@ -38,6 +38,104 @@ function containsInternalReasoning(text) {
   return patterns.some(pattern => lowerText.includes(pattern));
 }
 
+const HERMES_OUTPUT_CONTRACT_INSTRUCTIONS = `OUTPUT CONTRACT (REQUIRED):
+Return exactly one JSON object and no Markdown or prose outside it.
+The object must contain: message_for_client (string), operation (object), profile_patch (object), state_patch (object), booking_patch (object), tool_calls (array), safe_to_send (boolean), requires_handoff (boolean), recoverable (boolean), and error_code (string or null).
+Do not omit empty patch objects or the tool_calls array.`;
+
+function buildHermesContractInput(payload) {
+  return `${HERMES_OUTPUT_CONTRACT_INSTRUCTIONS}\n\nOPERATIONAL PAYLOAD:\n${JSON.stringify(payload || {}, null, 2)}`;
+}
+
+function normalizeForSafetyCheck(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function isSafePlainIdentityRequest(rawReply, context = {}) {
+  const text = String(rawReply || "").trim();
+  if (!text || context.httpStatus !== 200 || context.identityComplete !== false) return false;
+
+  const toolCalls = Array.isArray(context.toolCalls) ? context.toolCalls : [];
+  if (toolCalls.length > 0 || findBalancedJsonObjects(text).length > 0) return false;
+  if (context.requiresHandoff === true) return false;
+  if (context.profilePatch && Object.keys(context.profilePatch).length > 0) return false;
+  if (context.bookingPatch && Object.keys(context.bookingPatch).length > 0) return false;
+
+  const lower = normalizeForSafetyCheck(text);
+  const structuredMarkers = [
+    "profile_patch", "booking_patch", "state_patch", "tool_calls",
+    "requires_handoff", "safe_to_send"
+  ];
+  if (structuredMarkers.some(marker => lower.includes(marker))) return false;
+
+  const forbiddenClinicalOrExternalActions = [
+    /\bdiagnostic/, /\benfermedad\b/, /\bcaries\b/,
+    /\bmedic(?:acion|amento|ina)\b/, /\brecet/, /\bdosis\b/,
+    /\bantibiotic/, /\banalgesic/, /\bprecio\b/, /\bcosto\b/,
+    /\bcuesta\b/, /(?:\$|€|\busd\b|\beur\b)/,
+    /\b(?:cita|reserva|turno)\s+(?:esta\s+)?(?:confirmad|agendad|reservad|cancelad|reprogramad)/,
+    /\b(?:he|hemos)\s+(?:confirmado|agendado|reservado|cancelado|reprogramado)\b/,
+    /\b(?:derivar|transferir|handoff)\b/,
+    /\b(?:agente|asesor|equipo|humano)\b/
+  ];
+  if (forbiddenClinicalOrExternalActions.some(pattern => pattern.test(lower))) return false;
+
+  const requestCue = /(?:\?|¿|necesit|podrias|puedes|facilit|indica|dime|compart|proporcion|escrib)/.test(lower);
+  if (!requestCue) return false;
+
+  const missingFields = [...new Set(
+    (Array.isArray(context.missingFields) ? context.missingFields : [])
+      .map(field => String(field))
+      .filter(field => ["first_name", "last_name", "email"].includes(field))
+  )];
+  if (missingFields.length === 0) return false;
+
+  const asksFullName = /\bnombre\s+completo\b/.test(lower);
+  const requestsField = {
+    first_name: asksFullName || /\bnombre\b/.test(lower),
+    last_name: asksFullName || /\bapellido/.test(lower),
+    email: /\bcorreo(?:\s+electronico)?\b|\be-?mail\b/.test(lower)
+  };
+  return missingFields.every(field => requestsField[field] === true);
+}
+
+function createPlainIdentityRepair(rawReply) {
+  const text = String(rawReply).trim();
+  return {
+    ok: true,
+    reply: text,
+    message_for_client: text,
+    route: "identity",
+    intent: "collect_patient_identity",
+    operation: {
+      type: "identity_required",
+      status: "pending",
+      summary: "Faltan datos obligatorios de identidad."
+    },
+    operation_type: "identity_required",
+    operation_status: "pending",
+    operation_summary: "Faltan datos obligatorios de identidad.",
+    profile_patch: {},
+    state_patch: { pending_question: "identity" },
+    booking_patch: {},
+    has_profile_patch: false,
+    has_state_patch: true,
+    has_booking_patch: false,
+    tool_calls: [],
+    safe_to_send: true,
+    response_sent: false,
+    requires_handoff: false,
+    recoverable: false,
+    error_code: null,
+    contract_repair_applied: true,
+    contract_repair_reason: "identity_request_plain_text",
+    original_output_format: "plain_text"
+  };
+}
+
 function findBalancedJsonObjects(text) {
   const candidates = [];
   if (typeof text !== "string") return candidates;
@@ -152,7 +250,7 @@ function extractLastValidHermesContract(text) {
   return null;
 }
 
-function normalizeAdapterResponse(result) {
+function normalizeAdapterResponse(result, context = {}) {
   const rawReply = result.answer || "";
   
   let parsedJson = null;
@@ -206,6 +304,22 @@ function normalizeAdapterResponse(result) {
 
   // D. Si no encuentra contrato válido, devolver INVALID_HERMES_CONTRACT.
   if (!parsedJson) {
+    if (isSafePlainIdentityRequest(rawReply, {
+      ...context,
+      toolCalls: context.toolCalls || result.toolCalls || result.tokenUsage?.tool_calls || [],
+      profilePatch: context.profilePatch || result.profile_patch,
+      bookingPatch: context.bookingPatch || result.booking_patch,
+      requiresHandoff: context.requiresHandoff ?? result.requires_handoff
+    })) {
+      console.log("Telemetry Contract Repair Info:", JSON.stringify({
+        event: "hermes_contract_repair",
+        contract_repair_applied: true,
+        contract_repair_reason: "identity_request_plain_text",
+        original_output_format: "plain_text"
+      }));
+      return createPlainIdentityRepair(rawReply);
+    }
+
     return {
       ok: false,
       reply: "",
@@ -227,7 +341,10 @@ function normalizeAdapterResponse(result) {
       response_sent: false,
       requires_handoff: false,
       recoverable: true,
-      error_code: "INVALID_HERMES_CONTRACT"
+      contract_repair_applied: false,
+      contract_repair_reason: null,
+      original_output_format: "invalid_or_ambiguous",
+      error_code: "OUTPUT_CONTRACT_VIOLATION"
     };
   }
 
@@ -293,8 +410,11 @@ function normalizeAdapterResponse(result) {
 }
 
 module.exports = {
+  HERMES_OUTPUT_CONTRACT_INSTRUCTIONS,
+  buildHermesContractInput,
   findBalancedJsonObjects,
   isValidHermesContract,
   extractLastValidHermesContract,
+  isSafePlainIdentityRequest,
   normalizeAdapterResponse
 };

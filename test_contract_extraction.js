@@ -102,13 +102,13 @@ const testCases = {
     input: "Esto no contiene ningún JSON en absoluto o es inválido.",
     expectedOk: false,
     expectedReply: "",
-    expectedErrorCode: "INVALID_HERMES_CONTRACT"
+    expectedErrorCode: "OUTPUT_CONTRACT_VIOLATION"
   },
   "M. Contrato con operation como array: rechazar": {
     input: makeContractStr({ operation: [1, 2, 3] }),
     expectedOk: false,
     expectedReply: "",
-    expectedErrorCode: "INVALID_HERMES_CONTRACT"
+    expectedErrorCode: "OUTPUT_CONTRACT_VIOLATION"
   },
   "N. Contrato sin tool_calls: rechazar": {
     input: JSON.stringify({
@@ -124,7 +124,7 @@ const testCases = {
     }),
     expectedOk: false,
     expectedReply: "",
-    expectedErrorCode: "INVALID_HERMES_CONTRACT"
+    expectedErrorCode: "OUTPUT_CONTRACT_VIOLATION"
   },
   "O. Contrato safe_to_send=false: no producir reply enviable": {
     input: makeContractStr({ safe_to_send: false, message_for_client: "Mensaje no seguro" }),

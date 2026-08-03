@@ -86,6 +86,7 @@ test("envía conversación nombrada, idempotencia y conserva telemetría", async
     store: true
   });
   assert.equal(result.responseId, "resp_123");
+  assert.equal(result.httpStatus, 200);
   assert.equal(result.answer, '{"message_for_client":"Listo"}');
   assert.equal(result.toolCalls[0].status, "success");
   assert.equal(result.tokenUsage.total_tokens, 15);

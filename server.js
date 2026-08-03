@@ -9,6 +9,7 @@ const { assertSupabaseSuccess } = require("./supabase-assert");
 const { version: PACKAGE_VERSION } = require("./package.json");
 const {
   findBalancedJsonObjects,
+  buildHermesContractInput,
   isValidHermesContract,
   extractLastValidHermesContract,
   normalizeAdapterResponse
@@ -601,7 +602,7 @@ function conversationKey(normalized, tenantContext) {
 
 function buildHermesMessage(normalized) {
   // IMPORTANTE: El adapter NO agrega instrucciones clínicas.
-  return JSON.stringify(normalized.raw || {}, null, 2);
+  return buildHermesContractInput(normalized.raw || {});
 }
 
 async function fetchWithTimeout(url, options = {}) {
@@ -3706,7 +3707,12 @@ app.post("/helios/message", async (req, res) => {
     }
 
     processingStage = "contract_parsing";
-    const normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result);
+    const normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result, {
+      httpStatus: result.httpStatus,
+      toolCalls: result.toolCalls || [],
+      identityComplete: normalized.patient?.identity_complete,
+      missingFields: normalized.state?.missing_fields || []
+    });
     normalizedResponse.request_key = result.executionRequestKey || null;
     if (result.idempotencyStatus === "new") {
       await executionStore.complete(result.executionRequestKey, {
@@ -3720,14 +3726,14 @@ app.post("/helios/message", async (req, res) => {
     }
     processingStage = "contract_validated";
     finalReply = normalizedResponse.reply || "";
-    finalStatus = normalizedResponse.ok ? "ok" : "handoff";
+    finalStatus = normalizedResponse.ok ? "ok" : "error";
     finalRoute = normalizedResponse.route || "hermes";
     finalIntent = normalizedResponse.intent || "respuesta_hermes";
 
     debugEvent.status = finalStatus;
     debugEvent.route = finalRoute;
     debugEvent.intent = finalIntent;
-    debugEvent.requires_handoff = !normalizedResponse.ok;
+    debugEvent.requires_handoff = normalizedResponse.requires_handoff === true;
     debugEvent.duration_ms = Date.now() - startTime;
     debugEvent.raw_hermes_preview = rawResponseText.slice(0, 1000);
     debugEvent.raw_hermes_detail = rawResponseText;
@@ -3881,7 +3887,7 @@ app.post("/helios/message", async (req, res) => {
         safe_to_send: false,
         response_sent: false,
         recoverable: true,
-        error_code: "INVALID_HERMES_CONTRACT"
+        error_code: "OUTPUT_CONTRACT_VIOLATION"
       };
     }
     const errorResponse = {

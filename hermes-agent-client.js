@@ -181,6 +181,7 @@ function createHermesAgentClient({
     const toolCalls = extractResponseToolCalls(responseData);
     return {
       answer,
+      httpStatus: response.status,
       responseId: responseData.id || "",
       model: responseData.model || model || "helios",
       toolCalls,
