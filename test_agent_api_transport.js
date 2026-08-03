@@ -209,4 +209,9 @@ test("adapter completes the production route through Hermes Agent API", async (t
   assert.doesNotMatch(output, /agent-api-secret|adapter-shared-secret/);
   assert.doesNotMatch(output, /PRIVATE_AGENT_API_MARKER|Private Test Patient|\+584120000000/);
   assert.match(output, /"transport":"agent_api"/);
+  assert.match(output, /"answer_source":"agent_api_output_text"/);
+  assert.match(output, /"durable_result_reused":false/);
+  assert.match(output, /"answer_source":"durable_normalized_result"/);
+  assert.match(output, /"durable_result_reused":true/);
+  assert.match(output, /"persisted_result_status":"completed"/);
 });

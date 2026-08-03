@@ -6,6 +6,11 @@ const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { createExecutionStore } = require("./execution-store");
 const { assertSupabaseSuccess } = require("./supabase-assert");
+const {
+  buildProcessingTelemetry,
+  classifyPostProcessingError,
+  derivePersistedResultMetadata
+} = require("./processing-diagnostics");
 const { version: PACKAGE_VERSION } = require("./package.json");
 const {
   findBalancedJsonObjects,
@@ -1318,7 +1323,11 @@ async function sendMessageToHermesWebUi(payload) {
     conflict,
     activeStreamId,
     hermesProfile: tenantContext.hermes_profile,
-    transport: "webui"
+    transport: "webui",
+    answerSource: "webui_stream_output",
+    durableResultReused: false,
+    persistedResultStatus: null,
+    persistedErrorCode: null
   };
 }
 
@@ -1343,9 +1352,17 @@ async function sendMessageToHermesAgentApi(payload) {
     contact_id: normalized.contact_id,
     source_message_ids_hash: requestIdentity.sourceMessageIdsHash
   };
-  const executionClaim = await executionStore.claim(executionIdentity);
+  let executionClaim;
+  try {
+    executionClaim = await executionStore.claim(executionIdentity);
+  } catch (error) {
+    error.exceptionStage = "durable_lookup";
+    error.executionRequestKey = requestIdentity.key;
+    throw error;
+  }
 
   if (executionClaim.action === "completed") {
+    const persistedMetadata = derivePersistedResultMetadata(executionClaim.execution);
     return {
       sessionId: executionClaim.execution.hermes_response_id || "",
       streamId: "",
@@ -1365,7 +1382,11 @@ async function sendMessageToHermesAgentApi(payload) {
       toolCalls: executionClaim.execution.tool_calls || [],
       executionRequestKey: requestIdentity.key,
       hermesConversationId: executionClaim.execution.hermes_conversation_id,
-      idempotencyStatus: "deduplicated"
+      idempotencyStatus: "deduplicated",
+      answerSource: "durable_normalized_result",
+      durableResultReused: persistedMetadata.durable_result_reused,
+      persistedResultStatus: persistedMetadata.persisted_result_status,
+      persistedErrorCode: persistedMetadata.persisted_error_code
     };
   }
   if (executionClaim.action === "waiting") {
@@ -1430,7 +1451,11 @@ async function sendMessageToHermesAgentApi(payload) {
     executionRequestKey: requestIdentity.key,
     hermesConversationId: conversation,
     hermesResponseId: result.responseId,
-    idempotencyStatus: "new"
+    idempotencyStatus: "new",
+    answerSource: "agent_api_output_text",
+    durableResultReused: false,
+    persistedResultStatus: null,
+    persistedErrorCode: null
   };
 }
 
@@ -1442,7 +1467,8 @@ async function closeAdapterEventDurably(ctx, {
   result,
   hermesDurationMs,
   httpStatus,
-  errorCode = null
+  errorCode = null,
+  responseGenerated = false
 }) {
   if (!ctx || !supabase) return;
   if (ctx.startError) throw ctx.startError;
@@ -1462,7 +1488,9 @@ async function closeAdapterEventDurably(ctx, {
     patient_display_name: getPatientDisplayName(normalized?.patient),
     phone: normalized?.phone || null,
     message_content: normalized?.message_text || null,
-    response_content: normalizedResponse?.message_for_client || normalizedResponse?.reply || null,
+    response_content: responseGenerated
+      ? "[RESPONSE_GENERATED_NOT_SENT]"
+      : normalizedResponse?.message_for_client || normalizedResponse?.reply || null,
     status,
     processing_stage: processingStage,
     hermes_transport: result?.transport || HERMES_TRANSPORT,
@@ -3473,6 +3501,12 @@ app.post("/helios/message", async (req, res) => {
   let errorMsg = "";
   let finalRoute = "hermes";
   let finalIntent = "respuesta_hermes";
+  let normalizedResponse = null;
+  let contractShapeValid = false;
+  let contractStrategy = null;
+  let contractCandidateCount = 0;
+  let normalizedSafeToSend = false;
+  let normalizedErrorCode = null;
 
   try {
     if (!ADAPTER_API_KEY) {
@@ -3536,7 +3570,7 @@ app.post("/helios/message", async (req, res) => {
 
     const hermesStartTime = Date.now();
     try {
-      processingStage = "message_sent";
+      processingStage = "hermes_request";
       result = await sendMessageToHermes(payload);
       hermesDurationMs = Date.now() - hermesStartTime;
     } catch(err) {
@@ -3546,6 +3580,7 @@ app.post("/helios/message", async (req, res) => {
     sessionId = result.sessionId || "";
     streamId = result.streamId || "";
     rawResponseText = result.answer || "";
+    processingStage = "hermes_response_received";
 
     debugEvent.hermes_session_id = sessionId;
     debugEvent.hermes_stream_id = streamId;
@@ -3706,25 +3741,60 @@ app.post("/helios/message", async (req, res) => {
       return;
     }
 
-    processingStage = "contract_parsing";
-    const normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result, {
+    processingStage = "contract_normalization";
+    normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result, {
       httpStatus: result.httpStatus,
       toolCalls: result.toolCalls || [],
       identityComplete: normalized.patient?.identity_complete,
       missingFields: normalized.state?.missing_fields || []
     });
+    contractShapeValid = result.persistedNormalizedResult
+      ? typeof normalizedResponse?.contract_shape_valid === "boolean"
+        ? normalizedResponse.contract_shape_valid
+        : isValidHermesContract(normalizedResponse)
+      : normalizedResponse?.contract_shape_valid === true;
+    contractStrategy = result.persistedNormalizedResult
+      ? normalizedResponse?.contract_strategy || "persisted_normalized_result"
+      : normalizedResponse?.contract_strategy || null;
+    contractCandidateCount = Number.isInteger(normalizedResponse?.contract_candidate_count)
+      ? normalizedResponse.contract_candidate_count
+      : 0;
+    normalizedSafeToSend = normalizedResponse?.safe_to_send === true;
+    normalizedErrorCode = normalizedResponse?.error_code || null;
     normalizedResponse.request_key = result.executionRequestKey || null;
-    if (result.idempotencyStatus === "new") {
-      await executionStore.complete(result.executionRequestKey, {
-        hermes_conversation_id: result.hermesConversationId,
-        hermes_response_id: result.hermesResponseId || result.sessionId,
-        normalized_result: normalizedResponse,
-        tool_calls: result.toolCalls || [],
-        token_usage: result.tokenUsage || {},
-        duration_ms: hermesDurationMs
-      });
-    }
     processingStage = "contract_validated";
+    console.log(JSON.stringify(buildProcessingTelemetry({
+      traceId: telemetryCtx?.identity?.trace_id || normalized?.trace_id || "",
+      requestKey: result.executionRequestKey,
+      processingStage,
+      answerSource: result.answerSource,
+      answer: rawResponseText,
+      contractShapeValid,
+      contractStrategy,
+      contractCandidateCount,
+      normalizedSafeToSend,
+      normalizedErrorCode,
+      durableResultReused: result.durableResultReused,
+      persistedResultStatus: result.persistedResultStatus,
+      persistedErrorCode: result.persistedErrorCode
+    })));
+    if (result.idempotencyStatus === "new") {
+      processingStage = "durable_persistence";
+      try {
+        await executionStore.complete(result.executionRequestKey, {
+          hermes_conversation_id: result.hermesConversationId,
+          hermes_response_id: result.hermesResponseId || result.sessionId,
+          normalized_result: normalizedResponse,
+          tool_calls: result.toolCalls || [],
+          token_usage: result.tokenUsage || {},
+          duration_ms: hermesDurationMs
+        });
+      } catch (error) {
+        error.exceptionStage = "durable_persistence";
+        error.executionRequestKey = result.executionRequestKey;
+        throw error;
+      }
+    }
     finalReply = normalizedResponse.reply || "";
     finalStatus = normalizedResponse.ok ? "ok" : "error";
     finalRoute = normalizedResponse.route || "hermes";
@@ -3756,7 +3826,7 @@ app.post("/helios/message", async (req, res) => {
     debugEvent.adapter_response_preview = JSON.stringify(normalizedResponse).slice(0, 1000);
     debugEvent.adapter_response_detail = JSON.stringify(normalizedResponse, null, 2);
 
-    processingStage = "response_returned";
+    processingStage = "telemetry_finalize";
     // Registrar listeners una sola vez antes de responder:
     const traceId = telemetryCtx?.identity?.trace_id || normalized?.trace_id || "";
 
@@ -3796,7 +3866,7 @@ app.post("/helios/message", async (req, res) => {
       status: result.idempotencyStatus === "deduplicated"
         ? "deduplicated"
         : normalizedResponse.ok ? "completed" : "failed_recoverable",
-      processingStage: "response_returned",
+      processingStage,
       normalized,
       normalizedResponse,
       result,
@@ -3806,6 +3876,7 @@ app.post("/helios/message", async (req, res) => {
     });
 
     // La ejecución y la telemetría ya son durables antes de responder.
+    processingStage = "response_returned";
     res.json(normalizedResponse);
 
     console.log(JSON.stringify({
@@ -3878,18 +3949,29 @@ app.post("/helios/message", async (req, res) => {
     finalIntent = "error_tecnico";
     errorMsg = error.message;
 
-    let normalizedError = normalizeProviderError(error);
-    if (["assistant_completed_received", "contract_parsing", "contract_validated"].includes(processingStage) && (error.name === "SyntaxError" || error.message.includes("JSON") || error.message.includes("contrato"))) {
-      normalizedError = {
-        ok: false,
-        intent: "technical_error",
-        requires_handoff: false,
-        safe_to_send: false,
-        response_sent: false,
-        recoverable: true,
-        error_code: "OUTPUT_CONTRACT_VIOLATION"
-      };
-    }
+    const exceptionStage = error.exceptionStage || processingStage;
+    error.exceptionStage = exceptionStage;
+    const normalizedError = classifyPostProcessingError(
+      error,
+      { processingStage: exceptionStage, contractShapeValid },
+      normalizeProviderError(error)
+    );
+    console.warn(JSON.stringify(buildProcessingTelemetry({
+      traceId: telemetryCtx?.identity?.trace_id || normalized?.trace_id || "",
+      requestKey: result?.executionRequestKey || error.executionRequestKey,
+      processingStage: exceptionStage,
+      answerSource: result?.answerSource,
+      answer: rawResponseText,
+      contractShapeValid,
+      contractStrategy,
+      contractCandidateCount,
+      normalizedSafeToSend,
+      normalizedErrorCode,
+      durableResultReused: result?.durableResultReused,
+      persistedResultStatus: result?.persistedResultStatus,
+      persistedErrorCode: result?.persistedErrorCode,
+      exception: error
+    })));
     const errorResponse = {
       ok: false,
       route: "error",
@@ -3975,7 +4057,7 @@ app.post("/helios/message", async (req, res) => {
       if (supabase) {
         await closeAdapterEventDurably(telemetryCtx, {
           status: normalizedError.recoverable === false ? "failed_final" : "failed_recoverable",
-          processingStage,
+          processingStage: exceptionStage,
           normalized,
           normalizedResponse: errorResponse,
           result: {
@@ -3987,7 +4069,10 @@ app.post("/helios/message", async (req, res) => {
           },
           hermesDurationMs,
           httpStatus: normalizedError.http_status,
-          errorCode: normalizedError.error_code
+          errorCode: normalizedError.error_code,
+          responseGenerated: contractShapeValid && Boolean(
+            normalizedResponse?.message_for_client || normalizedResponse?.reply
+          )
         });
       }
     } catch (persistenceError) {

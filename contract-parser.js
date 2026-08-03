@@ -102,7 +102,7 @@ function isSafePlainIdentityRequest(rawReply, context = {}) {
   return missingFields.every(field => requestsField[field] === true);
 }
 
-function createPlainIdentityRepair(rawReply) {
+function createPlainIdentityRepair(rawReply, extraction = {}) {
   const text = String(rawReply).trim();
   return {
     ok: true,
@@ -132,7 +132,10 @@ function createPlainIdentityRepair(rawReply) {
     error_code: null,
     contract_repair_applied: true,
     contract_repair_reason: "identity_request_plain_text",
-    original_output_format: "plain_text"
+    original_output_format: "plain_text",
+    contract_shape_valid: false,
+    contract_strategy: extraction.strategy || "not_found",
+    contract_candidate_count: extraction.candidateCount || 0
   };
 }
 
@@ -317,7 +320,7 @@ function normalizeAdapterResponse(result, context = {}) {
         contract_repair_reason: "identity_request_plain_text",
         original_output_format: "plain_text"
       }));
-      return createPlainIdentityRepair(rawReply);
+      return createPlainIdentityRepair(rawReply, { strategy, candidateCount });
     }
 
     return {
@@ -344,7 +347,10 @@ function normalizeAdapterResponse(result, context = {}) {
       contract_repair_applied: false,
       contract_repair_reason: null,
       original_output_format: "invalid_or_ambiguous",
-      error_code: "OUTPUT_CONTRACT_VIOLATION"
+      error_code: "OUTPUT_CONTRACT_VIOLATION",
+      contract_shape_valid: false,
+      contract_strategy: strategy,
+      contract_candidate_count: candidateCount
     };
   }
 
@@ -373,7 +379,10 @@ function normalizeAdapterResponse(result, context = {}) {
       response_sent: false,
       requires_handoff: false,
       recoverable: true,
-      error_code: "INTERNAL_REASONING_IN_CLIENT_MESSAGE"
+      error_code: "INTERNAL_REASONING_IN_CLIENT_MESSAGE",
+      contract_shape_valid: true,
+      contract_strategy: strategy,
+      contract_candidate_count: candidateCount
     };
   }
 
@@ -405,7 +414,10 @@ function normalizeAdapterResponse(result, context = {}) {
     response_sent: false,
     requires_handoff: parsedJson.requires_handoff === true,
     recoverable: parsedJson.recoverable === true,
-    error_code: parsedJson.error_code || null
+    error_code: parsedJson.error_code || null,
+    contract_shape_valid: true,
+    contract_strategy: strategy,
+    contract_candidate_count: candidateCount
   };
 }
 
