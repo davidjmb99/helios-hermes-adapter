@@ -1430,7 +1430,8 @@ async function sendMessageToHermesAgentApi(payload) {
     result = await hermesAgentClient.sendMessage({
       input: buildHermesMessage(normalized),
       conversation,
-      idempotencyKey: requestIdentity.key
+      idempotencyKey: requestIdentity.key,
+      traceId: normalized.trace_id
     });
     lastHermesResponseCompletedAt = new Date().toISOString();
   } catch (error) {
@@ -1439,7 +1440,7 @@ async function sendMessageToHermesAgentApi(payload) {
   }
 
   return {
-    sessionId: result.responseId,
+    sessionId: result.sessionId || null,
     streamId: "",
     answer: result.answer,
     conflict: false,

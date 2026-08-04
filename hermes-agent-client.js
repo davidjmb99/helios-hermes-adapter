@@ -1,4 +1,98 @@
-"use strict";
+﻿"use strict";
+
+const crypto = require("crypto");
+
+function sha256Prefix(text) {
+  if (typeof text !== "string") return null;
+  return crypto.createHash("sha256").update(text, "utf8").digest("hex").substring(0, 12);
+}
+
+function inspectHermesResponseStructure(responseData, metadata = {}) {
+  const rootOutputTextPresent = typeof responseData?.output_text === "string";
+  const rootOutputTextLength = rootOutputTextPresent ? responseData.output_text.length : null;
+  const rootOutputTextSha256 = rootOutputTextPresent ? sha256Prefix(responseData.output_text) : null;
+
+  const outputArray = Array.isArray(responseData?.output) ? responseData.output : [];
+  const outputItemCount = outputArray.length;
+  const outputItemTypes = outputArray.map(item => item?.type || "unknown");
+
+  let assistantMessageCount = 0;
+  let outputTextCount = 0;
+  const outputTextLocations = [];
+
+  for (let i = 0; i < outputArray.length; i++) {
+    const item = outputArray[i];
+    if (item?.type === "message" && item?.role === "assistant") {
+      assistantMessageCount++;
+    }
+    const contentArray = Array.isArray(item?.content) ? item.content : [];
+    for (let j = 0; j < contentArray.length; j++) {
+      const content = contentArray[j];
+      if (content?.type === "output_text" && typeof content.text === "string") {
+        outputTextCount++;
+        outputTextLocations.push({
+          output_index: i,
+          content_index: j,
+          item_type: item?.type || null,
+          role: item?.role || null,
+          content_type: "output_text",
+          length: content.text.length,
+          sha256_prefix: sha256Prefix(content.text)
+        });
+      }
+    }
+  }
+
+  let selectedOutputSource = "none";
+  let selectedOutputIndex = null;
+  let selectedContentIndex = null;
+
+  if (rootOutputTextPresent) {
+    selectedOutputSource = "root_output_text";
+  } else {
+    let firstFound = false;
+    for (const loc of outputTextLocations) {
+      if (loc.item_type === "message" && loc.role === "assistant") {
+        if (!firstFound) {
+          selectedOutputIndex = loc.output_index;
+          selectedContentIndex = loc.content_index;
+          firstFound = true;
+        }
+      }
+    }
+    if (firstFound) {
+      selectedOutputSource = "output_message_content";
+    }
+  }
+
+  const answer = extractResponseOutputText(responseData);
+  const selectedOutputLength = typeof answer === "string" ? answer.length : 0;
+  const selectedOutputSha256Prefix = typeof answer === "string" ? sha256Prefix(answer) : null;
+
+  const telemetryEvent = {
+    event: "hermes_agent_response_structure",
+    trace_id: metadata.trace_id || null,
+    response_id: responseData?.id || null,
+    real_session_id: metadata.real_session_id || null,
+    response_status: responseData?.status || null,
+    root_output_text_present: rootOutputTextPresent,
+    root_output_text_length: rootOutputTextLength,
+    root_output_text_sha256_prefix: rootOutputTextSha256,
+    output_item_count: outputItemCount,
+    output_item_types: outputItemTypes,
+    assistant_message_count: assistantMessageCount,
+    output_text_count: outputTextCount,
+    output_text_locations: outputTextLocations,
+    selected_output_source: selectedOutputSource,
+    selected_output_index: selectedOutputIndex,
+    selected_content_index: selectedContentIndex,
+    selected_output_length: selectedOutputLength,
+    selected_output_sha256_prefix: selectedOutputSha256Prefix
+  };
+
+  console.log(JSON.stringify(telemetryEvent));
+  return telemetryEvent;
+}
 
 function createAgentApiError(message, code, status, cause) {
   const error = new Error(message, cause ? { cause } : undefined);
@@ -87,22 +181,22 @@ function createHermesAgentClient({
     throw new Error("A fetch implementation is required");
   }
 
-  async function sendMessage({ input, conversation, idempotencyKey }) {
+  async function sendMessage({ input, conversation, idempotencyKey, traceId }) {
     if (!normalizedBaseUrl) {
       throw createAgentApiError(
-        "HERMES_AGENT_API_BASE_URL no está configurada",
+        "HERMES_AGENT_API_BASE_URL no estÃ¡ configurada",
         "HERMES_AGENT_API_BASE_URL_MISSING"
       );
     }
     if (!apiKey) {
       throw createAgentApiError(
-        "HERMES_AGENT_API_KEY no está configurada",
+        "HERMES_AGENT_API_KEY no estÃ¡ configurada",
         "HERMES_AGENT_API_KEY_MISSING"
       );
     }
     if (!conversation) {
       throw createAgentApiError(
-        "No se pudo construir la conversación de Hermes Agent",
+        "No se pudo construir la conversaciÃ³n de Hermes Agent",
         "HERMES_AGENT_CONVERSATION_MISSING"
       );
     }
@@ -147,7 +241,9 @@ function createHermesAgentClient({
     }
 
     let responseData = null;
+    let realSessionId = null;
     try {
+      realSessionId = response.headers.get("x-hermes-session-id") || response.headers.get("X-Hermes-Session-Id") || null;
       responseData = await response.json();
     } catch (_) {}
 
@@ -157,7 +253,7 @@ function createHermesAgentClient({
         responseData?.code ||
         `HTTP_${response.status}`;
       throw createAgentApiError(
-        `Hermes Agent API rechazó la solicitud (${providerCode})`,
+        `Hermes Agent API rechazÃ³ la solicitud (${providerCode})`,
         "HERMES_AGENT_HTTP_ERROR",
         response.status
       );
@@ -165,15 +261,21 @@ function createHermesAgentClient({
 
     if (responseData?.status !== "completed") {
       throw createAgentApiError(
-        `Hermes Agent API finalizó con estado ${responseData?.status || "unknown"}`,
+        `Hermes Agent API finalizÃ³ con estado ${responseData?.status || "unknown"}`,
         "HERMES_AGENT_INCOMPLETE_RESPONSE"
       );
     }
 
     const answer = extractResponseOutputText(responseData);
+
+    inspectHermesResponseStructure(responseData, {
+      trace_id: traceId,
+      real_session_id: realSessionId
+    });
+
     if (!answer) {
       throw createAgentApiError(
-        "Hermes Agent API no devolvió texto final",
+        "Hermes Agent API no devolviÃ³ texto final",
         "HERMES_AGENT_EMPTY_RESPONSE"
       );
     }
@@ -183,6 +285,7 @@ function createHermesAgentClient({
       answer,
       httpStatus: response.status,
       responseId: responseData.id || "",
+      sessionId: realSessionId,
       model: responseData.model || model || "helios",
       toolCalls,
       tokenUsage: extractResponseTokenUsage(responseData, toolCalls)
@@ -196,5 +299,6 @@ module.exports = {
   createHermesAgentClient,
   extractResponseOutputText,
   extractResponseToolCalls,
-  extractResponseTokenUsage
+  extractResponseTokenUsage,
+  inspectHermesResponseStructure
 };
