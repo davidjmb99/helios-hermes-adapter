@@ -130,38 +130,64 @@ const executionStore = createExecutionStore({
 });
 let lastHermesResponseCompletedAt = null;
 
-// Sesiones a las que ya se les puso titulo en esta vida del proceso, para no
-// repetir el PATCH en cada turno de la misma conversacion.
-const renamedHermesSessions = new Set();
+// Ultimo titulo aplicado a cada sesion en esta vida del proceso, para no repetir
+// el PATCH en cada turno pero si permitir el retitulado cuando llega la identidad.
+const hermesSessionTitles = new Map();
+
+// En el turno en que el paciente facilita sus datos, el payload de la peticion
+// todavia llega con first_name y last_name en null: el perfil se persiste despues.
+// La identidad buena de ese turno viene en el profile_patch de la respuesta.
+function resolveEventIdentity(normalized, normalizedResponse) {
+  const requestPatient = normalized?.patient || {};
+  const patch = normalizedResponse?.profile_patch || {};
+  const merged = {
+    ...requestPatient,
+    first_name: patch.first_name || requestPatient.first_name || null,
+    last_name: patch.last_name || requestPatient.last_name || null
+  };
+  return {
+    first_name: merged.first_name || null,
+    last_name: merged.last_name || null,
+    display_name: getPatientDisplayName(merged)
+  };
+}
 
 // Hermes crea las sesiones de Agent API sin titulo, y el WebUI las muestra todas
-// como "Api_Server Session", indistinguibles entre si. Le ponemos el numero de
-// conversacion de Chatwoot. Nunca lanza ni bloquea: si falla, se registra y el
-// paciente recibe su respuesta igual.
-async function ensureHermesSessionTitle(sessionId, normalized) {
+// como "Api_Server Session", indistinguibles entre si. Les ponemos el numero de
+// conversacion de Chatwoot, y el nombre del paciente en cuanto se conoce.
+// Nunca lanza ni bloquea: si falla, se registra y el paciente recibe su respuesta.
+async function ensureHermesSessionTitle(sessionId, normalized, normalizedResponse) {
   if (HERMES_TRANSPORT !== "agent_api") return;
   const conversationId = normalized?.conversation_id;
   if (!sessionId || !conversationId) return;
-  if (renamedHermesSessions.has(sessionId)) return;
-  renamedHermesSessions.add(sessionId);
 
-  const outcome = await hermesAgentClient.renameSession({
-    sessionId,
-    title: `Helios · Conversación ${conversationId}`
-  });
+  const identity = resolveEventIdentity(normalized, normalizedResponse);
+  const fullName = [identity.first_name, identity.last_name]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  const title = fullName
+    ? `${fullName} · Conversación ${conversationId}`
+    : `Helios · Conversación ${conversationId}`;
+
+  if (hermesSessionTitles.get(sessionId) === title) return;
+  hermesSessionTitles.set(sessionId, title);
+
+  const outcome = await hermesAgentClient.renameSession({ sessionId, title });
 
   if (outcome.ok) {
     console.log(JSON.stringify({
       event: "hermes_session_title_updated",
       conversation_id: String(conversationId),
       session_id: sessionId,
+      named: Boolean(fullName),
       http_status: outcome.status
     }));
     return;
   }
 
   // Permitir que el siguiente turno lo reintente.
-  renamedHermesSessions.delete(sessionId);
+  hermesSessionTitles.delete(sessionId);
   console.warn(JSON.stringify({
     event: "hermes_session_title_update_failed",
     conversation_id: String(conversationId),
@@ -1479,9 +1505,6 @@ async function sendMessageToHermesAgentApi(payload) {
     throw error;
   }
 
-  // Sin await: titular la sesion no debe retrasar la respuesta al paciente.
-  ensureHermesSessionTitle(result.sessionId, normalized).catch(() => {});
-
   return {
     sessionId: result.sessionId || null,
     streamId: "",
@@ -1521,15 +1544,16 @@ async function closeAdapterEventDurably(ctx, {
   const tokenUsage = result?.tokenUsage || {};
   const toolCalls = result?.toolCalls || tokenUsage.tool_calls || [];
   const completedAt = new Date().toISOString();
+  const eventIdentity = resolveEventIdentity(normalized, normalizedResponse);
   const payload = {
     request_key: result?.executionRequestKey || null,
     parent_trace_id: normalized?.metadata?.parent_trace_id || null,
     account_id: normalized?.account_id || null,
     clinic_id: normalized?.clinic_id || null,
     hermes_profile: normalized?.hermes_profile || null,
-    patient_first_name: normalized?.patient?.first_name || null,
-    patient_last_name: normalized?.patient?.last_name || null,
-    patient_display_name: getPatientDisplayName(normalized?.patient),
+    patient_first_name: eventIdentity.first_name,
+    patient_last_name: eventIdentity.last_name,
+    patient_display_name: eventIdentity.display_name,
     phone: normalized?.phone || null,
     message_content: normalized?.message_text || null,
     response_content: responseGenerated
@@ -3839,6 +3863,11 @@ app.post("/helios/message", async (req, res) => {
         throw error;
       }
     }
+
+    // Sin await: titular la sesion no debe retrasar la respuesta al paciente.
+    // Se hace aqui, y no antes, porque necesita el profile_patch de la respuesta
+    // para poder usar el nombre del paciente en cuanto se conoce.
+    ensureHermesSessionTitle(result.sessionId, normalized, normalizedResponse).catch(() => {});
     finalReply = normalizedResponse.reply || "";
     finalStatus = normalizedResponse.ok ? "ok" : "error";
     finalRoute = normalizedResponse.route || "hermes";
