@@ -130,6 +130,46 @@ const executionStore = createExecutionStore({
 });
 let lastHermesResponseCompletedAt = null;
 
+// Sesiones a las que ya se les puso titulo en esta vida del proceso, para no
+// repetir el PATCH en cada turno de la misma conversacion.
+const renamedHermesSessions = new Set();
+
+// Hermes crea las sesiones de Agent API sin titulo, y el WebUI las muestra todas
+// como "Api_Server Session", indistinguibles entre si. Le ponemos el numero de
+// conversacion de Chatwoot. Nunca lanza ni bloquea: si falla, se registra y el
+// paciente recibe su respuesta igual.
+async function ensureHermesSessionTitle(sessionId, normalized) {
+  if (HERMES_TRANSPORT !== "agent_api") return;
+  const conversationId = normalized?.conversation_id;
+  if (!sessionId || !conversationId) return;
+  if (renamedHermesSessions.has(sessionId)) return;
+  renamedHermesSessions.add(sessionId);
+
+  const outcome = await hermesAgentClient.renameSession({
+    sessionId,
+    title: `Helios · Conversación ${conversationId}`
+  });
+
+  if (outcome.ok) {
+    console.log(JSON.stringify({
+      event: "hermes_session_title_updated",
+      conversation_id: String(conversationId),
+      session_id: sessionId,
+      http_status: outcome.status
+    }));
+    return;
+  }
+
+  // Permitir que el siguiente turno lo reintente.
+  renamedHermesSessions.delete(sessionId);
+  console.warn(JSON.stringify({
+    event: "hermes_session_title_update_failed",
+    conversation_id: String(conversationId),
+    session_id: sessionId,
+    http_status: outcome.status,
+    error_code: outcome.errorCode
+  }));
+}
 
 function normalizeTelemetryIdentity(payload) {
   const traceId = payload?.metadata?.trace_id || payload?.trace_id || crypto.randomUUID();
@@ -1438,6 +1478,9 @@ async function sendMessageToHermesAgentApi(payload) {
     error.executionRequestKey = requestIdentity.key;
     throw error;
   }
+
+  // Sin await: titular la sesion no debe retrasar la respuesta al paciente.
+  ensureHermesSessionTitle(result.sessionId, normalized).catch(() => {});
 
   return {
     sessionId: result.sessionId || null,

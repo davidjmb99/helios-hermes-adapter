@@ -292,7 +292,50 @@ function createHermesAgentClient({
     };
   }
 
-  return { sendMessage };
+  // Pone un titulo legible a la sesion de Hermes para que el WebUI no la muestre
+  // como "Api_Server Session". Nunca lanza: un fallo aqui no debe afectar a la
+  // respuesta al paciente.
+  async function renameSession({ sessionId, title }) {
+    if (!normalizedBaseUrl || !apiKey || !sessionId || !title) {
+      return { ok: false, status: 0, errorCode: "HERMES_SESSION_RENAME_SKIPPED" };
+    }
+
+    const controller = new AbortController();
+    const renameTimeoutMs = Math.min(requestTimeoutMs, 5000);
+    const timeout = setTimeout(() => controller.abort(), renameTimeoutMs);
+
+    try {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ title: String(title) }),
+          signal: controller.signal
+        }
+      );
+      return {
+        ok: response.ok,
+        status: response.status,
+        errorCode: response.ok ? null : "HERMES_SESSION_RENAME_HTTP_ERROR"
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: 0,
+        errorCode: isAbortError(error)
+          ? "HERMES_SESSION_RENAME_TIMEOUT"
+          : "HERMES_SESSION_RENAME_NETWORK_ERROR"
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return { sendMessage, renameSession };
 }
 
 module.exports = {
