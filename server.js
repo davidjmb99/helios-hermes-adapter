@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
+const { calcularCoste, formatearUsd } = require("./pricing");
 const { createExecutionStore } = require("./execution-store");
 const { assertSupabaseSuccess } = require("./supabase-assert");
 const {
@@ -102,6 +103,10 @@ const HERMES_AGENT_API_BASE_URL = (
   process.env.HERMES_AGENT_API_BASE_URL || ""
 ).replace(/\/+$/, "");
 const HERMES_AGENT_API_KEY = process.env.HERMES_AGENT_API_KEY || "";
+// OJO: esto NO es el nombre del modelo de IA, es lo que se manda como campo
+// `model` en la petición a Hermes, que usa el perfil cuando no hay otra cosa. El
+// modelo REAL lo devuelve Hermes en la telemetría y se guarda aparte: mezclarlos
+// hacía que el panel mostrara «Modelo: helios», que es un perfil, no un modelo.
 const HERMES_AGENT_MODEL = process.env.HERMES_AGENT_MODEL || HERMES_PROFILE;
 const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 30000);
 const ADAPTER_EXECUTION_LEASE_MS = Math.max(
@@ -1568,7 +1573,10 @@ async function closeAdapterEventDurably(ctx, {
     input_tokens: tokenUsage.input_tokens ?? null,
     output_tokens: tokenUsage.output_tokens ?? null,
     total_tokens: tokenUsage.total_tokens ?? null,
-    model: tokenUsage.model || HERMES_AGENT_MODEL,
+    // Sin fallback al perfil: si Hermes no dice qué modelo usó, se deja vacío y
+    // el panel lo muestra como desconocido. Un nombre inventado impide además
+    // calcular el coste, porque el catálogo de precios no lo encontraría.
+    model: tokenUsage.model || null,
     tool_names: [...new Set(toolCalls.map(tool => tool?.name).filter(Boolean))],
     tool_count: toolCalls.length,
     duration_ms: Date.now() - ctx.startedAt,
@@ -2111,7 +2119,20 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
         patient_last_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_last_name : null,
         patient_display_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_display_name : null,
         message_content: HELIOS_ADMIN_SHOW_PII ? ev.message_content : "[REDACTED_MESSAGE]",
-        response_content: HELIOS_ADMIN_SHOW_PII ? ev.response_content : "[REDACTED_RESPONSE]"
+        response_content: HELIOS_ADMIN_SHOW_PII ? ev.response_content : "[REDACTED_RESPONSE]",
+        // Coste del mensaje. Se calcula con la tarifa VIGENTE EN SU FECHA, no en
+        // la de hoy: DeepSeek sube precios el 16-08-2026 y un mensaje de antes no
+        // cuesta lo que costaría ahora. Si no consta cuántos tokens vinieron de
+        // caché se devuelve un rango, porque entre «todo cacheado» y «nada
+        // cacheado» hay un factor de cincuenta y dar un número concreto sería
+        // inventárselo.
+        cost: calcularCoste({
+          model: ev.model,
+          at: ev.created_at,
+          input_tokens: ev.input_tokens,
+          output_tokens: ev.output_tokens,
+          cached_tokens: Number.isFinite(ev.cache_read_tokens) ? ev.cache_read_tokens : null
+        })
     }));
       res.json({ count: maskedEvents.length, events: maskedEvents });
   } catch (err) {
@@ -2965,7 +2986,20 @@ function serveDashboard(req, res) {
           if (Array.isArray(dt) && dt.length > 0) detailToolsList = escapeHtml(dt.join(', '));
         }
         
-        const tokenText = (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
+        // Mismo formato que formatearUsd() del servidor, para que el panel y la
+      // API digan exactamente lo mismo.
+      const fmtUsd = function(v) {
+        if (typeof v !== 'number' || !isFinite(v)) return 'N/A';
+        if (v === 0) return '$0';
+        return v < 0.01 ? '$' + v.toFixed(6) : '$' + v.toFixed(4);
+      };
+      const costText = (function(c){
+        if (!c) return '';
+        if (c.exact) return ' · 💵 ' + fmtUsd(c.usd);
+        if (c.motivo === 'modelo_desconocido') return '';
+        return ' · 💵 ' + fmtUsd(c.usd_min) + '–' + fmtUsd(c.usd_max);
+      })(ev.cost);
+      const tokenText = (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
                           (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + ' / ' +
                           (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A');
         
@@ -2982,7 +3016,7 @@ function serveDashboard(req, res) {
               '<span class="badge ' + badgeClass + '">' + ev.status + '</span>' +
               '<span class="timestamp">' + formattedDate + '</span>' +
               '<span class="timestamp" style="color: var(--primary); font-weight: 500;">⏱️ ' + durationText + '</span>' +
-              '<span class="timestamp" style="color: #818cf8; font-weight: 500;">🪙 Tokens: ' + tokenText + '</span>' +
+              '<span class="timestamp" style="color: #818cf8; font-weight: 500;">🪙 Tokens: ' + tokenText + costText + '</span>' +
             '</div>' +
             '<div style="font-size: 0.8rem; color: var(--text-muted);">' +
               'Trace: <code style="font-family: monospace; color: #fff;">' + traceShort + '</code>' +
@@ -3051,7 +3085,22 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section" style="border-color: rgba(99, 102, 241, 0.2);">' +
         '<div class="detail-section-title" style="color: #818cf8;">H. Uso de Tokens</div>' +
         '<div class="grid-2col">' +
-          '<div class="grid-item"><span>Modelo</span><div>' + (ev.model || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Modelo</span><div>' + escapeHtml(ev.model || 'sin identificar') + '</div></div>' +
+          '<div class="grid-item"><span>Perfil</span><div>' + escapeHtml(ev.hermes_profile || 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Coste del mensaje</span><div>' + (function(c){
+              if (!c) return 'N/A';
+              if (c.exact) return '<b style="color:#34d399">' + fmtUsd(c.usd) + '</b>';
+              if (c.motivo === 'modelo_desconocido') return '<span title="El catálogo de precios no reconoce este modelo">sin tarifa conocida</span>';
+              // Sin saber cuántos tokens vinieron de caché solo se puede acotar.
+              return '<span title="No consta el desglose de caché: se muestra el rango entre todo cacheado y nada cacheado">'
+                + fmtUsd(c.usd_min) + ' – ' + fmtUsd(c.usd_max) + '</span>';
+            })(ev.cost) + '</div></div>' +
+          '<div class="grid-item"><span>Tarifa aplicada</span><div>' + (function(c){
+              if (!c || !c.franja) return 'N/A';
+              if (c.franja === 'pico') return 'horario pico';
+              if (c.franja === 'valle') return 'horario valle';
+              return 'tarifa única';
+            })(ev.cost) + '</div></div>' +
           '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
