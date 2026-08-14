@@ -5,6 +5,16 @@ const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd } = require("./pricing");
+
+/**
+ * Modelo que se usa SOLO para calcular el coste, cuando Hermes no lo reporta.
+ *
+ * Va aparte de HERMES_AGENT_MODEL a propósito, y la diferencia importa: aquella
+ * viaja en el cuerpo de la petición a Hermes y cambiarla puede alterar a qué
+ * modelo se llama. Esta no sale de aquí: solo sirve para buscar la tarifa en el
+ * catálogo. Si Hermes acaba reportando el modelo real, ese gana y esta se ignora.
+ */
+const HELIOS_BILLING_MODEL = (process.env.HELIOS_BILLING_MODEL || "").trim() || null;
 const { createExecutionStore } = require("./execution-store");
 const { assertSupabaseSuccess } = require("./supabase-assert");
 const {
@@ -2127,7 +2137,9 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
         // cacheado» hay un factor de cincuenta y dar un número concreto sería
         // inventárselo.
         cost: calcularCoste({
-          model: ev.model,
+          // El modelo que reporte Hermes manda; si no hay, se usa el declarado
+          // para facturación. Nunca el perfil.
+          model: ev.model || HELIOS_BILLING_MODEL,
           at: ev.created_at,
           input_tokens: ev.input_tokens,
           output_tokens: ev.output_tokens,
