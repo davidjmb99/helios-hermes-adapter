@@ -44,7 +44,14 @@ The object must contain: message_for_client (string), operation (object), profil
 Do not omit empty patch objects or the tool_calls array.`;
 
 function buildHermesContractInput(payload) {
-  return `${HERMES_OUTPUT_CONTRACT_INSTRUCTIONS}\n\nOPERATIONAL PAYLOAD:\n${JSON.stringify(payload || {}, null, 2)}`;
+  // SIN SANGRÍA, a propósito. Este texto no lo lee una persona: lo lee el modelo,
+  // y Hermes lo PERSISTE tal cual en el historial de la sesión. Desde ahí se
+  // reenvía en cada llamada del turno —que pueden ser tres si hay herramientas— y
+  // en todos los turnos siguientes, así que cada espacio de indentación se paga
+  // muchas veces. Medido sobre un payload real: 1.701 caracteres con sangría
+  // frente a 1.425 sin ella, un 19% de puro relleno. En una conversación de 30
+  // turnos son unos 5.800 tokens tirados.
+  return `${HERMES_OUTPUT_CONTRACT_INSTRUCTIONS}\n\nOPERATIONAL PAYLOAD:\n${JSON.stringify(payload || {})}`;
 }
 
 function normalizeForSafetyCheck(text) {
