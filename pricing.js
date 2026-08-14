@@ -219,6 +219,22 @@ function calcularCoste(input) {
   };
 }
 
+/**
+ * Elige el primer candidato que EXISTA en el catálogo de precios.
+ *
+ * No basta con `guardado || respaldo`: durante meses se guardó el nombre del
+ * PERFIL en el campo del modelo, así que las filas antiguas traen «helios», que
+ * no está vacío y por tanto ganaba al respaldo. El resultado era «sin tarifa
+ * conocida» en todo el historial. Preguntando al catálogo se resuelven también
+ * esas filas, y cualquier otro valor basura que se haya colado.
+ */
+function modeloConTarifa(...candidatos) {
+  for (const candidato of candidatos) {
+    if (candidato && buscarTramos(null, candidato)) return String(candidato);
+  }
+  return null;
+}
+
 /** Formato corto para la interfaz: seis decimales bastan a estos precios. */
 function formatearUsd(valor) {
   if (!Number.isFinite(valor)) return "N/A";
@@ -230,6 +246,7 @@ function formatearUsd(valor) {
 module.exports = {
   CATALOGO,
   calcularCoste,
+  modeloConTarifa,
   formatearUsd,
   normalizarModelo,
   buscarTramos,

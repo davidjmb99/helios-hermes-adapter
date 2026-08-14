@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
-const { calcularCoste, formatearUsd } = require("./pricing");
+const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
 
 /**
  * Modelo que se usa SOLO para calcular el coste, cuando Hermes no lo reporta.
@@ -2137,9 +2137,10 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
         // cacheado» hay un factor de cincuenta y dar un número concreto sería
         // inventárselo.
         cost: calcularCoste({
-          // El modelo que reporte Hermes manda; si no hay, se usa el declarado
-          // para facturación. Nunca el perfil.
-          model: ev.model || HELIOS_BILLING_MODEL,
+          // Se pregunta al catálogo, no se usa `||`: las filas antiguas traen
+          // «helios» en este campo —el perfil, no el modelo— y como no está vacío
+          // ganaba al respaldo y dejaba todo el historial sin tarifa.
+          model: modeloConTarifa(ev.model, HELIOS_BILLING_MODEL),
           at: ev.created_at,
           input_tokens: ev.input_tokens,
           output_tokens: ev.output_tokens,

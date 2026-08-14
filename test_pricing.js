@@ -132,3 +132,33 @@ console.log("  coste real del turno de 101.398 tokens: " + real.usd.toFixed(6) +
 console.log("  ignorando la cache habria dado:         " + ignorandoCache.toFixed(6) + " USD");
 console.log("  el mismo turno tras la subida (valle):  " + mismoTurnoDespues.usd.toFixed(6) + " USD");
 console.log("  el mismo turno tras la subida (pico):   " + enPico.usd.toFixed(6) + " USD");
+
+// --- Filas antiguas con el PERFIL guardado como modelo ----------------------
+// Durante meses se guardo "helios" en el campo del modelo. No esta vacio, asi
+// que un simple `guardado || respaldo` lo daba por bueno y dejaba TODO el
+// historial sin tarifa. Se resuelve preguntando al catalogo.
+
+const { modeloConTarifa } = require("./pricing.js");
+
+assert.equal(
+  modeloConTarifa("helios", "deepseek-v4-flash"),
+  "deepseek-v4-flash",
+  "una fila antigua con el perfil cae al modelo de facturacion"
+);
+assert.equal(
+  modeloConTarifa("deepseek-v4-pro", "deepseek-v4-flash"),
+  "deepseek-v4-pro",
+  "si el guardado es bueno, ese manda"
+);
+assert.equal(modeloConTarifa("helios", null), null, "sin respaldo valido, se admite que no se sabe");
+assert.equal(modeloConTarifa(null, null), null);
+assert.equal(modeloConTarifa("", "deepseek-v4-flash"), "deepseek-v4-flash");
+
+const filaAntigua = calcularCoste({
+  model: modeloConTarifa("helios", "deepseek-v4-flash"),
+  at: ANTES, input_tokens: 99015, output_tokens: 2383, cached_tokens: 97536
+});
+assert.equal(filaAntigua.exact, true, "y por tanto una traza vieja ya muestra su coste");
+assert.ok(Math.abs(filaAntigua.usd - real.usd) < 1e-12);
+
+console.log("  filas antiguas con perfil por modelo: resueltas");
