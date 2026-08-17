@@ -1583,6 +1583,12 @@ async function closeAdapterEventDurably(ctx, {
     input_tokens: tokenUsage.input_tokens ?? null,
     output_tokens: tokenUsage.output_tokens ?? null,
     total_tokens: tokenUsage.total_tokens ?? null,
+    // Sin esto el coste NO PUEDE ser exacto. Un token cacheado cuesta una
+    // cincuentava parte de uno nuevo y aquí el acierto de caché ronda el 97%, así
+    // que sin el desglose solo se puede dar un rango de 0,0001 a 0,0056 dólares
+    // para el mismo mensaje. Se leía de Hermes y se tiraba: no había columna.
+    cache_read_tokens: tokenUsage.cache_read_tokens ?? null,
+    cache_write_tokens: tokenUsage.cache_write_tokens ?? null,
     // Sin fallback al perfil: si Hermes no dice qué modelo usó, se deja vacío y
     // el panel lo muestra como desconocido. Un nombre inventado impide además
     // calcular el coste, porque el catálogo de precios no lo encontraría.
@@ -2106,7 +2112,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     let query = supabase
       .from('helios_adapter_events')
-      .select('id, request_key, created_at, trace_id, parent_trace_id, tenant_id, account_id, clinic_id, hermes_profile, conversation_id, contact_id, patient_first_name, patient_last_name, patient_display_name, phone, message_content, response_content, status, processing_stage, hermes_transport, hermes_conversation_id, hermes_response_id, idempotency_status, started_at, finished_at, completed_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, model, tool_names, tool_count, attempt_count, safe_to_send, http_status, error_code')
+      .select('id, request_key, created_at, trace_id, parent_trace_id, tenant_id, account_id, clinic_id, hermes_profile, conversation_id, contact_id, patient_first_name, patient_last_name, patient_display_name, phone, message_content, response_content, status, processing_stage, hermes_transport, hermes_conversation_id, hermes_response_id, idempotency_status, started_at, finished_at, completed_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, model, tool_names, tool_count, attempt_count, safe_to_send, http_status, error_code')
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
@@ -2120,6 +2126,44 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
       return res.status(500).json({ error: true, error_code: "ADAPTER_EVENTS_QUERY_FAILED" });
     }
 
+    /**
+     * Con qué modelo se cobra este turno, de dónde salió esa tarifa, y el coste.
+     *
+     * DOS COSAS QUE EL PANEL MOSTRABA MAL:
+     *
+     *  1. Enseñaba `model` tal cual, y durante meses ahí se guardó «helios», que es
+     *     el nombre del PERFIL y no de un modelo. Así que decía «Modelo: helios» y
+     *     a la vez cobraba con la tarifa de DeepSeek, sin explicar de dónde salía.
+     *     Ahora se muestra el modelo con el que de verdad se calcula, y si viene
+     *     del respaldo se dice también qué hay guardado en la fila.
+     *
+     *  2. No se pregunta al catálogo con `||`: «helios» no está vacío, así que
+     *     ganaba al respaldo y dejaba TODO el historial sin tarifa conocida.
+     *
+     * El coste se calcula con la tarifa VIGENTE EN SU FECHA, no en la de hoy:
+     * DeepSeek sube precios el 16-08-2026 y un mensaje de antes no cuesta lo que
+     * costaría ahora. Si no consta cuántos tokens vinieron de caché se devuelve un
+     * rango, porque entre «todo cacheado» y «nada cacheado» hay un factor de
+     * cincuenta y dar un número concreto sería inventárselo.
+     */
+    const usoDeTokensDelEvento = (ev) => {
+      const deLaFila = modeloConTarifa(ev.model);
+      const delRespaldo = deLaFila ? null : modeloConTarifa(HELIOS_BILLING_MODEL);
+      const modelo = deLaFila || delRespaldo || null;
+      return {
+        billing_model: modelo,
+        billing_model_source: deLaFila ? 'fila' : (delRespaldo ? 'variable' : 'desconocido'),
+        model_guardado: ev.model || null,
+        cost: calcularCoste({
+          model: modelo,
+          at: ev.created_at,
+          input_tokens: ev.input_tokens,
+          output_tokens: ev.output_tokens,
+          cached_tokens: Number.isFinite(ev.cache_read_tokens) ? ev.cache_read_tokens : null
+        })
+      };
+    };
+
     const maskedEvents = data.map(ev => ({
         ...ev,
         phone: HELIOS_ADMIN_SHOW_PII
@@ -2130,22 +2174,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
         patient_display_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_display_name : null,
         message_content: HELIOS_ADMIN_SHOW_PII ? ev.message_content : "[REDACTED_MESSAGE]",
         response_content: HELIOS_ADMIN_SHOW_PII ? ev.response_content : "[REDACTED_RESPONSE]",
-        // Coste del mensaje. Se calcula con la tarifa VIGENTE EN SU FECHA, no en
-        // la de hoy: DeepSeek sube precios el 16-08-2026 y un mensaje de antes no
-        // cuesta lo que costaría ahora. Si no consta cuántos tokens vinieron de
-        // caché se devuelve un rango, porque entre «todo cacheado» y «nada
-        // cacheado» hay un factor de cincuenta y dar un número concreto sería
-        // inventárselo.
-        cost: calcularCoste({
-          // Se pregunta al catálogo, no se usa `||`: las filas antiguas traen
-          // «helios» en este campo —el perfil, no el modelo— y como no está vacío
-          // ganaba al respaldo y dejaba todo el historial sin tarifa.
-          model: modeloConTarifa(ev.model, HELIOS_BILLING_MODEL),
-          at: ev.created_at,
-          input_tokens: ev.input_tokens,
-          output_tokens: ev.output_tokens,
-          cached_tokens: Number.isFinite(ev.cache_read_tokens) ? ev.cache_read_tokens : null
-        })
+        ...usoDeTokensDelEvento(ev)
     }));
       res.json({ count: maskedEvents.length, events: maskedEvents });
   } catch (err) {
@@ -3098,7 +3127,20 @@ function serveDashboard(req, res) {
       bodyHtml += '<div class="detail-section" style="border-color: rgba(99, 102, 241, 0.2);">' +
         '<div class="detail-section-title" style="color: #818cf8;">H. Uso de Tokens</div>' +
         '<div class="grid-2col">' +
-          '<div class="grid-item"><span>Modelo</span><div>' + escapeHtml(ev.model || 'sin identificar') + '</div></div>' +
+          '<div class="grid-item"><span>Modelo</span><div>' + (function(e){
+              // Se muestra el modelo con el que SE COBRA, no lo que hay guardado en
+              // la fila: durante meses ahi se guardo «helios», que es el perfil.
+              // Si la tarifa sale del respaldo se dice, para que nadie crea que
+              // Hermes informo del modelo cuando no lo hizo.
+              if (e.billing_model_source === 'fila') return escapeHtml(e.billing_model);
+              if (e.billing_model_source === 'variable') {
+                return escapeHtml(e.billing_model)
+                  + '<span style="opacity:.6;font-size:.85em"> (por variable; la fila dice «'
+                  + escapeHtml(e.model_guardado || 'vacío') + '»)</span>';
+              }
+              return escapeHtml(e.model_guardado || 'sin identificar')
+                + '<span style="opacity:.6;font-size:.85em"> (sin tarifa en el catálogo)</span>';
+            })(ev) + '</div></div>' +
           '<div class="grid-item"><span>Perfil</span><div>' + escapeHtml(ev.hermes_profile || 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Coste del mensaje</span><div>' + (function(c){
               if (!c) return 'N/A';
