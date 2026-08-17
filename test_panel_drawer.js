@@ -41,7 +41,7 @@ assert.ok(
 
 const elementos = {};
 const elemento = (id) => (elementos[id] = elementos[id] || {
-  id, innerHTML: "", style: {}, dataset: {},
+  id, innerHTML: "", style: {}, dataset: {}, value: "", textContent: "",
   classList: { _c: new Set(), add(x) { this._c.add(x); }, remove(x) { this._c.delete(x); }, contains(x) { return this._c.has(x); } },
   addEventListener() {}
 });
@@ -101,7 +101,7 @@ const TRAZA = {
 
 const api = new Function(`
   ${cuerpo}
-  return { openEventDetail, rawEventsList, renderList, fmtUsd };
+  return { openEventDetail, rawEventsList, renderList, fmtUsd, agruparPorConversacion, alternarConversacion };
 `)();
 
 // --- El clic ----------------------------------------------------------------
@@ -151,6 +151,63 @@ assert.ok(
   elementos["drawer-body-area"].innerHTML.includes("HERMES_TIMEOUT"),
   "una traza sin campos opcionales también abre su detalle"
 );
+
+// =============================================================================
+// AGRUPACION POR CONVERSACION
+// =============================================================================
+//
+// El 17 de agosto la prueba de carga lleno el panel con cincuenta filas que en
+// realidad eran reintentos de un punado de mensajes. Imposible seguirlo mientras
+// entraban. Ahora se agrupa por conversacion y los reintentos se pliegan.
+
+function eventoDe(conv, id, requestKey, extra) {
+  return Object.assign({}, TRAZA, {
+    id, conversation_id: conv, request_key: requestKey,
+    patient_display_name: "Paciente " + conv, phone: "+3460000000" + conv
+  }, extra || {});
+}
+
+// Tres conversaciones. La 55 con la MISMA peticion reintentada veinte veces, que
+// es exactamente lo que paso en la prueba.
+const muchos = [];
+for (let i = 0; i < 20; i++) {
+  muchos.push(eventoDe("55", 1000 + i, "req-55", {
+    idempotency_status: "deduplicated", error_code: "OUTPUT_CONTRACT_VIOLATION"
+  }));
+}
+muchos.push(eventoDe("68", 2000, "req-68", { idempotency_status: "new", error_code: null }));
+muchos.push(eventoDe("68", 2001, "req-68-b", { idempotency_status: "new", error_code: null }));
+muchos.push(eventoDe("64", 3000, "req-64", { idempotency_status: "new", error_code: "HERMES_TIMEOUT" }));
+
+// alternarConversacion repinta desde rawEventsList, que es lo que hace el panel
+// de verdad: se cargan ahi para que el despliegue funcione como en produccion.
+api.rawEventsList.length = 0;
+muchos.forEach(e => api.rawEventsList.push(e));
+
+api.renderList(muchos);
+const lista = elementos["requests-container"].innerHTML;
+
+const cabeceras = (lista.match(/data-conv=/g) || []).length;
+assert.equal(cabeceras, 3, "veintitres eventos se ven como TRES conversaciones, no veintitres filas");
+
+assert.ok(lista.includes("Conversacion 55"), "y cada una dice cual es");
+assert.ok(lista.includes("20 reintento"), "los veinte reintentos se resumen en la cabecera: " + lista.slice(0, 200));
+assert.ok(lista.includes("con error"), "y se dice cuantos fallaron");
+
+// Cerradas por defecto: con muchas conversaciones a la vez, lo que se necesita es
+// la lista corta, no todo el detalle abierto.
+assert.ok(!lista.includes("Hermes Resp"), "las conversaciones empiezan plegadas");
+
+// Al abrir una, aparecen sus mensajes, y los reintentos van en UNA linea.
+api.alternarConversacion("55");
+const abierta = elementos["requests-container"].innerHTML;
+assert.ok(abierta.includes("Hermes Resp"), "al desplegar se ven los mensajes");
+assert.ok(
+  abierta.includes("+ 19 reintentos de esta misma peticion"),
+  "y los diecinueve repetidos son una linea, no diecinueve tarjetas"
+);
+const tarjetasDentro = (abierta.match(/class="request-card [^"]*status/g) || []).length;
+assert.ok(tarjetasDentro <= 2, "como mucho una tarjeta por peticion distinta, no una por reintento");
 
 console.log("test_panel_drawer: PASS");
 console.log("  script del navegador: " + cuerpo.split("\n").length + " lineas ejecutadas");

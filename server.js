@@ -3031,7 +3031,89 @@ function serveDashboard(req, res) {
         }
       }
 
-      container.innerHTML = events.map(ev => {
+      container.innerHTML = agruparPorConversacion(events);
+    }
+
+
+    /**
+     * Una tarjeta POR CONVERSACION, con sus mensajes dentro.
+     *
+     * Antes cada ejecucion era una fila suelta. Con varios pacientes escribiendo a
+     * la vez es imposible seguirlo: la prueba del 17 de agosto lleno el panel de
+     * cincuenta filas que en realidad eran reintentos de un punado de mensajes, y
+     * no habia forma de saber cuantas conversaciones habia de verdad.
+     *
+     * Ahora se agrupa por conversacion y los REINTENTOS SE PLIEGAN: veinte
+     * reintentos de la misma peticion son una linea que dice «20 reintentos», no
+     * veinte tarjetas. Lo que queda a la vista es una fila por conversacion con su
+     * estado, que es lo que se mira cuando estan entrando mensajes de golpe.
+     */
+    let conversacionesAbiertas = new Set();
+
+    function alternarConversacion(id) {
+      if (conversacionesAbiertas.has(id)) conversacionesAbiertas.delete(id);
+      else conversacionesAbiertas.add(id);
+      applyFiltersAndSearch();
+    }
+
+    function agruparPorConversacion(events) {
+      const grupos = new Map();
+      for (const ev of events) {
+        const id = String(ev.conversation_id || 'sin-conversacion');
+        if (!grupos.has(id)) grupos.set(id, []);
+        grupos.get(id).push(ev);
+      }
+
+      return [...grupos.entries()].map(([id, lista]) => {
+        // El primero es el mas reciente: la lista ya viene ordenada por fecha.
+        const ultimo = lista[0];
+        const conError = lista.filter(e => e.error_code).length;
+        const dedup = lista.filter(e => e.idempotency_status === 'deduplicated').length;
+        const reales = lista.length - dedup;
+        const abierta = conversacionesAbiertas.has(id);
+
+        // Los reintentos de la MISMA peticion se pliegan en una sola linea.
+        const porPeticion = new Map();
+        for (const e of lista) {
+          const clave = e.request_key || e.trace_id || String(e.id);
+          if (!porPeticion.has(clave)) porPeticion.set(clave, []);
+          porPeticion.get(clave).push(e);
+        }
+
+        const cuerpo = abierta
+          ? [...porPeticion.values()].map(repeticiones => {
+              const principal = repeticiones[0];
+              const extra = repeticiones.length - 1;
+              return tarjetaDeEvento(principal) + (extra > 0
+                ? '<div class="info-line" style="margin:-0.5rem 0 0.75rem 1rem; padding:0.35rem 0.6rem;'
+                  + ' border-left:2px solid rgba(148,163,184,0.3); color: var(--text-muted); font-size:0.75rem;">'
+                  + '+ ' + extra + ' reintento' + (extra === 1 ? '' : 's') + ' de esta misma peticion, '
+                  + 'con el mismo resultado</div>'
+                : '');
+            }).join('')
+          : '';
+
+        const semaforo = conError === lista.length ? '#ef4444' : (conError > 0 ? '#f59e0b' : '#34d399');
+        const resumen = reales + ' mensaje' + (reales === 1 ? '' : 's')
+          + (dedup > 0 ? ' · ' + dedup + ' reintento' + (dedup === 1 ? '' : 's') : '')
+          + (conError > 0 ? ' · ' + conError + ' con error' : '');
+
+        return '<div class="request-card" style="cursor:pointer; border-left:3px solid ' + semaforo + ';"'
+          + ' data-conv="' + escapeHtml(id) + '">'
+          + '<div class="card-header"><div class="card-meta">'
+          +   '<span style="font-weight:600; color:#fff;">' + (abierta ? '▾' : '▸') + ' Conversacion ' + escapeHtml(id) + '</span>'
+          +   '<span class="timestamp">' + escapeHtml(ultimo.patient_display_name || 'Sin identificar') + '</span>'
+          +   '<span class="timestamp">' + escapeHtml(ultimo.phone || 'N/A') + '</span>'
+          + '</div>'
+          + '<div style="font-size:0.8rem; color: var(--text-muted);">' + resumen + '</div>'
+          + '</div></div>'
+          + (abierta ? '<div style="margin-left:1rem; border-left:2px solid rgba(148,163,184,0.15); padding-left:0.75rem;">'
+              + cuerpo + '</div>' : '');
+      }).join('');
+    }
+
+    function tarjetaDeEvento(ev) {
+      return (function() {
         const statusClass = 'status-' + ev.status;
         const badgeClass = 'badge-' + ev.status;
         const evTime = ev.started_at || ev.created_at;
@@ -3087,7 +3169,7 @@ function serveDashboard(req, res) {
           '</div>' +
           (ev.error_code ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error_code) + '</div>' : '') +
         '</div>';
-      }).join('');
+      })();
     }
 
     function openEventDetail(eventId) {
@@ -3220,6 +3302,13 @@ function serveDashboard(req, res) {
     }
 
     document.addEventListener('click', function(e) {
+      // La cabecera de una conversacion se pliega y despliega. Va antes que la
+      // tarjeta de traza porque la cabecera TAMBIEN es una .request-card.
+      const cabecera = e.target.closest('[data-conv]');
+      if (cabecera) {
+        alternarConversacion(cabecera.dataset.conv);
+        return;
+      }
       const card = e.target.closest('.request-card');
       if (card && card.dataset.id) {
         openEventDetail(card.dataset.id);
@@ -3925,12 +4014,77 @@ app.post("/helios/message", async (req, res) => {
     }
 
     processingStage = "contract_normalization";
-    normalizedResponse = result.persistedNormalizedResult || normalizeAdapterResponse(result, {
+
+    // UNA PETICION DEDUPLICADA SIN RESULTADO GUARDADO NO ES UNA VIOLACION DE
+    // CONTRATO, y confundirlas costo una prueba de carga entera.
+    //
+    // Cuando el Adapter reconoce una peticion repetida devuelve `answer: ""` y el
+    // resultado que tenia guardado. Si ese resultado guardado esta vacio -la
+    // ejecucion original murio antes de escribirlo-, la linea de abajo caia al
+    // parser, el parser leia una cadena vacia, no encontraba ningun JSON y
+    // declaraba OUTPUT_CONTRACT_VIOLATION. Un error de contrato que nunca ocurrio,
+    // porque en ese turno no hubo ni modelo ni respuesta que validar.
+    //
+    // Y lo peor no es el nombre equivocado: ese error se marcaba RECUPERABLE, asi
+    // que el worker de recuperacion lo reintentaba, el Adapter volvia a decir
+    // «esto ya lo tengo», volvia a devolver vacio, y volvia a fallar. Un bucle que
+    // no podia progresar nunca. En la prueba del 17 de agosto las CINCUENTA filas
+    // del panel eran reintentos de un punado de fallos originales.
+    //
+    // Ahora se dice lo que es y se marca NO recuperable, para que el bucle pare.
+    const dedupSinResultado = result.idempotencyStatus === "deduplicated"
+      && !result.persistedNormalizedResult
+      && !String(result.answer || "").trim();
+
+    if (dedupSinResultado) {
+      console.warn(JSON.stringify({
+        event: "adapter_dedup_sin_resultado",
+        trace_id: ctx.identity?.trace_id,
+        request_key: result.executionRequestKey,
+        persisted_error_code: result.persistedErrorCode || null,
+        nota: "peticion repetida cuya ejecucion original no dejo resultado; no se reintenta"
+      }));
+    }
+
+    normalizedResponse = result.persistedNormalizedResult || (dedupSinResultado ? {
+      ok: false,
+      reply: "",
+      message_for_client: "",
+      route: "error",
+      intent: "technical_error",
+      operation: {
+        type: "technical_error",
+        status: "failed",
+        summary: "Peticion repetida cuya ejecucion original no dejo resultado guardado."
+      },
+      operation_type: "technical_error",
+      operation_status: "failed",
+      operation_summary: "Peticion repetida cuya ejecucion original no dejo resultado guardado.",
+      profile_patch: {},
+      state_patch: {},
+      booking_patch: {},
+      has_profile_patch: false,
+      has_booking_patch: false,
+      has_state_patch: false,
+      tool_calls: [],
+      safe_to_send: false,
+      response_sent: false,
+      requires_handoff: false,
+      // NO recuperable: reintentarlo devuelve exactamente lo mismo, para siempre.
+      recoverable: false,
+      contract_repair_applied: false,
+      contract_repair_reason: null,
+      original_output_format: "deduplicated_without_result",
+      error_code: result.persistedErrorCode || "ADAPTER_DEDUP_SIN_RESULTADO",
+      contract_shape_valid: false,
+      contract_strategy: "deduplicated_without_result",
+      contract_candidate_count: 0
+    } : normalizeAdapterResponse(result, {
       httpStatus: result.httpStatus,
       toolCalls: result.toolCalls || [],
       identityComplete: normalized.patient?.identity_complete,
       missingFields: normalized.state?.missing_fields || []
-    });
+    }));
     contractShapeValid = result.persistedNormalizedResult
       ? typeof normalizedResponse?.contract_shape_valid === "boolean"
         ? normalizedResponse.contract_shape_valid
