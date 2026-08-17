@@ -17,7 +17,12 @@ function listen(server) {
   });
 }
 
-async function waitForHealth(port, child, timeoutMs = 5000) {
+// 20 segundos y no 5: arrancar el adapter en frio, detras de los otros tests y
+// compitiendo por CPU, pasa de 5 segundos a menudo. El test fallaba una de cada
+// pocas ejecuciones de la suite completa y pasaba siempre por separado, que es el
+// peor comportamiento posible: hace desconfiar de la suite entera y con ella se
+// dejan de mirar los fallos de verdad. Coolify da 30 segundos de arranque.
+async function waitForHealth(port, child, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
@@ -154,7 +159,7 @@ test("Hermes stream abort returns HERMES_TIMEOUT without crashing the adapter", 
       HERMES_API_KEY: "test-api-key",
       HERMES_WEBUI_PASSWORD: "test-password",
       HERMES_WEBUI_BASE_URL: `http://127.0.0.1:${hermesPort}`,
-      HERMES_TIMEOUT_MS: "150",
+      HERMES_TIMEOUT_MS: "500",
       CHATWOOT_TENANT_CONTEXTS_JSON: JSON.stringify({
         "test-account": {
           tenant_id: "test-tenant",
@@ -191,7 +196,11 @@ test("Hermes stream abort returns HERMES_TIMEOUT without crashing the adapter", 
     body: JSON.stringify(gatewayPayload("normal", "normal-case"))
   });
   const normalBody = await normalResponse.json();
-  assert.equal(normalResponse.status, 200);
+  assert.equal(
+    normalResponse.status,
+    200,
+    `Unexpected normal response: ${JSON.stringify(normalBody)}\nstdout:\n${stdout}\nstderr:\n${stderr}`
+  );
   assert.equal(normalBody.ok, true);
   assert.equal(normalBody.message_for_client, "Respuesta normal");
 
