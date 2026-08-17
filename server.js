@@ -2808,6 +2808,24 @@ function serveDashboard(req, res) {
   </div>
 
 <script>
+    /**
+     * Mismo formato que formatearUsd() del servidor, para que el panel y la API
+     * digan exactamente lo mismo.
+     *
+     * VA AQUI, EN EL AMBITO DEL SCRIPT, y no dentro de renderList: estaba declarada
+     * con const dentro de esa funcion y openEventDetail tambien la llama. Resultado:
+     * ReferenceError en CADA clic sobre una traza, y como el cajon se abre en la
+     * ultima linea de esa funcion, no se abria nada y no habia sintoma visible.
+     * Estuvo roto desde que se anadio el coste al panel, porque la comprobacion de
+     * sintaxis valida el fichero, pero este script viaja dentro de una plantilla de
+     * texto y nunca se comprobaba.
+     */
+    function fmtUsd(v) {
+      if (typeof v !== 'number' || !isFinite(v)) return 'N/A';
+      if (v === 0) return '$0';
+      return v < 0.01 ? '$' + v.toFixed(6) : '$' + v.toFixed(4);
+    }
+
     let autoRefresh = true;
     let refreshInterval = null;
     let currentFilter = 'all';
@@ -3028,22 +3046,15 @@ function serveDashboard(req, res) {
           if (Array.isArray(dt) && dt.length > 0) detailToolsList = escapeHtml(dt.join(', '));
         }
         
-        // Mismo formato que formatearUsd() del servidor, para que el panel y la
-      // API digan exactamente lo mismo.
-      const fmtUsd = function(v) {
-        if (typeof v !== 'number' || !isFinite(v)) return 'N/A';
-        if (v === 0) return '$0';
-        return v < 0.01 ? '$' + v.toFixed(6) : '$' + v.toFixed(4);
-      };
-      const costText = (function(c){
+        const costText = (function(c){
         if (!c) return '';
         if (c.exact) return ' · 💵 ' + fmtUsd(c.usd);
         if (c.motivo === 'modelo_desconocido') return '';
         return ' · 💵 ' + fmtUsd(c.usd_min) + '–' + fmtUsd(c.usd_max);
       })(ev.cost);
-      const tokenText = (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
-                          (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + ' / ' +
-                          (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A');
+      const tokenText = (ev.input_tokens != null ? ev.input_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (ev.output_tokens != null ? ev.output_tokens.toLocaleString() : 'N/A') + ' / ' +
+                          (ev.total_tokens != null ? ev.total_tokens.toLocaleString() : 'N/A');
         
         let toolsList = 'Ninguna';
         if (ev.tool_names) {
@@ -3156,9 +3167,9 @@ function serveDashboard(req, res) {
               if (c.franja === 'valle') return 'horario valle';
               return 'tarifa única';
             })(ev.cost) + '</div></div>' +
-          '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens !== null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens !== null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
-          '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens !== null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Input Tokens</span><div>' + (ev.input_tokens != null ? ev.input_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Output Tokens</span><div>' + (ev.output_tokens != null ? ev.output_tokens.toLocaleString() : 'N/A') + '</div></div>' +
+          '<div class="grid-item"><span>Total Tokens</span><div>' + (ev.total_tokens != null ? ev.total_tokens.toLocaleString() : 'N/A') + '</div></div>' +
           '<div class="grid-item"><span>Total Tool Calls</span><div>' + escapeHtml(ev.tool_count ?? '0') + '</div></div>' +
           '<div class="grid-item"><span>Herramientas Usadas</span><div>' + (function(t){if(!t)return 'Ninguna';try{if(typeof t==='string')t=JSON.parse(t);}catch(e){}if(Array.isArray(t)&&t.length>0)return escapeHtml(t.join(', '));return 'Ninguna'})(ev.tool_names) + '</div></div>' +
         '</div>' +
