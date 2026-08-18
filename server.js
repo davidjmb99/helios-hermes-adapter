@@ -4039,7 +4039,7 @@ app.post("/helios/message", async (req, res) => {
     if (dedupSinResultado) {
       console.warn(JSON.stringify({
         event: "adapter_dedup_sin_resultado",
-        trace_id: ctx.identity?.trace_id,
+        trace_id: traceId,
         request_key: result.executionRequestKey,
         persisted_error_code: result.persistedErrorCode || null,
         nota: "peticion repetida cuya ejecucion original no dejo resultado; no se reintenta"
@@ -4125,7 +4125,7 @@ app.post("/helios/message", async (req, res) => {
         };
         console.warn(JSON.stringify({
           event: "adapter_reintento_abandonado",
-          trace_id: ctx.identity?.trace_id,
+          trace_id: traceId,
           request_key: result.executionRequestKey,
           causa_original: causaOriginal
         }));

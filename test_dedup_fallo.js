@@ -35,15 +35,26 @@ const fin = fuente.indexOf("\n    }\n", fuente.indexOf("adapter_reintento_abando
 const bloque = fuente.slice(inicio, fin);
 assert.ok(bloque.includes("recoverable: false"), "el bloque extraido esta incompleto");
 
+/**
+ * EL TEST TAPABA EL FALLO. La primera version le pasaba al bloque un `ctx` de
+ * mentira, y con eso `ctx.identity?.trace_id` funcionaba aqui... y reventaba en
+ * produccion con ReferenceError, porque en ese ambito `ctx` NO EXISTE. El Adapter
+ * devolvia 502 en cada peticion deduplicada.
+ *
+ * La leccion: un arnes que INVENTA una variable no prueba el codigo, prueba otra
+ * cosa. Ahora se le pasan solo las que de verdad hay alli -result,
+ * normalizedResponse y traceId- y cualquier otra referencia revienta el test,
+ * que es justo lo que se quiere.
+ */
 function aplicar(result, normalizedResponse) {
-  const ctx = { identity: { trace_id: "t-prueba" } };
+  const traceId = "t-prueba";
   const avisos = [];
   const consolaOriginal = console.warn;
   console.warn = (m) => avisos.push(m);
   try {
     // eslint-disable-next-line no-new-func
-    const fn = new Function("result", "normalizedResponse", "ctx", bloque + "\n return normalizedResponse;");
-    return { salida: fn(result, normalizedResponse, ctx), avisos };
+    const fn = new Function("result", "normalizedResponse", "traceId", bloque + "\n return normalizedResponse;");
+    return { salida: fn(result, normalizedResponse, traceId), avisos };
   } finally {
     console.warn = consolaOriginal;
   }
