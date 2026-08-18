@@ -539,12 +539,37 @@ function isDebugAuthorized(req) {
   return false;
 }
 
+/**
+ * Cada cuanto se registra un acceso al panel, POR RUTA.
+ *
+ * El panel se auto-refresca cada cinco segundos, asi que /debug/events escribia
+ * una linea cada cinco segundos, sin parar, mientras alguien lo tuviera abierto.
+ * Con eso los logs quedan inservibles: al diagnosticar el fallo del 18 de agosto,
+ * las cien lineas visibles en Coolify eran casi todas admin_dashboard_access y
+ * habian empujado fuera las lineas de diagnostico que hacian falta.
+ *
+ * Un acceso al panel es informacion de auditoria util UNA VEZ, no doce veces por
+ * minuto. Se deja una por ruta y minuto: se sigue viendo quien entra y a donde,
+ * sin tapar lo que importa.
+ */
+const ULTIMO_ACCESO_REGISTRADO = new Map();
+const CADENCIA_LOG_ACCESO_MS = 60_000;
+
+function registrarAccesoAlPanel(ruta) {
+  const ahora = Date.now();
+  const anterior = ULTIMO_ACCESO_REGISTRADO.get(ruta) || 0;
+  if (ahora - anterior < CADENCIA_LOG_ACCESO_MS) return;
+  ULTIMO_ACCESO_REGISTRADO.set(ruta, ahora);
+  console.log(JSON.stringify({
+    event: "admin_dashboard_access",
+    path: ruta,
+    nota: "se registra como maximo una vez por minuto y ruta"
+  }));
+}
+
 function requireDebugAuth(req, res, next) {
   if (isDebugAuthorized(req)) {
-    console.log(JSON.stringify({
-      event: "admin_dashboard_access",
-      path: req.path
-    }));
+    registrarAccesoAlPanel(req.path);
     return next();
   }
 
