@@ -4,3 +4,27 @@ node_modules
 npm-debug.log
 .DS_Store
 helios-hermes-sessions.json
+
+# Scripts de trabajo y respaldos que no son del proyecto. Entraron por error en
+# 62975b7 con un `git add -A`; siguen en el disco, pero no se versionan.
+apply_fixes*.js
+update_adapter*.js
+integration_test*.js
+refactor_adapter.js
+rewrite_post.js
+add_normalize_error.js
+replace.js
+replace.py
+temp_script.js
+tmp_*.js
+*.bak
+*.patch
+adapter_diff.txt
+test_concurrency.js
+test_contract.js
+test_db.js
+test_deepseek.js
+test_fallback.js
+test_hermes_real.js
+test_production.js
+test_regression.js
