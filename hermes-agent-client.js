@@ -105,6 +105,39 @@ function isAbortError(error) {
   return error?.name === "AbortError" || error?.code === "ABORT_ERR";
 }
 
+/**
+ * Retrato de la respuesta de Hermes: que elementos trajo, de que tipo, y cuanto
+ * ocupa el texto de cada uno. SIN el contenido.
+ *
+ * Existe porque durante toda la investigacion del 17 y 18 de agosto nadie pudo
+ * responder a «que llego exactamente». Se dedujo, se supuso y se fallo cinco veces.
+ * Esto lo convierte en un dato.
+ */
+function describeResponseShape(responseData) {
+  try {
+    const salida = Array.isArray(responseData?.output) ? responseData.output : [];
+    return {
+      response_id: responseData?.id || null,
+      status: responseData?.status || null,
+      output_text_en_raiz: typeof responseData?.output_text === "string",
+      total_elementos: salida.length,
+      elementos: salida.map((item, i) => ({
+        i,
+        type: item?.type || null,
+        role: item?.role || null,
+        content: (Array.isArray(item?.content) ? item.content : []).map(c => ({
+          type: c?.type || null,
+          // Solo la longitud. El texto en si va aparte y solo cuando falla.
+          largo: typeof c?.text === "string" ? c.text.length : null
+        }))
+      }))
+    };
+  } catch (error) {
+    // Un fallo describiendo NUNCA puede tumbar una respuesta buena.
+    return { error_al_describir: String(error && error.message) };
+  }
+}
+
 function extractResponseOutputText(responseData) {
   if (typeof responseData?.output_text === "string") {
     return responseData.output_text.trim();
@@ -288,7 +321,10 @@ function createHermesAgentClient({
       sessionId: realSessionId,
       model: responseData.model || model || "helios",
       toolCalls,
-      tokenUsage: extractResponseTokenUsage(responseData, toolCalls)
+      tokenUsage: extractResponseTokenUsage(responseData, toolCalls),
+      // La forma de lo que llego, para poder mirarla despues sin depender de logs.
+      // Se calcula siempre pero solo se guarda si el contrato falla.
+      responseShape: describeResponseShape(responseData)
     };
   }
 

@@ -1566,6 +1566,51 @@ async function sendMessageToHermesAgentApi(payload) {
   };
 }
 
+
+/**
+ * Que llego de Hermes, cuando el contrato no se pudo leer.
+ *
+ * SOLO en el fallo: en un turno normal devuelve null y la columna queda vacia.
+ *
+ * Guarda el texto CRUDO y entero -son un par de miles de caracteres- porque la
+ * pregunta que nadie ha podido responder en dos dias es literalmente «que texto
+ * llego». Recortarlo a una muestra seria repetir el error de mirar fragmentos.
+ *
+ * El texto es la respuesta que Hermes redacta para el paciente, no una historia
+ * clinica, y esta fila ya guarda el mensaje recibido y la respuesta generada. No
+ * se anade ninguna categoria de dato que no estuviera ya.
+ */
+function construirCajaNegra(result, normalizedResponse, errorCode) {
+  const fallo = Boolean(errorCode) || normalizedResponse?.safe_to_send !== true;
+  if (!fallo) return null;
+  try {
+    const crudo = typeof result?.answer === "string" ? result.answer : "";
+    return {
+      guardado_en: new Date().toISOString(),
+      error_code: errorCode || null,
+      // Lo que el parser vio
+      texto_crudo: crudo.slice(0, 20000),
+      texto_largo: crudo.length,
+      texto_truncado_aqui: crudo.length > 20000,
+      parsea_como_json: (() => {
+        try { JSON.parse(crudo.trim()); return true; } catch { return false; }
+      })(),
+      contiene_message_for_client: crudo.includes("message_for_client"),
+      llaves_de_apertura: (crudo.match(/\{/g) || []).length,
+      // Lo que dijo el parser
+      estrategia: normalizedResponse?.contract_strategy ?? null,
+      candidatos: normalizedResponse?.contract_candidate_count ?? null,
+      // Y la forma de la respuesta de Hermes, sin contenido
+      forma_respuesta: result?.responseShape ?? null,
+      idempotencia: result?.idempotencyStatus ?? null,
+      origen_respuesta: result?.answerSource ?? null
+    };
+  } catch (error) {
+    // Diagnosticar nunca puede romper el turno.
+    return { error_al_construir: String(error && error.message) };
+  }
+}
+
 async function closeAdapterEventDurably(ctx, {
   status,
   processingStage,
@@ -1625,6 +1670,12 @@ async function closeAdapterEventDurably(ctx, {
     http_status: httpStatus,
     error_code: errorCode,
     safe_to_send: normalizedResponse?.safe_to_send === true,
+    // LA CAJA NEGRA. Solo se rellena cuando el contrato falla, y entonces guarda
+    // EXACTAMENTE lo que llego de Hermes: el texto crudo y la forma de su
+    // respuesta. Es el unico salto de los siete que no se podia mirar en SQL, y es
+    // justo donde estaba el fallo. Se guarda aqui y no en los logs porque los logs
+    // se perdieron tres veces seguidas y SQL nunca ha fallado.
+    contract_debug: construirCajaNegra(result, normalizedResponse, errorCode),
     finished_at: completedAt,
     completed_at: completedAt
   };
