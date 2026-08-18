@@ -4085,6 +4085,53 @@ app.post("/helios/message", async (req, res) => {
       identityComplete: normalized.patient?.identity_complete,
       missingFields: normalized.state?.missing_fields || []
     }));
+    // UN REINTENTO DEDUPLICADO DE ALGO QUE YA FALLO NO SE PUEDE REINTENTAR MAS.
+    //
+    // Cuando la peticion es repetida, el Adapter devuelve el resultado que ya tenia
+    // guardado. Si ese resultado era un FALLO marcado como recuperable, pasa esto:
+    // el worker de recuperacion lo reintenta, recibe EXACTAMENTE el mismo fallo
+    // guardado, y lo vuelve a reintentar. Por construccion devuelve siempre lo
+    // mismo. Es un bucle que no puede progresar nunca.
+    //
+    // El arreglo anterior solo cubria el caso SIN resultado guardado, y por eso no
+    // sirvio: lo que ocurria de verdad es este, CON resultado guardado y siendo un
+    // fallo. El sintoma era que el panel seguia diciendo la causa original -por
+    // ejemplo OUTPUT_CONTRACT_VIOLATION- en cada reintento, como si volviera a
+    // pasar, cuando en realidad no se estaba ejecutando nada.
+    //
+    // Al marcarlo NO recuperable pasan dos cosas buenas: el bucle para, y el
+    // Gateway lo trata como fallo definitivo, que es lo que dispara el aviso a
+    // Soporte Tecnico y el mensaje al paciente. Deja de morir en silencio.
+    if (result.idempotencyStatus === "deduplicated" && normalizedResponse) {
+      const guardadoFueFallo = normalizedResponse.ok === false
+        || Boolean(normalizedResponse.error_code);
+      if (guardadoFueFallo) {
+        const causaOriginal = normalizedResponse.error_code || "desconocida";
+        normalizedResponse = {
+          ...normalizedResponse,
+          recoverable: false,
+          // Se cambia el codigo a proposito: el que habia describe lo que paso la
+          // PRIMERA vez, no lo que acaba de pasar. La causa original se conserva
+          // aparte para no perder el diagnostico.
+          error_code: "REINTENTO_ABANDONADO",
+          error_code_original: causaOriginal,
+          operation: {
+            ...(normalizedResponse.operation || {}),
+            type: normalizedResponse.operation?.type || "technical_error",
+            status: "failed",
+            summary: "Reintento de una peticion que ya habia fallado. No se reintenta"
+              + " mas porque devolveria lo mismo. Causa original: " + causaOriginal
+          }
+        };
+        console.warn(JSON.stringify({
+          event: "adapter_reintento_abandonado",
+          trace_id: ctx.identity?.trace_id,
+          request_key: result.executionRequestKey,
+          causa_original: causaOriginal
+        }));
+      }
+    }
+
     contractShapeValid = result.persistedNormalizedResult
       ? typeof normalizedResponse?.contract_shape_valid === "boolean"
         ? normalizedResponse.contract_shape_valid
