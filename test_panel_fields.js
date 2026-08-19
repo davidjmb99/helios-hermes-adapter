@@ -46,7 +46,11 @@ const DERIVADOS = new Set([
   "cost",                  // lo calcula pricing.js
   "billing_model",         // el modelo con el que se cobra, resuelto
   "billing_model_source",  // de dónde salió esa tarifa
-  "model_guardado"         // copia de `model` para poder mostrar las dos cosas
+  "model_guardado",        // copia de `model` para poder mostrar las dos cosas
+  // Se deriva de contract_debug, que SI esta en el select. Del blob solo se envia
+  // el diagnostico: texto_crudo lleva el mensaje del paciente y el panel lo
+  // enmascara por la otra puerta, asi que no puede salir por esta.
+  "diagnostico"
 ]);
 
 const leidos = new Set();
