@@ -6,6 +6,7 @@ const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
 const { calcularDesgloseDeCache, leerAcumuladosDelContrato } = require("./cache-delta.js");
+const { esRepeticionDeLaAnterior } = require("./respuesta-repetida.js");
 
 /**
  * Modelo que se usa SOLO para calcular el coste, cuando Hermes no lo reporta.
@@ -1723,8 +1724,11 @@ function nombrarAlCulpable(result, normalizedResponse, errorCode, crudo) {
   };
 }
 
-function construirCajaNegra(result, normalizedResponse, errorCode) {
-  const fallo = Boolean(errorCode) || normalizedResponse?.safe_to_send !== true;
+function construirCajaNegra(result, normalizedResponse, errorCode, respuestaReciclada) {
+  // Una respuesta reciclada es un fallo aunque el contrato sea impecable: el
+  // paciente recibe algo que ya leyo. Por eso abre caja negra por si sola.
+  const fallo = Boolean(errorCode) || normalizedResponse?.safe_to_send !== true
+    || respuestaReciclada?.repetida === true;
   if (!fallo) return null;
   try {
     const crudo = typeof result?.answer === "string" ? result.answer : "";
@@ -1732,6 +1736,7 @@ function construirCajaNegra(result, normalizedResponse, errorCode) {
     return {
       guardado_en: new Date().toISOString(),
       error_code: errorCode || null,
+      respuesta_reciclada: respuestaReciclada || null,
       // LO PRIMERO QUE SE LEE: quien fallo. Lo demas es la evidencia que lo sostiene.
       diagnostico,
       // Lo que el parser vio
@@ -1776,6 +1781,48 @@ async function closeAdapterEventDurably(ctx, {
   const toolCalls = result?.toolCalls || tokenUsage.tool_calls || [];
   const completedAt = new Date().toISOString();
   const eventIdentity = resolveEventIdentity(normalized, normalizedResponse);
+
+  // ¿ES ESTA RESPUESTA LA DE AHORA, O UNA VIEJA RECICLADA DEL HISTORIAL?
+  //
+  // El 19-ago tres pacientes recibieron el saludo del principio como si fuera una
+  // respuesta nueva, pidiendoles datos que Helios ya tenia. Pasa cuando el turno no
+  // produce mensaje final: el extractor encuentra en `output[]` los mensajes viejos
+  // que Hermes reinyecta al compactar, saca de ahi un contrato valido, y se entrega.
+  //
+  // Se compara con la ULTIMA respuesta enviada en esta conversacion. No lanza y no
+  // bloquea el turno: solo deja constancia, porque decidir aqui que un paciente se
+  // queda sin respuesta es peor que un mensaje repetido, y la decision correcta
+  // -escalar- pertenece al camino que ya existe.
+  let respuestaReciclada = { repetida: false, motivo: null };
+  const textoDeAhora = normalizedResponse?.message_for_client || normalizedResponse?.reply || null;
+  if (textoDeAhora && normalized?.conversation_id) {
+    try {
+      const anterior = await supabase
+        .from("helios_adapter_events")
+        .select("response_content")
+        .eq("tenant_id", normalized.tenant_id)
+        .eq("conversation_id", normalized.conversation_id)
+        .not("response_content", "is", null)
+        .neq("response_content", "[RESPONSE_GENERATED_NOT_SENT]")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      respuestaReciclada = esRepeticionDeLaAnterior(textoDeAhora, anterior?.data?.response_content);
+      if (respuestaReciclada.repetida) {
+        console.error(JSON.stringify({
+          event: "respuesta_reciclada_del_historial",
+          tenant_id: normalized.tenant_id,
+          conversation_id: normalized.conversation_id,
+          motivo: respuestaReciclada.motivo,
+          que_significa: "El turno no genero mensaje propio y se recupero uno viejo del "
+            + "historial reinyectado. El paciente recibe una respuesta que ya leyo."
+        }));
+      }
+    } catch (error) {
+      // Comprobar no puede romper el turno.
+      respuestaReciclada = { repetida: false, motivo: "fallo_al_comparar" };
+    }
+  }
 
   // EL DESGLOSE DE CACHE DEL TURNO. Se calcula aqui, con el turno anterior de la
   // misma sesion de Hermes delante, porque es el unico momento en que se tienen las
@@ -1868,7 +1915,7 @@ async function closeAdapterEventDurably(ctx, {
     // respuesta. Es el unico salto de los siete que no se podia mirar en SQL, y es
     // justo donde estaba el fallo. Se guarda aqui y no en los logs porque los logs
     // se perdieron tres veces seguidas y SQL nunca ha fallado.
-    contract_debug: construirCajaNegra(result, normalizedResponse, errorCode),
+    contract_debug: construirCajaNegra(result, normalizedResponse, errorCode, respuestaReciclada),
     finished_at: completedAt,
     completed_at: completedAt
   };
