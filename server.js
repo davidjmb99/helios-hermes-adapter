@@ -1620,14 +1620,119 @@ async function sendMessageToHermesAgentApi(payload) {
  * clinica, y esta fila ya guarda el mensaje recibido y la respuesta generada. No
  * se anade ninguna categoria de dato que no estuviera ya.
  */
+/**
+ * QUIEN FALLO, dicho con nombre y apellido.
+ *
+ * Peticion de David, y tiene toda la razon: «cuando de un error asi, de una vez sea
+ * identificado en el adapter, diga el nombre de lo que esta fallando». Durante una
+ * semana el panel decia OUTPUT_CONTRACT_VIOLATION, que es el sintoma y no la causa,
+ * y para llegar de ahi al culpable -el plugin helios-output-guard del perfil helios-
+ * hicieron falta cinco hipotesis, una columna nueva y varias auditorias.
+ *
+ * Todos los indicios de aqui son MEDIDOS, no interpretados: cuantos tokens se
+ * gastaron, si el texto parsea, si el mensaje viene vacio. Y cuando no se puede
+ * afirmar, se dice que no se puede: «desconocido» es una respuesta honesta y
+ * «probablemente el guard» no lo es.
+ *
+ * Los tres casos reales que vivimos, en orden de como se distinguen:
+ *
+ *  1. CERO TOKENS. El modelo no se ejecuto: el proveedor rechazo la peticion antes
+ *     de correr. Es el caso de Ligia del 17-ago -0 tokens en 798 ms-, un HTTP 400
+ *     de DeepSeek por un historial mal formado. No es culpa de Hermes ni del
+ *     Adapter: la peticion nunca llego al modelo.
+ *  2. JSON VALIDO CON EL MENSAJE VACIO. El contrato esta impecable y el mensaje al
+ *     paciente esta en blanco. Eso no lo escribe un modelo: lo escribe un validador
+ *     que veto la respuesta y la sustituyo. Es el guard.
+ *  3. TEXTO QUE NO PARSEA. Ahi si el problema esta en la forma de la respuesta o en
+ *     mi extractor, y hay que mirar el texto crudo.
+ */
+function nombrarAlCulpable(result, normalizedResponse, errorCode, crudo) {
+  const tokens = Number(result?.tokenUsage?.total_tokens ?? result?.total_tokens ?? NaN);
+  const sinTokens = Number.isFinite(tokens) && tokens === 0;
+
+  let parsea = false;
+  let contrato = null;
+  try {
+    contrato = JSON.parse(String(crudo).trim());
+    parsea = contrato !== null && typeof contrato === "object";
+  } catch { parsea = false; }
+
+  const mensajeVacio = parsea
+    && typeof contrato.message_for_client === "string"
+    && contrato.message_for_client.trim() === "";
+
+  if (sinTokens) {
+    return {
+      culpable: "proveedor_del_modelo",
+      nombre: "El proveedor del modelo rechazo la peticion (DeepSeek, HTTP 400)",
+      explicacion: "Cero tokens gastados: el modelo no se ejecuto. El cuerpo de la "
+        + "peticion se valido y se rechazo antes de generar nada. Causa conocida: un "
+        + "mensaje de asistente en el historial con tool_calls vacio.",
+      donde_mirar: "Hermes, perfil helios: el hook pre_api_request del plugin "
+        + "helios-output-guard es el que limpia ese historial.",
+      seguro: true
+    };
+  }
+
+  if (mensajeVacio) {
+    return {
+      culpable: "helios_output_guard",
+      nombre: "El guard del perfil helios veto la respuesta y la dejo vacia",
+      explicacion: "El contrato llego entero y parsea perfectamente, pero "
+        + "message_for_client viene en blanco. Un modelo no escribe eso: lo escribe "
+        + "un validador que rechazo la respuesta buena y la sustituyo por su "
+        + "fallback. Hermes SI genero una respuesta; no es la que llego.",
+      donde_mirar: "Hermes, perfil helios, plugins/helios-output-guard. Buscar en "
+        + "sus logs el evento helios_output_guard_blocked con la regla que fallo.",
+      seguro: true
+    };
+  }
+
+  if (crudo && !parsea) {
+    return {
+      culpable: "forma_de_la_respuesta",
+      nombre: "Llego texto que no es un contrato JSON valido",
+      explicacion: "Hay texto pero no se puede leer como contrato. Puede ser la "
+        + "forma de la respuesta de Hermes o mi propio extractor.",
+      donde_mirar: "El campo texto_crudo de esta misma fila: son los bytes exactos "
+        + "que recibio el Adapter.",
+      seguro: false
+    };
+  }
+
+  if (!crudo) {
+    return {
+      culpable: "sin_respuesta",
+      nombre: "Hermes no devolvio texto",
+      explicacion: "La llamada termino sin contenido que analizar.",
+      donde_mirar: "forma_respuesta en esta fila, y los logs del gateway-helios.",
+      seguro: false
+    };
+  }
+
+  // Parsea, tiene mensaje, y aun asi fallo. No se puede nombrar a nadie sin
+  // inventar, y inventar es lo que costo una semana.
+  return {
+    culpable: "desconocido",
+    nombre: "No se puede identificar al culpable con lo medido",
+    explicacion: "El contrato parsea y trae mensaje, asi que no encaja en ninguno "
+      + "de los patrones conocidos. Hace falta mirar el texto crudo a mano.",
+    donde_mirar: "texto_crudo y error_code de esta fila.",
+    seguro: false
+  };
+}
+
 function construirCajaNegra(result, normalizedResponse, errorCode) {
   const fallo = Boolean(errorCode) || normalizedResponse?.safe_to_send !== true;
   if (!fallo) return null;
   try {
     const crudo = typeof result?.answer === "string" ? result.answer : "";
+    const diagnostico = nombrarAlCulpable(result, normalizedResponse, errorCode, crudo);
     return {
       guardado_en: new Date().toISOString(),
       error_code: errorCode || null,
+      // LO PRIMERO QUE SE LEE: quien fallo. Lo demas es la evidencia que lo sostiene.
+      diagnostico,
       // Lo que el parser vio
       texto_crudo: crudo.slice(0, 20000),
       texto_largo: crudo.length,
@@ -2228,7 +2333,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
 
     let query = supabase
       .from('helios_adapter_events')
-      .select('id, request_key, created_at, trace_id, parent_trace_id, tenant_id, account_id, clinic_id, hermes_profile, conversation_id, contact_id, patient_first_name, patient_last_name, patient_display_name, phone, message_content, response_content, status, processing_stage, hermes_transport, hermes_conversation_id, hermes_response_id, idempotency_status, started_at, finished_at, completed_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, model, tool_names, tool_count, attempt_count, safe_to_send, http_status, error_code')
+      .select('id, request_key, created_at, trace_id, parent_trace_id, tenant_id, account_id, clinic_id, hermes_profile, conversation_id, contact_id, patient_first_name, patient_last_name, patient_display_name, phone, message_content, response_content, status, processing_stage, hermes_transport, hermes_conversation_id, hermes_response_id, idempotency_status, started_at, finished_at, completed_at, duration_ms, hermes_duration_ms, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, model, tool_names, tool_count, attempt_count, safe_to_send, http_status, error_code, contract_debug')
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
@@ -2280,6 +2385,21 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
       };
     };
 
+    /**
+     * Del contract_debug solo viaja el DIAGNOSTICO, nunca el texto crudo.
+     *
+     * texto_crudo son hasta 20.000 caracteres de la respuesta de Hermes, y ahi
+     * dentro va el mensaje que se le escribio al paciente. El panel enmascara
+     * message_content y response_content salvo con HELIOS_ADMIN_SHOW_PII, asi que
+     * mandar el blob entero por esta puerta seria colar por detras exactamente lo
+     * que se protege por delante. El diagnostico no lleva contenido: solo nombres de
+     * componente y frases fijas escritas en el codigo.
+     */
+    const soloElDiagnostico = (debug) => {
+      if (!debug || typeof debug !== 'object') return null;
+      return debug.diagnostico || null;
+    };
+
     const maskedEvents = data.map(ev => ({
         ...ev,
         phone: HELIOS_ADMIN_SHOW_PII
@@ -2290,6 +2410,10 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
         patient_display_name: HELIOS_ADMIN_SHOW_PII ? ev.patient_display_name : null,
         message_content: HELIOS_ADMIN_SHOW_PII ? ev.message_content : "[REDACTED_MESSAGE]",
         response_content: HELIOS_ADMIN_SHOW_PII ? ev.response_content : "[REDACTED_RESPONSE]",
+        // El blob entero NO sale de aqui: solo el diagnostico, que no lleva
+        // contenido de pacientes.
+        contract_debug: undefined,
+        diagnostico: soloElDiagnostico(ev.contract_debug),
         ...usoDeTokensDelEvento(ev)
     }));
       res.json({ count: maskedEvents.length, events: maskedEvents });
@@ -3284,6 +3408,18 @@ function serveDashboard(req, res) {
             '<div class="info-line">Idempotencia: <code>' + escapeHtml(ev.idempotency_status || 'N/A') + '</code></div>' +
           '</div>' +
           (ev.error_code ? '<div class="error-msg" style="margin-top: 0.5rem; padding: 0.5rem;"><strong>Error:</strong> ' + escapeHtml(ev.error_code) + '</div>' : '') +
+          // QUIEN FALLO, junto al codigo de error. OUTPUT_CONTRACT_VIOLATION es el
+          // sintoma; esto dice el componente y donde mirar. Cuando no se puede
+          // afirmar, se marca como sospecha y no se disfraza de certeza.
+          (ev.diagnostico ? '<div style="margin-top:0.4rem;padding:0.5rem;border-left:3px solid '
+            + (ev.diagnostico.seguro ? '#f87171' : '#fbbf24')
+            + ';background:rgba(255,255,255,0.03);font-size:0.78rem;line-height:1.45">'
+            + '<div style="font-weight:700;color:' + (ev.diagnostico.seguro ? '#fca5a5' : '#fcd34d') + '">'
+            + (ev.diagnostico.seguro ? '' : 'SOSPECHA: ') + escapeHtml(ev.diagnostico.nombre || '') + '</div>'
+            + '<div style="opacity:0.85;margin-top:0.25rem">' + escapeHtml(ev.diagnostico.explicacion || '') + '</div>'
+            + (ev.diagnostico.donde_mirar ? '<div style="opacity:0.65;margin-top:0.25rem"><strong>Donde mirar:</strong> '
+                + escapeHtml(ev.diagnostico.donde_mirar) + '</div>' : '')
+            + '</div>' : '') +
         '</div>';
       })();
     }
