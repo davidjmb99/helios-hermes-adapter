@@ -99,7 +99,47 @@ function getCookie(req, name) {
 }
 
 const HERMES_PROFILE = process.env.HERMES_PROFILE || "helios";
-const HERMES_TRANSPORT = String(process.env.HERMES_TRANSPORT || "webui").toLowerCase();
+/**
+ * Transportes que este Adapter sabe hablar. `webui` es el viejo, que se conserva
+ * solo para poder volver atras; produccion usa `agent_api`.
+ */
+const TRANSPORTES_VALIDOS = ["agent_api", "webui"];
+
+/**
+ * EL TRANSPORTE SE EXIGE EXPLICITO. NO HAY VALOR POR DEFECTO.
+ *
+ * Antes esto era `process.env.HERMES_TRANSPORT || "webui"`, y esa linea tenia dos
+ * formas de arruinar un despliegue sin que nadie se enterase:
+ *
+ *   - Si la variable FALTABA, el Adapter arrancaba tan feliz hablando por el
+ *     transporte VIEJO. El servicio se veia sano, el health decia OK, y los
+ *     mensajes iban por un camino que ya no es el de produccion.
+ *   - Si la variable tenia un typo -«agent-api» con guion, por ejemplo-, el error
+ *     no salia al arrancar sino en CADA peticion, una por una. El contenedor
+ *     pasaba el healthcheck y fallaba con todos los pacientes.
+ *
+ * Las dos cosas son fallos silenciosos, que es justo el patron que este sistema
+ * lleva una semana pagando. Ahora el proceso se niega a arrancar y lo dice.
+ *
+ * Un arranque que falla se ve en el log del despliegue en diez segundos. Un
+ * transporte equivocado se descubre cuando un paciente no recibe respuesta.
+ */
+const HERMES_TRANSPORT = String(process.env.HERMES_TRANSPORT || "").trim().toLowerCase();
+if (!TRANSPORTES_VALIDOS.includes(HERMES_TRANSPORT)) {
+  const comoLlego = process.env.HERMES_TRANSPORT === undefined
+    ? "no esta definida"
+    : `vale "${process.env.HERMES_TRANSPORT}"`;
+  console.error(JSON.stringify({
+    event: "arranque_abortado",
+    motivo: "HERMES_TRANSPORT_INVALIDO",
+    variable: "HERMES_TRANSPORT",
+    estado: comoLlego,
+    valores_admitidos: TRANSPORTES_VALIDOS,
+    que_hacer: "Definir HERMES_TRANSPORT=agent_api en las variables del servicio. "
+      + "Sin esto el Adapter hablaria por el transporte viejo sin avisar."
+  }));
+  process.exit(1);
+}
 const HERMES_CWD =
   process.env.HERMES_CWD ||
   "/home/hermeswebui/.hermes/profiles/helios/workspace/helios";
