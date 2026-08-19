@@ -1762,6 +1762,45 @@ function construirCajaNegra(result, normalizedResponse, errorCode, respuestaReci
   }
 }
 
+/**
+ * ¿La respuesta de este turno es una vieja reciclada del historial?
+ *
+ * Corre ANTES de devolverle nada al Gateway, porque aquí no se registra: se BLOQUEA.
+ * David, el 19-ago, sobre los tres pacientes que recibieron el saludo del principio
+ * pidiéndoles datos que Helios ya tenía: «está mal, no debe pasar nunca, es algo de
+ * mal gusto».
+ *
+ * QUÉ SE HACE CON ELLA. No se entrega, y se marca como fallo recuperable. Eso lleva
+ * al camino que ya existe: se reintenta, y si tampoco sale, se deriva a una persona
+ * y al paciente se le dice que sigue alguien del equipo. El paciente nunca se queda
+ * sin respuesta, y la que recibe nunca es una que ya leyó.
+ *
+ * Se marca recoverable a propósito: la causa es que ESE turno no generó mensaje
+ * propio, y un reintento tiene posibilidades reales de producir uno.
+ */
+async function comprobarRespuestaReciclada(normalized, normalizedResponse) {
+  const texto = normalizedResponse?.message_for_client || normalizedResponse?.reply || null;
+  if (!texto || !normalized?.conversation_id) return { repetida: false, motivo: null };
+  try {
+    const anterior = await supabase
+      .from("helios_adapter_events")
+      .select("response_content")
+      .eq("tenant_id", normalized.tenant_id)
+      .eq("conversation_id", normalized.conversation_id)
+      .not("response_content", "is", null)
+      .neq("response_content", "[RESPONSE_GENERATED_NOT_SENT]")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return esRepeticionDeLaAnterior(texto, anterior?.data?.response_content);
+  } catch (error) {
+    // Comprobar no puede tumbar un turno. Sin poder comparar se deja pasar: un
+    // mensaje repetido es malo, pero dejar al paciente sin nada por un fallo de
+    // consulta es peor.
+    return { repetida: false, motivo: "fallo_al_comparar" };
+  }
+}
+
 async function closeAdapterEventDurably(ctx, {
   status,
   processingStage,
@@ -1771,7 +1810,8 @@ async function closeAdapterEventDurably(ctx, {
   hermesDurationMs,
   httpStatus,
   errorCode = null,
-  responseGenerated = false
+  responseGenerated = false,
+  respuestaReciclada = null
 }) {
   if (!ctx || !supabase) return;
   if (ctx.startError) throw ctx.startError;
@@ -1781,48 +1821,6 @@ async function closeAdapterEventDurably(ctx, {
   const toolCalls = result?.toolCalls || tokenUsage.tool_calls || [];
   const completedAt = new Date().toISOString();
   const eventIdentity = resolveEventIdentity(normalized, normalizedResponse);
-
-  // ¿ES ESTA RESPUESTA LA DE AHORA, O UNA VIEJA RECICLADA DEL HISTORIAL?
-  //
-  // El 19-ago tres pacientes recibieron el saludo del principio como si fuera una
-  // respuesta nueva, pidiendoles datos que Helios ya tenia. Pasa cuando el turno no
-  // produce mensaje final: el extractor encuentra en `output[]` los mensajes viejos
-  // que Hermes reinyecta al compactar, saca de ahi un contrato valido, y se entrega.
-  //
-  // Se compara con la ULTIMA respuesta enviada en esta conversacion. No lanza y no
-  // bloquea el turno: solo deja constancia, porque decidir aqui que un paciente se
-  // queda sin respuesta es peor que un mensaje repetido, y la decision correcta
-  // -escalar- pertenece al camino que ya existe.
-  let respuestaReciclada = { repetida: false, motivo: null };
-  const textoDeAhora = normalizedResponse?.message_for_client || normalizedResponse?.reply || null;
-  if (textoDeAhora && normalized?.conversation_id) {
-    try {
-      const anterior = await supabase
-        .from("helios_adapter_events")
-        .select("response_content")
-        .eq("tenant_id", normalized.tenant_id)
-        .eq("conversation_id", normalized.conversation_id)
-        .not("response_content", "is", null)
-        .neq("response_content", "[RESPONSE_GENERATED_NOT_SENT]")
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      respuestaReciclada = esRepeticionDeLaAnterior(textoDeAhora, anterior?.data?.response_content);
-      if (respuestaReciclada.repetida) {
-        console.error(JSON.stringify({
-          event: "respuesta_reciclada_del_historial",
-          tenant_id: normalized.tenant_id,
-          conversation_id: normalized.conversation_id,
-          motivo: respuestaReciclada.motivo,
-          que_significa: "El turno no genero mensaje propio y se recupero uno viejo del "
-            + "historial reinyectado. El paciente recibe una respuesta que ya leyo."
-        }));
-      }
-    } catch (error) {
-      // Comprobar no puede romper el turno.
-      respuestaReciclada = { repetida: false, motivo: "fallo_al_comparar" };
-    }
-  }
 
   // EL DESGLOSE DE CACHE DEL TURNO. Se calcula aqui, con el turno anterior de la
   // misma sesion de Hermes delante, porque es el unico momento en que se tienen las
@@ -4598,6 +4596,29 @@ app.post("/helios/message", async (req, res) => {
       }));
     });
 
+    // NUNCA SE ENTREGA UNA RESPUESTA QUE EL PACIENTE YA LEYO.
+    const respuestaReciclada = await comprobarRespuestaReciclada(normalized, normalizedResponse);
+    if (respuestaReciclada.repetida) {
+      console.error(JSON.stringify({
+        event: "respuesta_reciclada_bloqueada",
+        trace_id: traceId,
+        tenant_id: normalized?.tenant_id,
+        conversation_id: normalized?.conversation_id,
+        motivo: respuestaReciclada.motivo,
+        que_significa: "El turno no genero mensaje propio y se recupero uno viejo del "
+          + "historial reinyectado. Se bloquea: el paciente recibiria algo que ya leyo."
+      }));
+      normalizedResponse = {
+        ...normalizedResponse,
+        ok: false,
+        safe_to_send: false,
+        message_for_client: "",
+        reply: "",
+        recoverable: true,
+        error_code: "RESPUESTA_RECICLADA"
+      };
+    }
+
     await closeAdapterEventDurably(telemetryCtx, {
       status: result.idempotencyStatus === "deduplicated"
         ? "deduplicated"
@@ -4608,7 +4629,8 @@ app.post("/helios/message", async (req, res) => {
       result,
       hermesDurationMs,
       httpStatus: 200,
-      errorCode: normalizedResponse.error_code || null
+      errorCode: normalizedResponse.error_code || null,
+      respuestaReciclada
     });
 
     // La ejecución y la telemetría ya son durables antes de responder.
