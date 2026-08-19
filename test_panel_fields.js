@@ -70,8 +70,22 @@ assert.ok(
   "cache_read_tokens tiene que estar en el select o el coste nunca será exacto"
 );
 
-const guardado = fuente.match(/cache_read_tokens:\s*tokenUsage\.cache_read_tokens/);
-assert.ok(guardado, "cache_read_tokens tiene que guardarse en la fila, no solo leerse de Hermes");
+const guardado = fuente.match(/cache_read_tokens:\s*(desgloseDeCache|tokenUsage)/);
+assert.ok(
+  guardado,
+  "cache_read_tokens tiene que guardarse en la fila desde una fuente real: el delta "
+  + "exacto de los acumulados o lo que reporte Hermes"
+);
+assert.ok(
+  !/cache_read_tokens:\s*null\s*,[\s\S]{0,400}cache_write_tokens:\s*tokenUsage/.test(fuente),
+  "cache_read_tokens no puede quedarse en null fijo en el payload del evento: sin él "
+  + "el coste solo puede darse como rango"
+);
+assert.ok(
+  /cache_acumulado_hit:/.test(fuente) && /cache_acumulado_nuevos:/.test(fuente),
+  "los dos contadores acumulados tienen que persistirse, o el turno siguiente no "
+  + "tendrá contra qué restar y el coste exacto se pierde en cadena"
+);
 
 const migraciones = fs.readdirSync(require("path").join(__dirname, "supabase", "migrations"))
   .map(f => fs.readFileSync(require("path").join(__dirname, "supabase", "migrations", f), "utf8"))
@@ -80,6 +94,12 @@ assert.ok(
   /ADD COLUMN IF NOT EXISTS cache_read_tokens/.test(migraciones),
   "la columna cache_read_tokens tiene que existir en alguna migración"
 );
+for (const columna of ["cache_acumulado_hit", "cache_acumulado_nuevos", "cache_desglose_origen"]) {
+  assert.ok(
+    new RegExp("cache_acumulado_hit|" + columna).test(migraciones) && migraciones.includes(columna),
+    "falta la columna " + columna + " en las migraciones"
+  );
+}
 
 // --- Y que el modelo que se muestra sea el que se cobra --------------------
 // El panel mostraba `ev.model` tal cual, y ahi vivia «helios» -el perfil-, asi que

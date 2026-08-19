@@ -5,6 +5,7 @@ const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
+const { calcularDesgloseDeCache, leerAcumuladosDelContrato } = require("./cache-delta.js");
 
 /**
  * Modelo que se usa SOLO para calcular el coste, cuando Hermes no lo reporta.
@@ -1775,6 +1776,39 @@ async function closeAdapterEventDurably(ctx, {
   const toolCalls = result?.toolCalls || tokenUsage.tool_calls || [];
   const completedAt = new Date().toISOString();
   const eventIdentity = resolveEventIdentity(normalized, normalizedResponse);
+
+  // EL DESGLOSE DE CACHE DEL TURNO. Se calcula aqui, con el turno anterior de la
+  // misma sesion de Hermes delante, porque es el unico momento en que se tienen las
+  // dos cosas: lo que acaba de pasar y lo que habia antes.
+  const acumuladosDelTurno = leerAcumuladosDelContrato(normalizedResponse);
+  const sesionDeHermes = result?.hermesConversationId || null;
+  let desgloseDeCache = { exacto: false, motivo: "sin_contadores_acumulados", cached_tokens: null };
+  if (acumuladosDelTurno && sesionDeHermes) {
+    try {
+      const previo = await supabase
+        .from("helios_adapter_events")
+        .select("cache_acumulado_hit, cache_acumulado_nuevos")
+        .eq("hermes_conversation_id", sesionDeHermes)
+        .not("cache_acumulado_hit", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const anterior = previo?.data
+        ? { hit: previo.data.cache_acumulado_hit, nuevos: previo.data.cache_acumulado_nuevos }
+        : null;
+      desgloseDeCache = calcularDesgloseDeCache({
+        hit: acumuladosDelTurno.hit,
+        nuevos: acumuladosDelTurno.nuevos,
+        input_tokens: tokenUsage.input_tokens
+      }, anterior);
+    } catch (error) {
+      // NO PUEDE ROMPER EL TURNO. Calcular un coste es contabilidad; entregarle la
+      // respuesta al paciente es el trabajo. Si esta consulta falla, se guarda la
+      // fila sin desglose y el panel vuelve al rango.
+      desgloseDeCache = { exacto: false, motivo: "fallo_al_leer_el_turno_anterior", cached_tokens: null };
+    }
+  }
+
   const payload = {
     request_key: result?.executionRequestKey || null,
     parent_trace_id: normalized?.metadata?.parent_trace_id || null,
@@ -1802,7 +1836,21 @@ async function closeAdapterEventDurably(ctx, {
     // cincuentava parte de uno nuevo y aquí el acierto de caché ronda el 97%, así
     // que sin el desglose solo se puede dar un rango de 0,0001 a 0,0056 dólares
     // para el mismo mensaje. Se leía de Hermes y se tiraba: no había columna.
-    cache_read_tokens: tokenUsage.cache_read_tokens ?? null,
+    // EL DESGLOSE EXACTO, cuando se puede. Hermes guarda el acierto de cache
+    // ACUMULADO POR SESION y su endpoint lo descarta al serializar, asi que el guard
+    // del perfil helios manda los dos acumulados dentro de state_patch -el unico
+    // objeto abierto del contrato- y aqui se resta contra el turno anterior de la
+    // misma sesion. La resta de dos acumulados ES el consumo del turno: aritmetica,
+    // no estimacion. Y si no cuadra con la entrada reportada, no se afirma nada y
+    // el panel vuelve al rango.
+    cache_read_tokens: desgloseDeCache.exacto
+      ? desgloseDeCache.cached_tokens
+      : (tokenUsage.cache_read_tokens ?? null),
+    cache_acumulado_hit: acumuladosDelTurno?.hit ?? null,
+    cache_acumulado_nuevos: acumuladosDelTurno?.nuevos ?? null,
+    cache_desglose_origen: desgloseDeCache.exacto
+      ? "delta_de_acumulados"
+      : (tokenUsage.cache_read_tokens != null ? "reportado_por_hermes" : desgloseDeCache.motivo),
     cache_write_tokens: tokenUsage.cache_write_tokens ?? null,
     // Sin fallback al perfil: si Hermes no dice qué modelo usó, se deja vacío y
     // el panel lo muestra como desconocido. Un nombre inventado impide además
