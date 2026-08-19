@@ -156,6 +156,9 @@ test("Hermes stream abort returns HERMES_TIMEOUT without crashing the adapter", 
     env: {
       ...process.env,
       PORT: String(adapterPort),
+      // El transporte se declara: desde el 19-ago el Adapter se niega a
+      // arrancar sin el, y estos tests ejercitan la ruta webui.
+      HERMES_TRANSPORT: "webui",
       HERMES_API_KEY: "test-api-key",
       HERMES_WEBUI_PASSWORD: "test-password",
       HERMES_WEBUI_BASE_URL: `http://127.0.0.1:${hermesPort}`,

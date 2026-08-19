@@ -150,6 +150,9 @@ test("tenant context isolates sessions and sends explicit profiles", async (t) =
     env: {
       ...process.env,
       PORT: String(adapterPort),
+      // El transporte se declara: desde el 19-ago el Adapter se niega a
+      // arrancar sin el, y estos tests ejercitan la ruta webui.
+      HERMES_TRANSPORT: "webui",
       HERMES_API_KEY: "test-api-key",
       HERMES_PROFILE: "wrong-global-profile",
       HERMES_WEBUI_PASSWORD: "test-password",
