@@ -43,7 +43,17 @@ const elementos = {};
 const elemento = (id) => (elementos[id] = elementos[id] || {
   id, innerHTML: "", style: {}, dataset: {}, value: "", textContent: "",
   classList: { _c: new Set(), add(x) { this._c.add(x); }, remove(x) { this._c.delete(x); }, contains(x) { return this._c.has(x); } },
-  addEventListener() {}
+  addEventListener() {},
+  // querySelectorAll SOBRE UN ELEMENTO, no solo sobre document. Faltaba, y el panel
+  // de metricas lo usa para enganchar los botones de periodo: sin esto el arnes
+  // reventaba con «caja.querySelectorAll is not a function» en codigo que en un
+  // navegador funciona perfectamente.
+  //
+  // Devuelve una lista vacia a proposito. Este arnes comprueba que el script CARGA y
+  // que sus funciones resuelven en su ambito, no que el HTML generado sea el
+  // correcto: fingir nodos aqui daria una falsa sensacion de estar probando el DOM.
+  querySelectorAll: () => [],
+  querySelector: () => null
 });
 
 global.document = {
@@ -101,7 +111,7 @@ const TRAZA = {
 
 const api = new Function(`
   ${cuerpo}
-  return { openEventDetail, rawEventsList, renderList, fmtUsd, agruparPorConversacion, alternarConversacion };
+  return { openEventDetail, rawEventsList, renderList, fmtUsd, agruparPorConversacion, alternarConversacion, cargarMetricas, pintarBotonesDePeriodo, PERIODOS_UI };
 `)();
 
 // --- El clic ----------------------------------------------------------------
@@ -211,3 +221,35 @@ assert.ok(tarjetasDentro <= 2, "como mucho una tarjeta por peticion distinta, no
 
 console.log("test_panel_drawer: PASS");
 console.log("  script del navegador: " + cuerpo.split("\n").length + " lineas ejecutadas");
+
+// --- El panel de metricas resuelve en su ambito -----------------------------
+//
+// Es la MISMA familia de fallo que motivo esta prueba: fmtUsd declarada dentro de
+// renderList y llamada desde openEventDetail. Aqui hay funciones que se llaman al
+// cargar la pagina -pintarBotonesDePeriodo y cargarMetricas- y si alguna quedara en
+// otro ambito, el panel entero dejaria de arrancar sin ningun sintoma visible.
+
+assert.equal(typeof api.cargarMetricas, "function", "cargarMetricas tiene que existir en el ambito del script");
+assert.equal(typeof api.pintarBotonesDePeriodo, "function", "pintarBotonesDePeriodo tambien");
+assert.ok(Array.isArray(api.PERIODOS_UI), "la lista de periodos tiene que estar");
+assert.equal(api.PERIODOS_UI.length, 6, "son los seis periodos que pidio David");
+assert.deepEqual(
+  api.PERIODOS_UI.map(p => p[0]),
+  ["dia", "semana", "mes", "3meses", "6meses", "ano"],
+  "y los identificadores tienen que coincidir con los que acepta el endpoint, o los " +
+  "botones devolverian PERIODO_INVALIDO"
+);
+
+// EL PANEL TIENE QUE LLAMAR AL ENDPOINT QUE EXISTE. Un error de una letra aqui deja
+// la seccion vacia sin decir por que, y es el tipo de fallo que solo se ve abriendo
+// el navegador.
+assert.ok(
+  /fetch\('\/debug\/metricas\?periodo='/.test(cuerpo),
+  "el panel tiene que pedir /debug/metricas con el periodo"
+);
+assert.ok(
+  /credentials: 'include'/.test(cuerpo.slice(cuerpo.indexOf("/debug/metricas"))),
+  "y con las credenciales, o requireDebugAuth lo rechaza"
+);
+
+console.log("  panel de metricas: funciones y endpoint OK");

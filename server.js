@@ -5,6 +5,7 @@ const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
+const { PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos } = require("./metricas");
 const { calcularDesgloseDeCache, leerAcumuladosDelContrato } = require("./cache-delta.js");
 const { esRepeticionDeLaAnterior } = require("./respuesta-repetida.js");
 
@@ -2453,6 +2454,86 @@ function serveLoginPage(req, res) {
 </html>`);
 }
 // Endpoint para el historial de eventos recientes en JSON
+/**
+ * Metricas de gasto y de mensajes, por periodo.
+ *
+ * LO PIDIO DAVID: «quiero una seccion al lado de donde dice servicio activo que me de
+ * las metricas: del gasto de tokens y el coste real clasificado por dia, semana, mes,
+ * 3 meses, 6 meses, 1 año», y despues «añade tambien la cantidad de mensajes que
+ * llegan y los que salen».
+ *
+ * SE LEE PAGINANDO Y NO CON UN SUM DE SQL, y merece la explicacion porque es la
+ * decision discutible de aqui. El cliente de Supabase no agrega, asi que un total de
+ * un año exigiria una funcion en Postgres: otra migracion, otro sitio donde el
+ * calculo del coste podria divergir del de pricing.js. Al volumen de hoy -decenas de
+ * turnos al dia- un año son unos pocos miles de filas y traerlas es barato.
+ *
+ * PERO NO ES GRATIS PARA SIEMPRE. Hay un tope de filas y, si se alcanza, se devuelve
+ * `truncado: true` y el panel lo dice: un total a medias presentado como total es
+ * exactamente el error que este endpoint intenta no cometer. Cuando eso empiece a
+ * pasar, toca mover la suma a SQL.
+ */
+app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error("Supabase is not initialized.");
+
+    const periodo = String(req.query.periodo || "dia");
+    if (!esPeriodoValido(periodo)) {
+      return res.status(400).json({ error: true, error_code: "PERIODO_INVALIDO", validos: Object.keys(PERIODOS) });
+    }
+
+    const ahora = new Date();
+    const desde = inicioDelPeriodo(periodo, ahora);
+
+    // Tope de seguridad. 60.000 filas son mas de un año al volumen actual; si se
+    // alcanza, el total es incompleto y hay que DECIRLO, no recortarlo en silencio.
+    const TOPE_FILAS = 60000;
+    const PAGINA = 1000;
+
+    const eventos = [];
+    let truncado = false;
+    for (let inicio = 0; inicio < TOPE_FILAS; inicio += PAGINA) {
+      const { data, error } = await supabase
+        .from("helios_adapter_events")
+        // Solo las columnas que la suma necesita: traer message_content o
+        // contract_debug de miles de filas seria mover megabytes de datos de
+        // pacientes para contar tokens.
+        .select("created_at, status, safe_to_send, input_tokens, output_tokens, cache_read_tokens, model")
+        .gte("created_at", desde.toISOString())
+        .order("created_at", { ascending: false })
+        .range(inicio, inicio + PAGINA - 1);
+
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      eventos.push(...data);
+      if (data.length < PAGINA) break;
+      if (eventos.length >= TOPE_FILAS) { truncado = true; break; }
+    }
+
+    const resumen = resumirEventos(eventos, HELIOS_BILLING_MODEL);
+
+    return res.json({
+      ok: true,
+      periodo,
+      etiqueta: PERIODOS[periodo].etiqueta,
+      desde: desde.toISOString(),
+      hasta: ahora.toISOString(),
+      truncado,
+      ...resumen,
+      coste_usd_texto: formatearUsd(resumen.coste_usd),
+      coste_por_saliente_texto: resumen.coste_por_saliente === null
+        ? null
+        : formatearUsd(resumen.coste_por_saliente)
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "metricas_fallidas",
+      error_code: error?.code || "METRICAS_ERROR"
+    }));
+    return res.status(500).json({ error: true, error_code: "METRICAS_ERROR" });
+  }
+});
+
 app.get("/debug/events", requireDebugAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error("Supabase is not initialized.");
@@ -3129,6 +3210,52 @@ function serveDashboard(req, res) {
     </div>
   </header>
 
+  <!--
+    GASTO Y MENSAJES. Lo pidio David: el coste real y los tokens por periodo, mas
+    cuantos mensajes entran y cuantos salen.
+
+    LA CIFRA QUE IMPORTA ES «POR MENSAJE ENVIADO», no el total: dice cuanto cuesta
+    atender a un paciente. El total de un mes solo se puede leer sabiendo cuantos
+    pacientes hubo, y esta division ya la hace el backend.
+
+    Y SI EL TOTAL ESTA INCOMPLETO SE DICE EN ROJO. Un numero con pinta de exacto que
+    se ha dejado turnos fuera es peor que no tener panel: se usa para decidir.
+  -->
+  <section id="metricas" style="margin: 0 0 1.5rem 0;">
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:0.75rem; margin-bottom:0.75rem;">
+      <h2 style="font-size:1rem; margin:0; color:var(--primary);">Gasto y mensajes</h2>
+      <div id="metricas-periodos" style="display:flex; gap:0.35rem; flex-wrap:wrap;"></div>
+    </div>
+    <div id="metricas-aviso" style="display:none; font-size:0.8rem; padding:0.6rem 0.8rem; border-radius:8px; margin-bottom:0.75rem;"></div>
+    <div class="stats-grid" id="metricas-tarjetas">
+      <div class="stat-card">
+        <div class="stat-label">Coste del periodo</div>
+        <div class="stat-value" id="m-coste" style="color: var(--primary);">-</div>
+        <div class="stat-detail" id="m-coste-detalle">Cargando...</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Coste por mensaje enviado</div>
+        <div class="stat-value" id="m-coste-msg">-</div>
+        <div class="stat-detail">Incluye el gasto de los turnos que fallaron</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Mensajes</div>
+        <div class="stat-value" id="m-mensajes" style="font-size:1.1rem; padding-top:0.5rem;">-</div>
+        <div class="stat-detail" id="m-mensajes-detalle">entran / salen</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Tokens</div>
+        <div class="stat-value" id="m-tokens" style="font-size:1.1rem; padding-top:0.5rem;">-</div>
+        <div class="stat-detail" id="m-tokens-detalle">entrada / salida</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Acierto de caché</div>
+        <div class="stat-value" id="m-cache">-</div>
+        <div class="stat-detail">Si baja, el gasto sube sin que cambie el uso</div>
+      </div>
+    </div>
+  </section>
+
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Versión</div>
@@ -3237,6 +3364,111 @@ function serveDashboard(req, res) {
     const adapterRuntimeEl = document.getElementById('adapter-runtime');
     const adapterModeEl = document.getElementById('adapter-mode');
     const adapterModeDetailEl = document.getElementById('adapter-mode-detail');
+
+    // --- GASTO Y MENSAJES -----------------------------------------------------
+    //
+    // TODO EL TEXTO QUE EXPLICA UNA CIFRA LO ESCRIBE EL BACKEND o se deriva de un
+    // campo suyo. Si el navegador decidiera por su cuenta cuando un total esta
+    // completo, panel y backend podrian discrepar, y ya nos paso con el semaforo del
+    // Gateway: decia una cosa mientras el sistema hacia otra.
+
+    const PERIODOS_UI = [
+      ['dia', 'Día'], ['semana', 'Semana'], ['mes', 'Mes'],
+      ['3meses', '3 meses'], ['6meses', '6 meses'], ['ano', 'Año']
+    ];
+    let periodoActivo = 'dia';
+
+    const miles = (n) => Number(n || 0).toLocaleString('es-VE');
+
+    function pintarBotonesDePeriodo() {
+      const caja = document.getElementById('metricas-periodos');
+      if (!caja) return;
+      caja.innerHTML = PERIODOS_UI.map(([id, texto]) => {
+        const activo = id === periodoActivo;
+        const estilo = activo
+          ? 'background: var(--primary); color: #0b1220; font-weight: 600;'
+          : 'background: rgba(255,255,255,0.04); color: #9aa4b2;';
+        return '<button class="btn" data-periodo="' + id + '" style="padding:0.3rem 0.7rem; font-size:0.78rem; ' + estilo + '">' + texto + '</button>';
+      }).join('');
+      caja.querySelectorAll('button[data-periodo]').forEach(b => {
+        b.addEventListener('click', () => {
+          periodoActivo = b.dataset.periodo;
+          pintarBotonesDePeriodo();
+          cargarMetricas();
+        });
+      });
+    }
+
+    async function cargarMetricas() {
+      const aviso = document.getElementById('metricas-aviso');
+      const detalle = document.getElementById('m-coste-detalle');
+      if (detalle) detalle.textContent = 'Cargando...';
+      try {
+        const res = await fetch('/debug/metricas?periodo=' + encodeURIComponent(periodoActivo), {
+          credentials: 'include'
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const m = await res.json();
+
+        document.getElementById('m-coste').textContent = m.coste_usd_texto || '-';
+        document.getElementById('m-coste-msg').textContent = m.coste_por_saliente_texto || 'sin datos';
+        document.getElementById('m-mensajes').textContent = miles(m.entrantes) + ' / ' + miles(m.salientes);
+        document.getElementById('m-tokens').textContent = miles(m.total_tokens);
+        document.getElementById('m-cache').textContent =
+          m.acierto_cache_pct === null ? 'sin datos' : m.acierto_cache_pct + '%';
+
+        if (detalle) detalle.textContent = m.etiqueta + ' · ' + miles(m.turnos) + ' turnos';
+        document.getElementById('m-tokens-detalle').textContent =
+          miles(m.input_tokens) + ' de entrada · ' + miles(m.output_tokens) + ' de salida';
+
+        // ENTRAN Y SALEN NO SON EL MISMO NUMERO, y la diferencia es lo interesante:
+        // son los fallos y los duplicados frenados. Verla es para lo que sirve.
+        const hueco = [];
+        if (m.fallidos > 0) hueco.push(miles(m.fallidos) + ' fallaron');
+        if (m.deduplicados > 0) hueco.push(miles(m.deduplicados) + ' duplicados frenados');
+        document.getElementById('m-mensajes-detalle').textContent =
+          hueco.length ? 'entran / salen · ' + hueco.join(', ') : 'entran / salen';
+
+        // EL AVISO DE TOTAL INCOMPLETO. En rojo y explicando por que, porque un total
+        // a medias presentado como total se usa para decidir y decide mal.
+        if (aviso) {
+          const problemas = [];
+          if (m.truncado) {
+            problemas.push('Se alcanzó el tope de filas: faltan turnos por contar. Hay que mover la suma a SQL.');
+          }
+          if (m.coste_completo === false) {
+            const motivos = Object.entries(m.motivos_sin_valorar || {})
+              .map(([k, v]) => v + ' por ' + k.replace(/_/g, ' ')).join(', ');
+            problemas.push(
+              'El coste está INCOMPLETO: ' + miles(m.turnos_sin_valorar) +
+              ' turnos no se pudieron valorar (' + motivos + '). El total mostrado es solo de los ' +
+              miles(m.turnos_valorados) + ' que sí.'
+            );
+          }
+          if (problemas.length) {
+            aviso.style.display = 'block';
+            aviso.style.background = 'rgba(239, 68, 68, 0.1)';
+            aviso.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+            aviso.style.color = '#fca5a5';
+            aviso.textContent = problemas.join(' ');
+          } else {
+            aviso.style.display = 'none';
+          }
+        }
+      } catch (error) {
+        if (detalle) detalle.textContent = 'No se pudieron cargar las métricas';
+        if (aviso) {
+          aviso.style.display = 'block';
+          aviso.style.background = 'rgba(239, 68, 68, 0.1)';
+          aviso.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+          aviso.style.color = '#fca5a5';
+          aviso.textContent = 'No se pudieron cargar las métricas: ' + String(error.message || error);
+        }
+      }
+    }
+
+    pintarBotonesDePeriodo();
+    cargarMetricas();
 
     function logout() {
       const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
