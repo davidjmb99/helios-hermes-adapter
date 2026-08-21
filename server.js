@@ -1522,6 +1522,7 @@ async function sendMessageToHermesAgentApi(payload) {
       motivo: decision.motivo,
       generacion,
       horas_inactiva: decision.horas_inactiva,
+      turnos_de_la_sesion_anterior: sesionGuardada.fila?.turnos ?? null,
       tokens_del_turno_anterior: sesionGuardada.fila?.ultimo_input_tokens ?? null,
       // Si la lectura fue degradada, la decision se tomo con datos de respaldo y
       // conviene saberlo antes de creerse el motivo.

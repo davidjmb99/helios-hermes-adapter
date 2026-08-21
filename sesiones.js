@@ -49,20 +49,37 @@
 const HORAS_PARA_EMPEZAR_DE_CERO = 12;
 
 /**
- * Tope de tokens de entrada del último turno.
+ * Tope de turnos de la sesión.
  *
- * Es un techo, no un objetivo: en una conversación normal de reserva -seis turnos-
- * se llega a unos 10.000 y esto no salta nunca. Salta en las patológicas, que son
- * justo las que envenenan al modelo. La conversación 75 del 20 de agosto iba por
- * 42.000 después de unos quince turnos.
+ * AQUÍ HABÍA UN TECHO DE TOKENS Y ESTABA MAL CALIBRADO. Lo puse en 60.000 diciendo
+ * que «una reserva normal de seis turnos va por 10.000 y no salta nunca». David lo
+ * cuestionó y los datos de esa misma noche le dieron la razón:
  *
- * SE MIDE EL TURNO ANTERIOR, no el actual, porque cuando hay que decidir la sesión
- * todavía no se ha llamado a nadie y no hay cifra del turno en curso. Con 60.000 de
- * techo, el turno que lo cruza se atiende con la sesión vieja y el siguiente ya
- * empieza limpio. Un turno de más con contexto grande no rompe nada; cortar a mitad
- * de una frase del paciente, sí.
+ *   conversación 82, LIMPIA     turno 1 ->  7.156
+ *                               turno 2 ->  8.648
+ *                               turno 3 -> 37.307   <- +28.659 de golpe
+ *   conversación 75, CONTAMINADA  turno ~15 -> 42.274
+ *
+ * El salto del tercer turno es la herramienta de HubSpot: los esquemas y el resultado
+ * entran en el contexto. O sea que una conversación de tres turnos SIN NADA DE
+ * HISTORIAL pesa casi lo mismo que una envenenada de quince. Los tokens no distinguen
+ * las dos cosas, y con 60.000 de techo una reserva real habría rotado a mitad de la
+ * identificación del paciente. Justo lo que dije que no iba a pasar.
+ *
+ * LO QUE SÍ MIDE LA CONTAMINACIÓN SON LOS TURNOS, porque el daño es que el modelo
+ * IMITA SUS PROPIAS RESPUESTAS ANTERIORES: cuantas más haya, más presión para
+ * repetirlas. Una reserva completa son seis u ocho. Cuarenta no las alcanza ninguna
+ * conversación legítima de una sola jornada.
+ *
+ * ES UN CIERRE DE SEGURIDAD QUE NO DEBERÍA SALTAR NUNCA. Lo que de verdad corta el
+ * historial son las 12 horas de inactividad y el botón del panel. Esto solo cubre una
+ * conversación que se pase el día entero dando vueltas, y ahí cuarenta turnos de
+ * ejemplos propios hacen más daño que perder el hilo.
+ *
+ * Los tokens se siguen guardando -son útiles para ver el gasto y para diagnosticar-
+ * pero no deciden nada.
  */
-const TECHO_DE_TOKENS_DE_ENTRADA = 60000;
+const TECHO_DE_TURNOS = 40;
 
 /**
  * ¿Se sigue con la sesión guardada o se abre una nueva?
@@ -105,9 +122,9 @@ function decidirSesion(fila, ahora) {
     return { nueva: true, motivo: "inactividad", horas_inactiva: horasInactiva };
   }
 
-  const tokens = Number(fila.ultimo_input_tokens);
-  if (Number.isFinite(tokens) && tokens > TECHO_DE_TOKENS_DE_ENTRADA) {
-    return { nueva: true, motivo: "contexto_demasiado_grande", horas_inactiva: horasInactiva };
+  const turnos = Number(fila.turnos);
+  if (Number.isFinite(turnos) && turnos > TECHO_DE_TURNOS) {
+    return { nueva: true, motivo: "demasiados_turnos", horas_inactiva: horasInactiva };
   }
 
   return { nueva: false, motivo: "vigente", horas_inactiva: horasInactiva };
@@ -116,5 +133,5 @@ function decidirSesion(fila, ahora) {
 module.exports = {
   decidirSesion,
   HORAS_PARA_EMPEZAR_DE_CERO,
-  TECHO_DE_TOKENS_DE_ENTRADA
+  TECHO_DE_TURNOS
 };
