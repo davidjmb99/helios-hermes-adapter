@@ -82,6 +82,34 @@ const HORAS_PARA_EMPEZAR_DE_CERO = 12;
 const TECHO_DE_TURNOS = 40;
 
 /**
+ * El interruptor de emergencia.
+ *
+ * POR QUE EXISTE. Todo lo demas que se desplego el 20 de agosto se puede apagar sin
+ * desplegar nada: la direccion es un campo del panel que se vacia, el reloj de
+ * atencion tiene su ajuste de horas, el handoff tiene su flag. La rotacion era la
+ * unica pieza que, si molestaba, obligaba a un redeploy al commit anterior —y eso se
+ * lleva por delante tambien el almacen durable y el backend del boton, que no tienen
+ * nada que ver—.
+ *
+ * `HELIOS_ROTAR_SESIONES=off` apaga SOLO la rotacion automatica: las 12 horas de
+ * inactividad y el techo de turnos. Se degrada a «las sesiones viven para siempre»,
+ * que es el comportamiento de antes: conocido, y sin sorpresas.
+ *
+ * EL RESET MANUAL SIGUE FUNCIONANDO CON EL INTERRUPTOR APAGADO, y no es un descuido.
+ * Un reset lo pide una persona desde el panel para poder probar algo; si un
+ * interruptor pudiera vetarlo, el boton seria una mentira, y ya tuvimos un panel que
+ * respondia «hecho» sin hacer nada. Apagar la rotacion automatica es decir «no
+ * decidas tu por mi», no «no me dejes decidir».
+ *
+ * Cualquier valor distinto de "off" -incluido no ponerla- deja la rotacion encendida.
+ * Es a proposito: una variable mal escrita no puede apagar en silencio una proteccion.
+ * Si alguien quiere apagarla, tiene que escribir exactamente off.
+ */
+function rotacionAutomaticaEncendida() {
+  return String(process.env.HELIOS_ROTAR_SESIONES ?? "on").trim().toLowerCase() !== "off";
+}
+
+/**
  * ¿Se sigue con la sesión guardada o se abre una nueva?
  *
  * @param fila La fila guardada de esta conversación, o null si no hay ninguna.
@@ -108,6 +136,12 @@ function decidirSesion(fila, ahora) {
     }
   }
 
+  // A PARTIR DE AQUI TODO ES ROTACION AUTOMATICA, y el interruptor la corta. El reset
+  // manual ya se ha decidido arriba a proposito: no lo puede vetar una variable.
+  if (!rotacionAutomaticaEncendida()) {
+    return { nueva: false, motivo: "rotacion_apagada", horas_inactiva: null };
+  }
+
   const ultimoMs = new Date(fila.updated_at || fila.created_at || 0).getTime();
   if (!Number.isFinite(ultimoMs) || ultimoMs <= 0) {
     // Una fila sin fecha legible no se puede juzgar. Se empieza de cero, que es el
@@ -132,6 +166,7 @@ function decidirSesion(fila, ahora) {
 
 module.exports = {
   decidirSesion,
+  rotacionAutomaticaEncendida,
   HORAS_PARA_EMPEZAR_DE_CERO,
   TECHO_DE_TURNOS
 };

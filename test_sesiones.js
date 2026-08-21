@@ -181,4 +181,58 @@ const haceHoras = (h) => new Date(T0 - h * 3600_000).toISOString();
   ok('una fecha en el futuro no rota', d.nueva === false);
 }
 
+// --- EL INTERRUPTOR DE EMERGENCIA -------------------------------------------
+//
+// HELIOS_ROTAR_SESIONES=off apaga la rotacion AUTOMATICA sin desplegar nada. Existe
+// porque era la unica pieza del 20-ago sin apagado por variable: la direccion se vacia
+// en el panel, el reloj de atencion tiene su ajuste, el handoff su flag, y esta
+// obligaba a un redeploy al commit anterior —llevandose por delante el almacen durable
+// y el backend del boton, que no tienen nada que ver—.
+
+{
+  const antes = process.env.HELIOS_ROTAR_SESIONES;
+  process.env.HELIOS_ROTAR_SESIONES = 'off';
+
+  // Lo que el interruptor SI apaga.
+  ok('apagado, la inactividad no rota',
+    decidirSesion({ session_id: 's1', updated_at: haceHoras(24 * 30) }, T0).nueva === false);
+  ok('apagado, el motivo lo dice',
+    decidirSesion({ session_id: 's1', updated_at: haceHoras(24 * 30) }, T0).motivo === 'rotacion_apagada');
+  ok('apagado, el techo de turnos tampoco rota',
+    decidirSesion({ session_id: 's1', updated_at: haceHoras(1), turnos: 500 }, T0).nueva === false);
+
+  // LO QUE NO PUEDE APAGAR, y es la mitad del sentido de esta prueba.
+  //
+  // 1. El reset manual. Lo pide una persona desde el panel para poder probar algo. Si
+  //    una variable pudiera vetarlo, el boton seria una mentira, y ya tuvimos un panel
+  //    que respondia «hecho» sin hacer nada.
+  ok('apagado, el reset manual SIGUE funcionando',
+    decidirSesion(
+      { session_id: 's1', updated_at: haceHoras(3), reset_pedido_at: haceHoras(0.1) }, T0
+    ).motivo === 'reset_manual');
+
+  // 2. Abrir la primera sesion de una conversacion. Si esto se apagara, una
+  //    conversacion nueva no tendria sesion y no se podria contestar a nadie.
+  ok('apagado, una conversacion sin sesion sigue abriendo una',
+    decidirSesion(null, T0).nueva === true);
+
+  // Y CUALQUIER VALOR QUE NO SEA «off» DEJA LA ROTACION ENCENDIDA. Una variable mal
+  // escrita no puede apagar una proteccion en silencio.
+  for (const valor of ['on', 'OFF ', '', 'no', 'false', '0', 'apagado']) {
+    process.env.HELIOS_ROTAR_SESIONES = valor;
+    const rota = decidirSesion({ session_id: 's1', updated_at: haceHoras(24) }, T0).nueva;
+    // «OFF » con espacio y mayusculas SI cuenta: se normaliza. El resto, no.
+    const deberiaApagar = valor.trim().toLowerCase() === 'off';
+    ok(`con HELIOS_ROTAR_SESIONES="${valor}" la rotacion ${deberiaApagar ? 'esta apagada' : 'sigue encendida'}`,
+      rota === !deberiaApagar);
+  }
+
+  delete process.env.HELIOS_ROTAR_SESIONES;
+  ok('sin la variable, la rotacion esta encendida',
+    decidirSesion({ session_id: 's1', updated_at: haceHoras(24) }, T0).nueva === true);
+
+  if (antes === undefined) delete process.env.HELIOS_ROTAR_SESIONES;
+  else process.env.HELIOS_ROTAR_SESIONES = antes;
+}
+
 console.log('test_sesiones: ' + pasados + ' comprobaciones OK');
