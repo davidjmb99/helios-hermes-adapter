@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_dockerfile.js && node test_pricing.js && node test_panel_fields.js && node test_panel_drawer.js && node test_dedup_fallo.js && node test_diagnostico.js && node test_cache_delta.js && node test_respuesta_repetida.js && node --test --test-concurrency=1 test_adapter_abort.js test_contract_extraction.js test_contract_repair.js test_normalize.js test_normalize2.js test_multitenant.js test_hermes_agent_client.js test_agent_api_transport.js test_request_identity.js test_durable_execution.js test_processing_diagnostics.js"
+    "test": "node test_dockerfile.js && node test_pricing.js && node test_panel_fields.js && node test_panel_drawer.js && node test_dedup_fallo.js && node test_diagnostico.js && node test_cache_delta.js && node test_respuesta_repetida.js && node test_sesiones.js && node test_almacen_sesiones.js && node --test --test-concurrency=1 test_adapter_abort.js test_contract_extraction.js test_contract_repair.js test_normalize.js test_normalize2.js test_multitenant.js test_hermes_agent_client.js test_agent_api_transport.js test_request_identity.js test_durable_execution.js test_processing_diagnostics.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",

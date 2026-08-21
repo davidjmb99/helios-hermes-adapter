@@ -19,6 +19,8 @@ const { esRepeticionDeLaAnterior } = require("./respuesta-repetida.js");
 const HELIOS_BILLING_MODEL = (process.env.HELIOS_BILLING_MODEL || "").trim() || null;
 const { createExecutionStore } = require("./execution-store");
 const { assertSupabaseSuccess } = require("./supabase-assert");
+const { decidirSesion } = require("./sesiones.js");
+const { crearAlmacenDeSesiones, conversacionDeHermes } = require("./almacen-sesiones.js");
 const {
   buildProcessingTelemetry,
   classifyPostProcessingError,
@@ -174,6 +176,19 @@ const HERMES_MODEL = process.env.HERMES_MODEL || "";
 const HERMES_MODEL_PROVIDER = process.env.HERMES_MODEL_PROVIDER || "";
 
 let hermesCookie = "";
+
+/**
+ * Las sesiones, en Supabase.
+ *
+ * Sustituye al mapa en /tmp, que se borraba en cada redeploy, no se podia consultar
+ * desde ningun sitio y —lo que mas costo— vivia en memoria del proceso, asi que
+ * editar el archivo no hacia absolutamente nada.
+ */
+const almacenDeSesiones = crearAlmacenDeSesiones({
+  supabase,
+  log: (linea) => console.warn(JSON.stringify(linea))
+});
+
 let sessionMap = {};
 const hermesAgentClient = createHermesAgentClient({
   baseUrl: HERMES_AGENT_API_BASE_URL,
@@ -1483,7 +1498,38 @@ async function sendMessageToHermesAgentApi(payload) {
   const normalized = normalizeGatewayPayload(payload);
   const tenantContext = validateTenantContext(normalized);
   const key = conversationKey(normalized, tenantContext);
-  const conversation = `helios-${hashShort(key)}`;
+
+  // CUANTO HISTORIAL ARRASTRA ESTA CONVERSACION.
+  //
+  // En agent_api la conversacion de Hermes es una cadena determinista y Hermes guarda
+  // el hilo de su lado con esa clave. Nunca cambiaba, asi que el hilo crecia para
+  // siempre: la conversacion 75 iba por 42.000 tokens de entrada, y el modelo se
+  // imitaba a si mismo -tuteaba, decia «hueco» y repetia una direccion de Madrid de
+  // hacia un mes-. Contra cuarenta mil tokens de ejemplos de lo contrario no gana
+  // ninguna regla del prompt.
+  //
+  // Ahora la cadena lleva una generacion. Subirla es empezar de cero para Hermes sin
+  // que haya que borrar nada. Y lo que importa NO se pierde: la identidad del
+  // paciente y el estado de la conversacion los manda el Gateway en cada peticion.
+  const sesionGuardada = await almacenDeSesiones.leer(key);
+  const decision = decidirSesion(sesionGuardada.fila, Date.now());
+  let generacion = Number(sesionGuardada.fila?.generacion) || 0;
+  if (decision.nueva) {
+    generacion = await almacenDeSesiones.abrirNueva(key, decision.motivo, sesionGuardada.fila);
+    console.log(JSON.stringify({
+      event: "hermes_conversacion_empieza_de_cero",
+      session_key_hash: hashShort(key),
+      motivo: decision.motivo,
+      generacion,
+      horas_inactiva: decision.horas_inactiva,
+      tokens_del_turno_anterior: sesionGuardada.fila?.ultimo_input_tokens ?? null,
+      // Si la lectura fue degradada, la decision se tomo con datos de respaldo y
+      // conviene saberlo antes de creerse el motivo.
+      lectura_degradada: sesionGuardada.degradado
+    }));
+  }
+
+  const conversation = conversacionDeHermes(hashShort(key), generacion);
   const requestIdentity = createStableRequestIdentity(normalized, tenantContext);
   if (!requestIdentity.key || !requestIdentity.sourceMessageIdsHash) {
     const error = new Error("Stable source message identity is required");
@@ -1586,6 +1632,14 @@ async function sendMessageToHermesAgentApi(payload) {
     error.executionRequestKey = requestIdentity.key;
     throw error;
   }
+
+  // ESTO ES LO QUE DECIDE LA PROXIMA ROTACION. Si no se anota, la conversacion crece
+  // sin techo y volvemos al problema. Va despues del turno porque hasta aqui no hay
+  // cifra de entrada. No se hace await a proposito de bloquear la respuesta al
+  // paciente por una escritura de contabilidad: si falla, se registra dentro.
+  almacenDeSesiones
+    .anotarTurno(key, result?.tokenUsage?.input_tokens ?? result?.tokenUsage?.inputTokens ?? null)
+    .catch(() => {});
 
   return {
     sessionId: result.sessionId || null,
