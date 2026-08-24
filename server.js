@@ -3517,7 +3517,13 @@ function serveDashboard(req, res) {
     async function cargarMetricas() {
       const aviso = document.getElementById('metricas-aviso');
       const detalle = document.getElementById('m-coste-detalle');
-      if (detalle) detalle.textContent = 'Cargando...';
+
+      // «Cargando...» SOLO LA PRIMERA VEZ. El panel se refresca cada cinco segundos, y
+      // ponerlo en cada vuelta hacia que esta linea parpadeara sin parar mientras el resto
+      // de las cifras se quedaban quietas: parecia que algo estaba a medio cargar
+      // permanentemente. En un refresco no hay nada que anunciar: los datos viejos siguen
+      // siendo validos hasta que llegan los nuevos.
+      if (detalle && detalle.dataset.cargadoAlgunaVez !== 'si') detalle.textContent = 'Cargando...';
       try {
         // cache: 'no-store' NO ES DECORATIVO. Sin el, el navegador sirve la misma
         // respuesta del GET una y otra vez: David refrescaba la pagina, llegaban
@@ -3574,6 +3580,7 @@ function serveDashboard(req, res) {
         if (detalle) {
           detalle.textContent = m.etiqueta + ' · ' + miles(m.turnos) + ' turnos' +
             (mm ? ' · ' + miles(mm.archivos) + ' archivos' : '');
+          detalle.dataset.cargadoAlgunaVez = 'si';
         }
         document.getElementById('m-tokens-detalle').textContent =
           miles(m.input_tokens) + ' de entrada · ' + miles(m.output_tokens) + ' de salida';

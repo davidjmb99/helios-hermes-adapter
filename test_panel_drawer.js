@@ -353,4 +353,17 @@ assert.ok(
   "el panel tiene que pintar los tres: el total, el de texto y el de archivos"
 );
 
+// EL «Cargando...» SOLO LA PRIMERA VEZ. El panel se refresca cada cinco segundos, y
+// ponerlo en cada vuelta hacia parpadear esa linea sin parar mientras el resto de las
+// cifras se quedaban quietas: parecia que algo estaba a medio cargar permanentemente.
+assert.ok(
+  /dataset\.cargadoAlgunaVez !== 'si'/.test(cuerpo),
+  "el texto de carga tiene que mirar si ya se cargo alguna vez, o parpadea cada 5 segundos"
+);
+assert.ok(
+  /dataset\.cargadoAlgunaVez = 'si'/.test(cuerpo),
+  "y hay que MARCARLO al terminar, o la condicion de arriba nunca se cumple y el arreglo " +
+  "no sirve de nada"
+);
+
 console.log("  reparto de coste: tarjetas, aviso de nivel y total OK");
