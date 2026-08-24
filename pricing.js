@@ -73,6 +73,46 @@ const CATALOGO = {
         }
       }
     ]
+  },
+
+  /**
+   * GEMINI, que es quien convierte los archivos en texto. Vive en el Gateway y no en
+   * Hermes, pero el precio se calcula aquí para que haya UN solo catálogo: dos sitios
+   * con tarifas es la forma segura de que uno se quede viejo.
+   *
+   * LA ENTRADA DE AUDIO CUESTA EL TRIPLE que el texto, la imagen o el vídeo, y esa es la
+   * única razón por la que existe `por_modalidad`. Sin ese desglose, una nota de voz se
+   * valoraría a precio de texto y el coste real sería tres veces el que dice el panel.
+   *
+   * Y SOBRE LA CACHÉ: no usamos la caché de contexto de Gemini. Cada archivo es una
+   * llamada independiente, así que quien pida el coste pasa `cached_tokens: 0` y sale
+   * exacto. `cache_hit` se deja igual a `cache_miss` a propósito: si algún día se activa
+   * la caché y nadie actualiza esto, el número saldrá ALTO, que es el lado en el que uno
+   * quiere equivocarse al estimar un gasto.
+   */
+  gemini: {
+    "gemini-2.5-flash-lite": [
+      {
+        desde: "1970-01-01T00:00:00Z",
+        cache_hit: 0.10,
+        cache_miss: 0.10,
+        output: 0.40,
+        por_modalidad: {
+          // 32 tokens por segundo de audio, a 0,30 el millón: una nota de voz de 30
+          // segundos son 960 tokens, unos 0,00029 USD.
+          audio: { cache_hit: 0.30, cache_miss: 0.30 }
+        }
+      }
+    ],
+    "gemini-2.5-flash": [
+      {
+        desde: "1970-01-01T00:00:00Z",
+        cache_hit: 0.30,
+        cache_miss: 0.30,
+        output: 2.50,
+        por_modalidad: { audio: { cache_hit: 1.00, cache_miss: 1.00 } }
+      }
+    ]
   }
   // openai: { "gpt-...": [...] }  <- añadir aquí cuando toque, sin tocar lógica.
 };
@@ -125,20 +165,37 @@ function esHoraPico(tramo, fecha) {
   return tramo.pico.franjas.some(([desde, hasta]) => hora >= desde && hora < hasta);
 }
 
-function tarifaAplicable(tramo, fecha) {
-  if (esHoraPico(tramo, fecha)) {
-    return {
+/**
+ * La tarifa que toca, resolviendo la hora pico y la modalidad.
+ *
+ * LA MODALIDAD SOLO PISA LA ENTRADA, nunca la salida: lo que cambia de precio es leer
+ * un audio, no escribir texto. Y solo pisa si el tramo declara esa modalidad, así que
+ * los modelos sin desglose -DeepSeek- se comportan exactamente igual que antes.
+ */
+function tarifaAplicable(tramo, fecha, modalidad = null) {
+  const base = esHoraPico(tramo, fecha)
+    ? {
       cache_hit: tramo.pico.cache_hit,
       cache_miss: tramo.pico.cache_miss,
       output: tramo.pico.output,
       franja: "pico"
+    }
+    : {
+      cache_hit: tramo.cache_hit,
+      cache_miss: tramo.cache_miss,
+      output: tramo.output,
+      franja: tramo.pico ? "valle" : "unica"
     };
-  }
+
+  const clave = String(modalidad || "").trim().toLowerCase();
+  const especial = clave && tramo.por_modalidad ? tramo.por_modalidad[clave] : null;
+  if (!especial) return { ...base, modalidad: clave || null };
+
   return {
-    cache_hit: tramo.cache_hit,
-    cache_miss: tramo.cache_miss,
-    output: tramo.output,
-    franja: tramo.pico ? "valle" : "unica"
+    ...base,
+    cache_hit: especial.cache_hit,
+    cache_miss: especial.cache_miss,
+    modalidad: clave
   };
 }
 
@@ -159,7 +216,13 @@ function calcularCoste(input) {
     at = new Date(),
     input_tokens = null,
     output_tokens = null,
-    cached_tokens = null
+    cached_tokens = null,
+    /**
+     * Qué se está leyendo: 'audio', 'imagen', 'video', 'documento'. Solo importa en los
+     * modelos cuya entrada cambia de precio según el tipo -Gemini-. Se ignora en el
+     * resto.
+     */
+    modalidad = null
   } = input || {};
 
   const encontrado = buscarTramos(provider, model);
@@ -175,13 +238,14 @@ function calcularCoste(input) {
   const entrada = Number.isFinite(input_tokens) ? input_tokens : 0;
   const salida = Number.isFinite(output_tokens) ? output_tokens : 0;
   const tramo = elegirTramo(encontrado.tramos, at);
-  const tarifa = tarifaAplicable(tramo, at);
+  const tarifa = tarifaAplicable(tramo, at, modalidad);
 
   const costeSalida = (salida * tarifa.output) / POR_MILLON;
   const comun = {
     provider: encontrado.provider,
     model: encontrado.model,
     franja: tarifa.franja,
+    modalidad: tarifa.modalidad,
     tarifa_desde: tramo.desde,
     input_tokens: entrada,
     output_tokens: salida,

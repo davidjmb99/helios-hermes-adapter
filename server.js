@@ -5,7 +5,9 @@ const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
-const { PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos } = require("./metricas");
+const {
+  PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos, resumirMedia
+} = require("./metricas");
 const { calcularDesgloseDeCache, leerAcumuladosDelContrato } = require("./cache-delta.js");
 const { esRepeticionDeLaAnterior } = require("./respuesta-repetida.js");
 
@@ -2512,6 +2514,52 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
 
     const resumen = resumirEventos(eventos, HELIOS_BILLING_MODEL);
 
+    // LOS ARCHIVOS SE CUENTAN APARTE, y de otra tabla. El gasto de convertir una nota de
+    // voz en texto ocurre en el Gateway, ANTES de que exista el turno, y puede haber
+    // gasto sin turno: una cadena reenviada que se ignora cuesta dinero y no genera
+    // respuesta. Ver la migracion 20260824010000_media_events.sql.
+    //
+    // SI ESTA CONSULTA FALLA NO SE CAE EL PANEL. El gasto de texto es el grueso y tiene
+    // que seguir viendose; que falte el de los archivos se DICE en el aviso.
+    let media = null;
+    let mediaTruncado = false;
+    let mediaError = null;
+    try {
+      const filasDeMedia = [];
+      for (let inicio = 0; inicio < TOPE_FILAS; inicio += PAGINA) {
+        const { data, error } = await supabase
+          .from("helios_media_events")
+          .select("created_at, tipo, accion, modelo, nivel, input_tokens, output_tokens")
+          .gte("created_at", desde.toISOString())
+          .order("created_at", { ascending: false })
+          .range(inicio, inicio + PAGINA - 1);
+
+        if (error) throw error;
+        if (!data || data.length === 0) break;
+        filasDeMedia.push(...data);
+        if (data.length < PAGINA) break;
+        if (filasDeMedia.length >= TOPE_FILAS) { mediaTruncado = true; break; }
+      }
+      media = resumirMedia(filasDeMedia);
+    } catch (error) {
+      mediaError = error?.code || "MEDIA_QUERY_ERROR";
+      console.error(JSON.stringify({ event: "metricas_media_fallidas", error_code: mediaError }));
+    }
+
+    // EL TOTAL SUMA LOS DOS, y solo se declara completo si los dos lo son. Un total que
+    // se ha dejado fuera el gasto de los archivos con pinta de exacto es peor que no
+    // tenerlo: se usa para decidir.
+    const costeDeTexto = resumen.coste_usd;
+    const costeDeMedia = media ? media.coste_usd : 0;
+    const costeTotal = Math.round((costeDeTexto + costeDeMedia) * 1e6) / 1e6;
+    const totalCompleto = resumen.coste_completo && !!media && media.coste_completo && !mediaError;
+
+    // El coste por mensaje enviado usa el TOTAL: lo que se quiere saber es cuanto cuesta
+    // atender a un paciente, y si mando una nota de voz, transcribirla es parte de eso.
+    const costePorSaliente = resumen.salientes > 0
+      ? Math.round((costeTotal / resumen.salientes) * 1e6) / 1e6
+      : null;
+
     return res.json({
       ok: true,
       periodo,
@@ -2520,10 +2568,23 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
       hasta: ahora.toISOString(),
       truncado,
       ...resumen,
-      coste_usd_texto: formatearUsd(resumen.coste_usd),
-      coste_por_saliente_texto: resumen.coste_por_saliente === null
-        ? null
-        : formatearUsd(resumen.coste_por_saliente)
+
+      // El coste de texto conserva su nombre propio, para que en el panel se pueda
+      // separar de verdad y no por resta.
+      coste_texto_usd: costeDeTexto,
+      coste_texto_usd_texto: formatearUsd(costeDeTexto),
+
+      media,
+      media_truncado: mediaTruncado,
+      media_error: mediaError,
+      coste_media_usd: costeDeMedia,
+      coste_media_usd_texto: media ? formatearUsd(costeDeMedia) : null,
+
+      coste_total_usd: costeTotal,
+      coste_total_completo: totalCompleto,
+      coste_usd_texto: formatearUsd(costeTotal),
+      coste_por_saliente: costePorSaliente,
+      coste_por_saliente_texto: costePorSaliente === null ? null : formatearUsd(costePorSaliente)
     });
   } catch (error) {
     console.error(JSON.stringify({
@@ -3227,6 +3288,14 @@ function serveDashboard(req, res) {
       <div id="metricas-periodos" style="display:flex; gap:0.35rem; flex-wrap:wrap;"></div>
     </div>
     <div id="metricas-aviso" style="display:none; font-size:0.8rem; padding:0.6rem 0.8rem; border-radius:8px; margin-bottom:0.75rem;"></div>
+    <!--
+      EL NIVEL GRATUITO DE GEMINI VA EN AMBAR Y NO EN ROJO, porque no es un fallo: es una
+      decision tomada a proposito. Pero tiene que estar A LA VISTA, porque en el nivel
+      gratuito Google usa el contenido para mejorar sus productos, y aqui el contenido son
+      notas de voz de pacientes hablando de su salud. Se cuenta de las FILAS: dice cuantos
+      archivos pasaron por ahi de verdad, no lo que dice una variable de entorno.
+    -->
+    <div id="metricas-aviso-nivel" style="display:none; font-size:0.8rem; padding:0.6rem 0.8rem; border-radius:8px; margin-bottom:0.75rem;"></div>
     <div class="stats-grid" id="metricas-tarjetas">
       <div class="stat-card">
         <div class="stat-label">Coste del periodo</div>
@@ -3237,6 +3306,22 @@ function serveDashboard(req, res) {
         <div class="stat-label">Coste por mensaje enviado</div>
         <div class="stat-value" id="m-coste-msg">-</div>
         <div class="stat-detail">Incluye el gasto de los turnos que fallaron</div>
+      </div>
+      <!--
+        TEXTO Y ARCHIVOS SEPARADOS, como lo pidio David: «que separe el costo del de
+        deepseek con el de gemini». No es curiosidad contable: son dos proveedores con
+        tarifas que no se parecen y que pueden dispararse por motivos distintos. Si sube
+        el total, lo primero que hay que saber es de quien es la subida.
+      -->
+      <div class="stat-card">
+        <div class="stat-label">Texto / Archivos</div>
+        <div class="stat-value" id="m-reparto" style="font-size:1.1rem; padding-top:0.5rem;">-</div>
+        <div class="stat-detail" id="m-reparto-detalle">DeepSeek / Gemini</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Archivos</div>
+        <div class="stat-value" id="m-archivos" style="font-size:1.1rem; padding-top:0.5rem;">-</div>
+        <div class="stat-detail" id="m-archivos-detalle">audio, imagen, vídeo, documento</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Mensajes</div>
@@ -3399,6 +3484,36 @@ function serveDashboard(req, res) {
       });
     }
 
+    /**
+     * El aviso del nivel gratuito de Gemini.
+     *
+     * EN AMBAR Y NO EN ROJO porque no es un fallo: es una decision tomada a proposito
+     * -David eligio el nivel gratuito para las pruebas-. Pero tiene que estar A LA VISTA,
+     * porque en el nivel gratuito Google usa el contenido para mejorar sus productos, y el
+     * contenido aqui son notas de voz de pacientes hablando de su salud.
+     *
+     * SE CUENTA DE LAS FILAS y no de una variable de entorno. La pregunta que importa es
+     * cuantos archivos de pacientes pasaron por ahi DE VERDAD, y eso una variable que pudo
+     * cambiar entre dos despliegues no lo contesta.
+     */
+    function pintarAvisoDeNivel(mm) {
+      const caja = document.getElementById('metricas-aviso-nivel');
+      if (!caja) return;
+      if (!mm || !mm.en_nivel_gratuito) {
+        caja.style.display = 'none';
+        return;
+      }
+      caja.style.display = 'block';
+      caja.style.background = 'rgba(245, 158, 11, 0.1)';
+      caja.style.border = '1px solid rgba(245, 158, 11, 0.3)';
+      caja.style.color = '#fcd34d';
+      caja.textContent =
+        miles(mm.en_nivel_gratuito) + ' de ' + miles(mm.archivos) +
+        ' archivos pasaron por el NIVEL GRATUITO de Gemini, donde Google usa el contenido ' +
+        'para mejorar sus productos. Para pacientes reales hay que activar la facturación en ' +
+        'Google y poner GEMINI_NIVEL=pago en el Gateway.';
+    }
+
     async function cargarMetricas() {
       const aviso = document.getElementById('metricas-aviso');
       const detalle = document.getElementById('m-coste-detalle');
@@ -3422,7 +3537,44 @@ function serveDashboard(req, res) {
         document.getElementById('m-cache').textContent =
           m.acierto_cache_pct === null ? 'sin datos' : m.acierto_cache_pct + '%';
 
-        if (detalle) detalle.textContent = m.etiqueta + ' · ' + miles(m.turnos) + ' turnos';
+        // TEXTO Y ARCHIVOS, cada uno con su cifra. Si el de archivos no se pudo consultar
+        // se dice, en vez de pintar un cero que pareceria «no se gasto nada».
+        const mm = m.media || null;
+        document.getElementById('m-reparto').textContent =
+          (m.coste_texto_usd_texto || '-') + ' / ' + (m.coste_media_usd_texto || 'sin datos');
+        document.getElementById('m-reparto-detalle').textContent = mm
+          ? 'DeepSeek / Gemini'
+          : 'DeepSeek / Gemini (no se pudo consultar el gasto de archivos)';
+
+        if (mm) {
+          document.getElementById('m-archivos').textContent = miles(mm.archivos);
+          const porTipo = [];
+          if (mm.por_tipo.audio) porTipo.push(miles(mm.por_tipo.audio) + ' audio');
+          if (mm.por_tipo.imagen) porTipo.push(miles(mm.por_tipo.imagen) + ' imagen');
+          if (mm.por_tipo.video) porTipo.push(miles(mm.por_tipo.video) + ' vídeo');
+          if (mm.por_tipo.documento) porTipo.push(miles(mm.por_tipo.documento) + ' doc');
+
+          // LO QUE HAY QUE MIRAR AQUI SON LOS IGNORADOS: son mensajes de pacientes que NO
+          // recibieron respuesta a proposito. Si ese numero crece sin motivo, el
+          // clasificador se esta comiendo mensajes de verdad, y este es el unico sitio
+          // donde eso se ve: un paciente al que no se contesta no se queja, se va.
+          const queSeHizo = [];
+          if (mm.derivados) queSeHizo.push(miles(mm.derivados) + ' a una persona');
+          if (mm.ignorados) queSeHizo.push(miles(mm.ignorados) + ' SIN responder');
+          if (mm.fallidos) queSeHizo.push(miles(mm.fallidos) + ' fallaron');
+
+          document.getElementById('m-archivos-detalle').textContent =
+            (porTipo.length ? porTipo.join(', ') : 'ninguno') +
+            (queSeHizo.length ? ' · ' + queSeHizo.join(', ') : '');
+        } else {
+          document.getElementById('m-archivos').textContent = 'sin datos';
+          document.getElementById('m-archivos-detalle').textContent = m.media_error || 'no se pudo consultar';
+        }
+
+        if (detalle) {
+          detalle.textContent = m.etiqueta + ' · ' + miles(m.turnos) + ' turnos' +
+            (mm ? ' · ' + miles(mm.archivos) + ' archivos' : '');
+        }
         document.getElementById('m-tokens-detalle').textContent =
           miles(m.input_tokens) + ' de entrada · ' + miles(m.output_tokens) + ' de salida';
 
@@ -3440,6 +3592,23 @@ function serveDashboard(req, res) {
           const problemas = [];
           if (m.truncado) {
             problemas.push('Se alcanzó el tope de filas: faltan turnos por contar. Hay que mover la suma a SQL.');
+          }
+          if (m.media_error) {
+            problemas.push(
+              'No se pudo consultar el gasto de los archivos (' + m.media_error +
+              '). El total mostrado es SOLO el de texto.'
+            );
+          }
+          if (m.media_truncado) {
+            problemas.push('Se alcanzó el tope de filas de archivos: falta gasto por contar.');
+          }
+          if (mm && mm.coste_completo === false) {
+            const motivosMedia = Object.entries(mm.motivos_sin_valorar || {})
+              .map(([k, v]) => v + ' por ' + k.replace(/_/g, ' ')).join(', ');
+            problemas.push(
+              'El coste de los archivos está INCOMPLETO: ' + miles(mm.archivos_sin_valorar) +
+              ' sin valorar (' + motivosMedia + ').'
+            );
           }
           if (m.coste_completo === false) {
             const motivos = Object.entries(m.motivos_sin_valorar || {})
@@ -3460,6 +3629,9 @@ function serveDashboard(req, res) {
             aviso.style.display = 'none';
           }
         }
+
+        // Y EL DEL NIVEL GRATUITO, siempre: no depende de que haya nada roto.
+        pintarAvisoDeNivel(mm);
       } catch (error) {
         if (detalle) detalle.textContent = 'No se pudieron cargar las métricas';
         if (aviso) {

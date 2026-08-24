@@ -157,4 +157,105 @@ function resumirEventos(eventos, modeloDeRespaldo = null) {
   return resumen;
 }
 
-module.exports = { PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos };
+/**
+ * Resume los archivos procesados: audio, imagen, video y documentos.
+ *
+ * VA APARTE DEL RESUMEN DE TURNOS, y no por comodidad. Un archivo NO ES UN TURNO: puede
+ * haber gasto sin turno -una cadena reenviada que se ignora cuesta dinero y no genera
+ * respuesta- y un turno puede llevar tres archivos. Sumarlos en el mismo contador diria
+ * que hubo mas conversaciones de las que hubo, que es la clase de cifra que se usa para
+ * decidir y esta mal.
+ *
+ * LA MODALIDAD DECIDE EL PRECIO. En Gemini la entrada de audio cuesta el TRIPLE que la
+ * de texto, imagen o video. Valorar una nota de voz a precio de texto no es un redondeo:
+ * es un tercio del coste real. Por eso el tipo viaja hasta `calcularCoste`.
+ *
+ * @param filas Filas de helios_media_events.
+ */
+function resumirMedia(filas) {
+  const lista = Array.isArray(filas) ? filas : [];
+
+  const resumen = {
+    archivos: lista.length,
+
+    por_tipo: { audio: 0, imagen: 0, video: 0, documento: 0 },
+
+    // QUE SE HIZO CON CADA UNO. «ignorados» es el que hay que mirar: son mensajes de
+    // pacientes que NO recibieron respuesta a proposito. Si ese numero crece sin motivo,
+    // el clasificador se esta comiendo mensajes de verdad y aqui es donde se ve.
+    seguidos: 0,
+    derivados: 0,
+    ignorados: 0,
+    fallidos: 0,
+
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+
+    coste_usd: 0,
+    archivos_valorados: 0,
+    archivos_sin_valorar: 0,
+    motivos_sin_valorar: {},
+    coste_completo: true,
+
+    /**
+     * Cuantos pasaron por el nivel gratuito de Gemini, donde Google usa el contenido para
+     * mejorar sus productos. Se cuenta de las FILAS y no de una variable de entorno: la
+     * pregunta es cuantos archivos de pacientes pasaron por ahi de verdad, y eso una
+     * variable que pudo cambiar entre dos despliegues no lo contesta.
+     */
+    en_nivel_gratuito: 0
+  };
+
+  for (const fila of lista) {
+    const tipo = String(fila?.tipo ?? "");
+    if (Object.prototype.hasOwnProperty.call(resumen.por_tipo, tipo)) resumen.por_tipo[tipo] += 1;
+
+    const accion = String(fila?.accion ?? "");
+    if (accion === "derivar") resumen.derivados += 1;
+    else if (accion === "ignorar") resumen.ignorados += 1;
+    else if (accion === "sin_procesar") resumen.fallidos += 1;
+    else if (accion === "seguir") resumen.seguidos += 1;
+
+    if (String(fila?.nivel ?? "") === "gratuito") resumen.en_nivel_gratuito += 1;
+
+    const entrada = numero(fila?.input_tokens);
+    const salida = numero(fila?.output_tokens);
+    resumen.input_tokens += entrada;
+    resumen.output_tokens += salida;
+    resumen.total_tokens += entrada + salida;
+
+    // Un archivo rechazado antes de llamar -demasiado grande, formato no soportado- no
+    // gasto nada. No cuenta como «sin valorar»: valorarlo daria cero igual.
+    if (entrada === 0 && salida === 0) continue;
+
+    const coste = calcularCoste({
+      model: modeloConTarifa(fila?.modelo) || null,
+      at: fila?.created_at,
+      input_tokens: entrada,
+      output_tokens: salida,
+      // NO USAMOS LA CACHE DE CONTEXTO DE GEMINI: cada archivo es una llamada
+      // independiente. Pasar 0 es la verdad, y ademas es lo que hace que el coste salga
+      // exacto en vez de un rango inutil.
+      cached_tokens: 0,
+      modalidad: tipo === "audio" ? "audio" : null
+    });
+
+    if (coste && coste.exact === true && Number.isFinite(coste.usd)) {
+      resumen.coste_usd += coste.usd;
+      resumen.archivos_valorados += 1;
+    } else {
+      resumen.archivos_sin_valorar += 1;
+      resumen.coste_completo = false;
+      const motivo = String(coste?.motivo || "desconocido");
+      resumen.motivos_sin_valorar[motivo] = (resumen.motivos_sin_valorar[motivo] || 0) + 1;
+    }
+  }
+
+  resumen.coste_usd = Math.round(resumen.coste_usd * 1e6) / 1e6;
+  return resumen;
+}
+
+module.exports = {
+  PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos, resumirMedia
+};

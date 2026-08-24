@@ -271,3 +271,86 @@ assert.ok(
 );
 
 console.log("  panel de metricas: funciones, endpoint, cache y refresco OK");
+
+// --- TODOS los bloques <script> tienen que COMPILAR -------------------------
+//
+// LO DE ARRIBA EJECUTA EL BLOQUE MAS GRANDE, y eso ya caza un error de sintaxis ahi.
+// Pero el panel tiene mas de un <script> -el de la pantalla de login, por ejemplo- y
+// ninguno de ellos lo miraba nadie.
+//
+// LA NOCHE DEL 21 DE AGOSTO ESO TIRO EL PANEL DEL GATEWAY: un `\n` escrito a mano acabo
+// convertido en un SALTO DE LINEA REAL dentro de una cadena de comillas simples. En
+// JavaScript eso no es un error pequeño y local: el navegador no puede parsear el bloque
+// ENTERO, asi que no se ejecuta NADA. David no podia ni iniciar sesion, y el sintoma
+// -«no me quiere agarrar el usuario y contraseña»- no se parecia en nada a la causa.
+//
+// `node --check server.js` no lo ve: para el validador todo esto es una cadena de texto
+// dentro de una plantilla. Y las pruebas que miran el panel lo leen como TEXTO y le
+// aplican expresiones regulares, asi que un archivo roto las pasa todas: los grep
+// encuentran lo que buscan.
+
+const vm = require("vm");
+
+const todosLosBloques = [...fuente.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+  .map(m => m[1])
+  .filter(codigo => codigo.trim().length > 0);
+
+assert.ok(
+  todosLosBloques.length >= 1,
+  "no se encuentra ningun <script> con codigo: o cambio la estructura del archivo o esta " +
+  "prueba dejo de mirar donde debia, y en los dos casos hay que arreglarla"
+);
+
+todosLosBloques.forEach((codigo, i) => {
+  try {
+    // Compilar y NO ejecutar: aqui solo interesa que sea JavaScript valido. Ejecutarlo
+    // pediria un DOM entero, y eso ya lo hace la parte de arriba con el bloque grande.
+    new vm.Script(codigo, { filename: "panel-script-" + i + ".js" });
+  } catch (error) {
+    assert.fail(
+      "el bloque <script> numero " + (i + 1) + " de " + todosLosBloques.length +
+      " NO COMPILA: " + error.message + "\n" +
+      "Un <script> que no parsea no ejecuta NADA, ni siquiera el formulario de login. " +
+      "Lo mas probable: un salto de linea real dentro de una cadena de comillas simples."
+    );
+  }
+});
+
+console.log("  sintaxis: " + todosLosBloques.length + " bloques <script> compilan");
+
+// --- Las tarjetas del reparto de coste existen y estan cableadas ------------
+//
+// LO PIDIO DAVID: «que separe el costo del de deepseek con el de gemini». Si el elemento
+// no existe, getElementById devuelve null y la linea de al lado revienta con un
+// TypeError que se lleva por delante TODO cargarMetricas: las metricas se quedan en «-»
+// sin decir por que.
+
+for (const id of ["m-reparto", "m-reparto-detalle", "m-archivos", "m-archivos-detalle", "metricas-aviso-nivel"]) {
+  assert.ok(
+    fuente.includes('id="' + id + '"'),
+    "falta el elemento " + id + " en el HTML del panel: cargarMetricas lo busca por " +
+    "getElementById y sin el revienta con un TypeError que deja las metricas en blanco"
+  );
+  assert.ok(
+    fuente.includes("'" + id + "'"),
+    "el elemento " + id + " existe en el HTML pero nadie lo rellena"
+  );
+}
+
+// EL AVISO DEL NIVEL GRATUITO NO PUEDE DEPENDER DE QUE ALGO ESTE ROTO. Estaba dentro de
+// la rama de «hay problemas» y solo aparecia cuando el coste venia incompleto; es decir,
+// justo cuando no toca. Se comprueba que la llamada esta FUERA del if.
+assert.ok(
+  /aviso\.style\.display = 'none';\s*\}\s*\}\s*\n[\s\S]{0,200}?pintarAvisoDeNivel\(mm\)/.test(cuerpo),
+  "pintarAvisoDeNivel tiene que llamarse FUERA del bloque de problemas: el nivel " +
+  "gratuito no es un fallo y tiene que verse siempre"
+);
+
+// Y QUE EL TOTAL SEA LA SUMA, no solo el texto. Si el panel pintara coste_texto_usd en
+// la tarjeta del total, el gasto de los archivos seria invisible.
+assert.ok(
+  /coste_usd_texto/.test(cuerpo) && /coste_texto_usd_texto/.test(cuerpo) && /coste_media_usd_texto/.test(cuerpo),
+  "el panel tiene que pintar los tres: el total, el de texto y el de archivos"
+);
+
+console.log("  reparto de coste: tarjetas, aviso de nivel y total OK");

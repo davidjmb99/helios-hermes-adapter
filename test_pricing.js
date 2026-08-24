@@ -162,3 +162,93 @@ assert.equal(filaAntigua.exact, true, "y por tanto una traza vieja ya muestra su
 assert.ok(Math.abs(filaAntigua.usd - real.usd) < 1e-12);
 
 console.log("  filas antiguas con perfil por modelo: resueltas");
+
+// ============================================================================
+// GEMINI: LA ENTRADA DE AUDIO CUESTA EL TRIPLE
+// ============================================================================
+//
+// EL FALLO QUE ESTO EVITA es de los que no se notan: valorar una nota de voz a precio
+// de texto no es un redondeo, es un TERCIO del coste real. El panel diria 0,0001 USD
+// donde se pagaron 0,0003, y multiplicado por mil notas de voz al mes la cifra que se
+// usa para decidir el precio del producto esta mal por un factor de tres.
+//
+// Y NO SE PUEDE DEDUCIR DEL MODELO, que es lo que lo hace facil de olvidar: el mismo
+// gemini-2.5-flash-lite cobra 0,10 por texto, imagen y video, y 0,30 por audio. La
+// unica forma de acertar es que el TIPO viaje hasta el calculo.
+
+const AHORA_G = "2026-08-24T12:00:00Z";
+
+// Una nota de voz de 30 segundos: 32 tokens por segundo = 960 de entrada.
+const notaDeVoz = calcularCoste({
+  model: "gemini-2.5-flash-lite", modalidad: "audio",
+  input_tokens: 960, output_tokens: 20, cached_tokens: 0, at: AHORA_G
+});
+assert.equal(notaDeVoz.exact, true, "sin cache de contexto, el coste de un archivo es EXACTO");
+assert.equal(notaDeVoz.modalidad, "audio");
+assert.ok(
+  Math.abs(notaDeVoz.usd - (960 * 0.30 + 20 * 0.40) / 1e6) < 1e-12,
+  "una nota de voz de 30 segundos cuesta 0,000296 USD"
+);
+
+const comoSiFueraTexto = calcularCoste({
+  model: "gemini-2.5-flash-lite",
+  input_tokens: 960, output_tokens: 20, cached_tokens: 0, at: AHORA_G
+});
+assert.ok(
+  notaDeVoz.usd > comoSiFueraTexto.usd * 2.5,
+  "SIN la modalidad el mismo audio sale casi tres veces mas barato: es el error que " +
+  "por_modalidad existe para evitar"
+);
+
+// Una imagen: 258 tokens por bloque de 768x768, a precio de texto.
+const imagen = calcularCoste({
+  model: "gemini-2.5-flash-lite", modalidad: "imagen",
+  input_tokens: 258, output_tokens: 12, cached_tokens: 0, at: AHORA_G
+});
+assert.ok(
+  Math.abs(imagen.usd - (258 * 0.10 + 12 * 0.40) / 1e6) < 1e-12,
+  "imagen, video y documento van a 0,10: solo el audio es distinto"
+);
+for (const m of ["imagen", "video", "documento", null, "", "cualquiera"]) {
+  const r = calcularCoste({
+    model: "gemini-2.5-flash-lite", modalidad: m,
+    input_tokens: 1000, output_tokens: 0, cached_tokens: 0, at: AHORA_G
+  });
+  assert.ok(
+    Math.abs(r.usd - 1000 * 0.10 / 1e6) < 1e-12,
+    "modalidad " + JSON.stringify(m) + ": todo lo que no sea audio va a la tarifa base"
+  );
+}
+
+// Y LO QUE MAS IMPORTA DE TODO ESTO: DEEPSEEK NO SE HA MOVIDO. `por_modalidad` es un
+// campo que solo existe en los tramos de Gemini, asi que pasar una modalidad a un
+// modelo que no la declara no puede cambiar su precio.
+const dsSinModalidad = calcularCoste({
+  model: "deepseek-v4-flash", input_tokens: 37307, output_tokens: 400,
+  cached_tokens: 36000, at: AHORA_G
+});
+for (const m of ["audio", "imagen", "video"]) {
+  const dsCon = calcularCoste({
+    model: "deepseek-v4-flash", modalidad: m, input_tokens: 37307, output_tokens: 400,
+    cached_tokens: 36000, at: AHORA_G
+  });
+  assert.equal(
+    dsCon.usd, dsSinModalidad.usd,
+    "una modalidad NO puede cambiar el precio de un modelo que no la declara"
+  );
+}
+
+// La hora pico de DeepSeek sigue funcionando con el parametro nuevo en medio.
+const pico = calcularCoste({
+  model: "deepseek-v4-flash", input_tokens: 1000, output_tokens: 100,
+  cached_tokens: 0, at: "2026-08-24T02:00:00Z"
+});
+const valle = calcularCoste({
+  model: "deepseek-v4-flash", input_tokens: 1000, output_tokens: 100,
+  cached_tokens: 0, at: AHORA_G
+});
+assert.equal(pico.franja, "pico");
+assert.equal(valle.franja, "valle");
+assert.ok(pico.usd > valle.usd, "el recargo de hora pico sigue aplicandose");
+
+console.log("  gemini: audio a 0,30 y el resto a 0,10, sin tocar deepseek");
