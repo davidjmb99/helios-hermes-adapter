@@ -34,8 +34,17 @@ const haceHoras = (h) => new Date(T0 - h * 3600_000).toISOString();
 {
   const d = decidirSesion(null, T0);
   ok('sin fila se crea sesion', d.nueva === true && d.motivo === 'sin_sesion');
-  ok('una fila sin session_id cuenta como sin sesion',
-    decidirSesion({ updated_at: haceHoras(1) }, T0).motivo === 'sin_sesion');
+  // ESTA ASERCION AFIRMABA EL FALLO, y por eso no lo caz'o. Decia que una fila sin
+  // session_id cuenta como «sin sesion», y en agent_api -el transporte de produccion-
+  // NUNCA hay session_id: la conversacion se identifica con una cadena y abrirNueva
+  // guarda null a proposito. Con esa regla se abria una generacion nueva EN CADA
+  // MENSAJE, y el paciente perdia el hilo entre una frase y la siguiente.
+  //
+  // LA SEÑAL CORRECTA ES QUE LA FILA EXISTA.
+  ok('EL FALLO: una fila SIN session_id es una sesion valida, porque en agent_api no hay',
+    decidirSesion({ updated_at: haceHoras(1), turnos: 1, generacion: 0 }, T0).nueva === false);
+  ok('y se sigue con ella, no se abre otra',
+    decidirSesion({ updated_at: haceHoras(1), turnos: 1, generacion: 0 }, T0).motivo === 'vigente');
 }
 
 // --- Dentro de la jornada NO se rota ----------------------------------------

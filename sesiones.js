@@ -120,7 +120,22 @@ function rotacionAutomaticaEncendida() {
 function decidirSesion(fila, ahora) {
   const ahoraMs = ahora instanceof Date ? ahora.getTime() : Number(ahora);
 
-  if (!fila || !fila.session_id) {
+  // LA SEÑAL DE QUE HAY SESIÓN ES QUE EXISTA LA FILA, no que tenga session_id.
+  //
+  // AQUÍ HABÍA UN FALLO GRAVE Y ERA MÍO. La condición decía
+  // `if (!fila || !fila.session_id)`, y en el transporte agent_api —el de
+  // producción— NO HAY session_id: la conversación se identifica con una cadena y
+  // `abrirNueva` guarda session_id en null a propósito. Así que la condición se
+  // cumplía SIEMPRE y se abría una generación nueva EN CADA MENSAJE.
+  //
+  // Lo que se veía: dos sesiones de Hermes para la conversación 84, una por mensaje.
+  // El paciente dijo «quiero una cita», dio su nombre, y Helios le preguntó otra vez
+  // en qué podía ayudarle —porque el segundo mensaje era, literalmente, otra
+  // conversación para Hermes—. La continuidad estaba rota para todos los pacientes.
+  //
+  // Y ME EQUIVOQUÉ AL LEER LA PISTA: al ver `helios-a11c97950cc5-g1` en el informe de
+  // Hermes dije que era la rotación funcionando en producción. Era este fallo.
+  if (!fila) {
     return { nueva: true, motivo: "sin_sesion", horas_inactiva: null };
   }
 
