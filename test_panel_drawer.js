@@ -252,4 +252,22 @@ assert.ok(
   "y con las credenciales, o requireDebugAuth lo rechaza"
 );
 
-console.log("  panel de metricas: funciones y endpoint OK");
+// Y QUE NO SE SIRVA DE LA CACHE DEL NAVEGADOR. David refrescaba la pagina, llegaban
+// mensajes nuevos, y las metricas seguian diciendo «2 / 2»: el GET se repetia igual y
+// el navegador devolvia la respuesta guardada sin llegar al servidor.
+const llamada = cuerpo.slice(cuerpo.indexOf("/debug/metricas"), cuerpo.indexOf("/debug/metricas") + 320);
+assert.ok(
+  /cache:\s*'no-store'/.test(llamada),
+  "la peticion de metricas tiene que llevar cache: 'no-store', o el navegador la sirve " +
+  "de su cache y las cifras se quedan congeladas"
+);
+
+// Y QUE SE REFRESQUE CON EL RESTO DEL PANEL, no solo al cargar la pagina. Estaba solo
+// en la carga inicial y se congelaba mientras el historial de abajo se actualizaba
+// cada cinco segundos: dos cifras del mismo panel contando cosas distintas.
+assert.ok(
+  /async function loadData\(\)[\s\S]{0,700}?cargarMetricas\(\)/.test(cuerpo),
+  "loadData tiene que llamar a cargarMetricas, o las metricas no se refrescan"
+);
+
+console.log("  panel de metricas: funciones, endpoint, cache y refresco OK");

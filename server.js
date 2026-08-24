@@ -3404,8 +3404,13 @@ function serveDashboard(req, res) {
       const detalle = document.getElementById('m-coste-detalle');
       if (detalle) detalle.textContent = 'Cargando...';
       try {
+        // cache: 'no-store' NO ES DECORATIVO. Sin el, el navegador sirve la misma
+        // respuesta del GET una y otra vez: David refrescaba la pagina, llegaban
+        // mensajes nuevos, y las metricas seguian diciendo «2 / 2». El servidor no se
+        // enteraba porque la peticion no llegaba a salir.
         const res = await fetch('/debug/metricas?periodo=' + encodeURIComponent(periodoActivo), {
-          credentials: 'include'
+          credentials: 'include',
+          cache: 'no-store'
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const m = await res.json();
@@ -3496,6 +3501,16 @@ function serveDashboard(req, res) {
 
     async function loadData() {
       lastLoadError = null;
+
+      // LAS METRICAS SE REFRESCAN CON EL RESTO. Estaban solo en la carga inicial, asi
+      // que se quedaban congeladas mientras el historial de abajo se iba actualizando
+      // cada cinco segundos: dos cifras del mismo panel contando cosas distintas.
+      //
+      // Va sin await y con catch propio a proposito: un fallo del resumen no puede
+      // impedir que se cargue el historial de trazas, que es para lo que se abre este
+      // panel cuando algo va mal.
+      cargarMetricas().catch(() => {});
+
       try {
         try {
           const healthRes = await fetch('/health', { credentials: 'include' });
