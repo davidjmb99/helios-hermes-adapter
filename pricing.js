@@ -112,6 +112,53 @@ const CATALOGO = {
         output: 2.50,
         por_modalidad: { audio: { cache_hit: 1.00, cache_miss: 1.00 } }
       }
+    ],
+
+    /**
+     * GEMINI 3.5 FLASH-LITE: el que se usa desde el 24 de agosto de 2026.
+     *
+     * POR QUE SE CAMBIO. `gemini-2.5-flash-lite` sigue en la lista de modelos y sigue en la
+     * pagina de precios, pero Google lo cerro a claves nuevas. Su respuesta, literal: «This
+     * model models/gemini-2.5-flash-lite is no longer available to new users. Please update
+     * your code to use models/gemini-3.5-flash-lite». Un 404, con la clave y el nombre
+     * perfectamente correctos.
+     *
+     * OJO A LA DIFERENCIA QUE IMPORTA: AQUI EL AUDIO NO TIENE TARIFA PROPIA. En 2.5 el audio
+     * costaba el triple que el texto -0,30 frente a 0,10-; en 3.5 todo entra al mismo precio,
+     * 0,30. Asi que NO lleva `por_modalidad`, y copiarlo del modelo anterior habria hecho que
+     * las notas de voz se valoraran a 0,90.
+     *
+     * Lo que si sube es la SALIDA: de 0,40 a 2,50, seis veces. Para transcribir da casi
+     * igual -la salida de una nota de voz son veinte tokens- pero para clasificar imagenes
+     * y videos multiplica el coste por tres. Sigue siendo calderilla: una nota de voz de
+     * treinta segundos pasa de 0,000296 a 0,000338 USD.
+     */
+    "gemini-3.5-flash-lite": [
+      {
+        desde: "1970-01-01T00:00:00Z",
+        cache_hit: 0.30,
+        cache_miss: 0.30,
+        output: 2.50
+        // SIN por_modalidad A PROPOSITO: el audio va al mismo precio que el resto.
+      }
+    ],
+
+    /**
+     * GEMINI 3.1 FLASH-LITE. No se usa, pero esta en el catalogo para poder cambiar de
+     * modelo con una variable de entorno y sin tocar codigo.
+     *
+     * Y PARA QUE CONSTE POR QUE NO SE ELIGIO: su audio cuesta 0,50 frente a los 0,30 de
+     * 3.5. Para lo que hace Helios -sobre todo transcribir notas de voz- sale MAS CARO que
+     * el modelo mas nuevo, aunque su salida sea mas barata.
+     */
+    "gemini-3.1-flash-lite": [
+      {
+        desde: "1970-01-01T00:00:00Z",
+        cache_hit: 0.25,
+        cache_miss: 0.25,
+        output: 1.50,
+        por_modalidad: { audio: { cache_hit: 0.50, cache_miss: 0.50 } }
+      }
     ]
   }
   // openai: { "gpt-...": [...] }  <- añadir aquí cuando toque, sin tocar lógica.

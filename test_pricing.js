@@ -252,3 +252,70 @@ assert.equal(valle.franja, "valle");
 assert.ok(pico.usd > valle.usd, "el recargo de hora pico sigue aplicandose");
 
 console.log("  gemini: audio a 0,30 y el resto a 0,10, sin tocar deepseek");
+
+// ============================================================================
+// GEMINI 3.5 FLASH-LITE: EL AUDIO YA NO TIENE TARIFA PROPIA
+// ============================================================================
+//
+// EL 24 DE AGOSTO DE 2026 HUBO QUE CAMBIAR DE MODELO. gemini-2.5-flash-lite sigue en la
+// lista de modelos de Google y sigue en su pagina de precios, pero esta cerrado a claves
+// nuevas. Su respuesta, literal: «This model models/gemini-2.5-flash-lite is no longer
+// available to new users. Please update your code to use models/gemini-3.5-flash-lite».
+//
+// LA TRAMPA DE ESTE CAMBIO, y es la razon de ser de esta prueba: en 2.5 el audio costaba
+// EL TRIPLE que el texto; en 3.5 va al MISMO precio. Copiar el `por_modalidad` del modelo
+// viejo -que es lo natural al añadir una fila nueva al lado- habria valorado cada nota de
+// voz a 0,90 en vez de 0,30. Tres veces de mas, en silencio, en la cifra que se usa para
+// poner precio al producto.
+
+const AHORA_35 = "2026-08-24T12:00:00Z";
+const coste35 = (modalidad, entrada, salida) => calcularCoste({
+  model: "gemini-3.5-flash-lite", modalidad,
+  input_tokens: entrada, output_tokens: salida, cached_tokens: 0, at: AHORA_35
+});
+
+// TODAS LAS MODALIDADES AL MISMO PRECIO. Esta es la comprobacion que caza el error de
+// copiar por_modalidad del modelo anterior.
+const base35 = coste35(null, 1000, 0).usd;
+for (const m of ["audio", "imagen", "video", "documento", null, "", "cualquiera"]) {
+  assert.ok(
+    Math.abs(coste35(m, 1000, 0).usd - base35) < 1e-12,
+    `3.5-flash-lite, modalidad ${JSON.stringify(m)}: NO tiene tarifa de audio aparte. ` +
+    `Si esto falla, alguien copio el por_modalidad de 2.5 y las notas de voz se estan ` +
+    `valorando al triple`
+  );
+}
+assert.ok(Math.abs(base35 - 1000 * 0.30 / 1e6) < 1e-12, "la entrada de 3.5 son 0,30 por millon");
+assert.ok(
+  Math.abs(coste35(null, 0, 1000).usd - 1000 * 2.50 / 1e6) < 1e-12,
+  "y la salida 2,50: seis veces la de 2.5, que es lo que de verdad cambia"
+);
+
+// Y EL MODELO VIEJO SIGUE VALORANDOSE BIEN. Las filas de antes del cambio existen y su
+// coste no se puede recalcular con la tarifa nueva: cada fila se valora con la suya.
+const vozEn25 = calcularCoste({
+  model: "gemini-2.5-flash-lite", modalidad: "audio",
+  input_tokens: 960, output_tokens: 20, cached_tokens: 0, at: AHORA_35
+});
+assert.ok(
+  Math.abs(vozEn25.usd - (960 * 0.30 + 20 * 0.40) / 1e6) < 1e-12,
+  "una fila vieja de 2.5 se sigue valorando con la tarifa de 2.5"
+);
+
+// LA COMPARACION QUE JUSTIFICA LA ELECCION, para que no haya que rehacerla:
+//
+//                         2.5-lite      3.5-lite      3.1-lite
+//   nota de voz 30s      0,000296      0,000338      0,000510
+//   imagen               0,000032      0,000115      0,000087
+//   video 10s            0,000804      0,002425      0,002015
+//
+// Se eligio 3.5 y no 3.1 porque el caso dominante de Helios es TRANSCRIBIR, y ahi 3.1
+// sale mas caro pese a tener la salida mas barata: su audio cuesta 0,50 frente a 0,30.
+const voz35 = coste35("audio", 960, 20).usd;
+const voz31 = calcularCoste({
+  model: "gemini-3.1-flash-lite", modalidad: "audio",
+  input_tokens: 960, output_tokens: 20, cached_tokens: 0, at: AHORA_35
+}).usd;
+assert.ok(voz35 < voz31, "para transcribir, 3.5 es mas barato que 3.1");
+
+console.log("  gemini 3.5: audio al mismo precio que el texto, y 2.5 sigue valorandose");
