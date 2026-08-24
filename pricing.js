@@ -354,8 +354,27 @@ function formatearUsd(valor) {
   return "$" + valor.toFixed(4);
 }
 
+/**
+ * Formato de SEIS decimales, siempre, para las cifras del panel de gasto.
+ *
+ * POR QUE NO VALE `formatearUsd` AQUI. Ese usa cuatro decimales por encima de un centavo,
+ * y el total del periodo suma dos cosas de magnitudes muy distintas: el texto de DeepSeek
+ * ronda los 0,02 y los archivos de Gemini los 0,00008. A cuatro decimales los archivos
+ * DESAPARECEN, y el resultado es un panel con la tarjeta del total y la del texto marcando
+ * exactamente lo mismo: parece que el gasto de Gemini no se esta contando.
+ *
+ * Lo pregunto David el 24 de agosto: «¿cuanto es el costo total sumando lo de deepseek y
+ * lo de gemini?». Si hay que preguntarlo mirando el panel, el panel esta mal.
+ */
+function formatearUsdFino(valor) {
+  if (!Number.isFinite(valor)) return "N/A";
+  if (valor === 0) return "$0";
+  return "$" + valor.toFixed(6);
+}
+
 module.exports = {
   CATALOGO,
+  formatearUsdFino,
   calcularCoste,
   modeloConTarifa,
   formatearUsd,

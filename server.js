@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
-const { calcularCoste, formatearUsd, modeloConTarifa } = require("./pricing");
+const { calcularCoste, formatearUsd, formatearUsdFino, modeloConTarifa } = require("./pricing");
 const {
   PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos, resumirMedia
 } = require("./metricas");
@@ -2572,19 +2572,19 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
       // El coste de texto conserva su nombre propio, para que en el panel se pueda
       // separar de verdad y no por resta.
       coste_texto_usd: costeDeTexto,
-      coste_texto_usd_texto: formatearUsd(costeDeTexto),
+      coste_texto_usd_texto: formatearUsdFino(costeDeTexto),
 
       media,
       media_truncado: mediaTruncado,
       media_error: mediaError,
       coste_media_usd: costeDeMedia,
-      coste_media_usd_texto: media ? formatearUsd(costeDeMedia) : null,
+      coste_media_usd_texto: media ? formatearUsdFino(costeDeMedia) : null,
 
       coste_total_usd: costeTotal,
       coste_total_completo: totalCompleto,
-      coste_usd_texto: formatearUsd(costeTotal),
+      coste_usd_texto: formatearUsdFino(costeTotal),
       coste_por_saliente: costePorSaliente,
-      coste_por_saliente_texto: costePorSaliente === null ? null : formatearUsd(costePorSaliente)
+      coste_por_saliente_texto: costePorSaliente === null ? null : formatearUsdFino(costePorSaliente)
     });
   } catch (error) {
     console.error(JSON.stringify({

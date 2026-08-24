@@ -319,3 +319,42 @@ const voz31 = calcularCoste({
 assert.ok(voz35 < voz31, "para transcribir, 3.5 es mas barato que 3.1");
 
 console.log("  gemini 3.5: audio al mismo precio que el texto, y 2.5 sigue valorandose");
+
+// ============================================================================
+// EL TOTAL DEL PANEL TIENE QUE VERSE, NO SOLO CALCULARSE
+// ============================================================================
+//
+// LO PREGUNTO DAVID MIRANDO EL PANEL: «¿cuanto es el costo total sumando lo de deepseek y
+// lo de gemini?». La tarjeta del total YA era la suma, pero a cuatro decimales el gasto
+// de Gemini desaparecia y las tarjetas «Coste del periodo» y «Texto» marcaban exactamente
+// lo mismo: $0.0249 las dos. Parecia que Gemini no se estaba contando.
+//
+// SI HAY QUE PREGUNTAR EL TOTAL MIRANDO EL PANEL, EL PANEL ESTA MAL. El problema no era
+// la suma, era la precision: el texto ronda 0,02 y los archivos 0,00008, y a cuatro
+// decimales una de las dos cifras no existe.
+
+const { formatearUsdFino } = require("./pricing");
+
+assert.equal(formatearUsdFino(0.0249 + 0.000081), "$0.024981", "el total se ve entero");
+assert.equal(formatearUsdFino(0.0249), "$0.024900");
+assert.equal(
+  formatearUsdFino(0.000081), "$0.000081",
+  "y el gasto de los archivos NO se redondea a cero"
+);
+assert.notEqual(
+  formatearUsdFino(0.0249 + 0.000081), formatearUsdFino(0.0249),
+  "el total y el gasto de texto TIENEN que verse distintos: si salen iguales, el panel " +
+  "hace pensar que el gasto de Gemini no se cuenta"
+);
+
+// El cero se dice «$0» y no «$0.000000»: una columna de ceros con seis decimales es ruido.
+assert.equal(formatearUsdFino(0), "$0");
+assert.equal(formatearUsdFino(NaN), "N/A");
+assert.equal(formatearUsdFino(null), "N/A");
+assert.equal(formatearUsdFino(undefined), "N/A");
+
+// Y `formatearUsd` NO se toca: lo usa el coste por mensaje del detalle de traza, donde
+// cuatro decimales estan bien y seis serian ruido.
+assert.equal(formatearUsd(0.0249), "$0.0249", "formatearUsd sigue como estaba");
+
+console.log("  el total del panel se ve con los seis decimales");
