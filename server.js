@@ -2395,6 +2395,16 @@ function serveLoginPage(req, res) {
         </div>
       </div>
 
+      <!--
+        SOLO EL USUARIO, NUNCA LA CONTRASEÑA. Guardar una contraseña en localStorage es
+        dejarla al alcance de cualquier JavaScript de la pagina; para eso ya esta el gestor
+        del navegador, que la cifra y la protege como es debido.
+      -->
+      <label style="display:flex; align-items:center; gap:.5rem; font-size:.8rem; color:#94a3b8; cursor:pointer; user-select:none; margin-bottom:1rem;">
+        <input type="checkbox" id="recordar-usuario">
+        Recordar mi usuario en este equipo
+      </label>
+
       <button type="submit" class="btn-submit">Iniciar Sesión</button>
     </form>
   </div>
@@ -2422,6 +2432,19 @@ function serveLoginPage(req, res) {
       }
     });
 
+    // Al abrir la pantalla, se rellena el usuario recordado y el foco salta a la
+    // contraseña: si el cursor siguiera cayendo en el usuario habria que saltarlo a mano
+    // cada vez, y lo recordado no ahorraria nada.
+    (function ponerUsuarioRecordado() {
+      const guardado = localStorage.getItem('helios_usuario_recordado');
+      if (!guardado) return;
+      const userEl = document.getElementById('username');
+      const recordar = document.getElementById('recordar-usuario');
+      if (userEl) userEl.value = guardado;
+      if (recordar) recordar.checked = true;
+      if (passwordInput) passwordInput.focus();
+    })();
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       errorBox.style.display = 'none';
@@ -2437,6 +2460,17 @@ function serveLoginPage(req, res) {
           },
           body: JSON.stringify({ username, password })
         });
+
+        // Se decide DESPUES de que el login vaya bien: recordar un usuario con el que no se
+        // ha podido entrar solo sirve para que la proxima vez tampoco funcione.
+        if (response.ok) {
+          const recordar = document.getElementById('recordar-usuario');
+          if (recordar && recordar.checked) {
+            localStorage.setItem('helios_usuario_recordado', String(username).trim());
+          } else {
+            localStorage.removeItem('helios_usuario_recordado');
+          }
+        }
 
         const data = await response.json();
 

@@ -367,3 +367,41 @@ assert.ok(
 );
 
 console.log("  reparto de coste: tarjetas, aviso de nivel y total OK");
+
+// --- RECORDAR EL USUARIO: SOLO EL USUARIO ----------------------------------
+//
+// Lo pidio David para no teclear su usuario cada vez. Lo que se comprueba aqui NO es que
+// funcione -eso se ve al usarlo- sino que NO SE GUARDE LA CONTRASEÑA.
+//
+// localStorage esta al alcance de cualquier JavaScript de la pagina: es exactamente lo que
+// leeria un XSS. Una contraseña ahi es una contraseña regalada, y el gestor del navegador
+// ya hace esto bien -cifrado y protegido por el sistema-.
+
+{
+  const login = todosLosBloques.join('\n');
+
+  assert.ok(
+    /localStorage\.setItem\('helios_usuario_recordado'/.test(login),
+    'tiene que guardar el usuario recordado'
+  );
+  assert.ok(
+    !/localStorage\.setItem\([^)]*(password|contrasena|contraseña|clave)/i.test(login),
+    'y NUNCA la contraseña: localStorage lo lee cualquier script de la pagina'
+  );
+
+  // Y SE GUARDA DESPUES DE QUE EL LOGIN VAYA BIEN. Recordar un usuario con el que no se ha
+  // podido entrar solo sirve para que la proxima vez tampoco funcione.
+  assert.ok(
+    /if \(response\.ok\)[\s\S]{0,300}?helios_usuario_recordado/.test(login),
+    'el usuario se recuerda solo si el login funciono'
+  );
+
+  // Al desmarcar la casilla se OLVIDA. Sin esto, quitar la marca no quitaria nada y el
+  // usuario seguiria apareciendo en un equipo compartido.
+  assert.ok(
+    /localStorage\.removeItem\('helios_usuario_recordado'\)/.test(login),
+    'al desmarcar la casilla se olvida'
+  );
+}
+
+console.log("  recordar usuario: se guarda el usuario, nunca la contraseña");
