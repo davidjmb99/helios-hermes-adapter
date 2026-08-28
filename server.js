@@ -5,6 +5,7 @@ const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, formatearUsdFino, modeloConTarifa } = require("./pricing");
+const { leerCuenta, filtrarPorCuenta, cuentasDeFilas } = require("./filtro-de-cuenta");
 const {
   PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos, resumirMedia
 } = require("./metricas");
@@ -2518,6 +2519,14 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
       return res.status(400).json({ error: true, error_code: "PERIODO_INVALIDO", validos: Object.keys(PERIODOS) });
     }
 
+    // QUE CLINICA SE ESTA MIRANDO. Sin esto el gasto SUMA TODAS: con una sola no se nota,
+    // con dos la cifra deja de significar nada y se usa para decidir.
+    const filtro = leerCuenta(req.query.cuenta);
+    if (filtro.error) {
+      return res.status(400).json({ error: true, error_code: "CUENTA_INVALIDA" });
+    }
+    const cuenta = filtro.cuenta;
+
     const ahora = new Date();
     const desde = inicioDelPeriodo(periodo, ahora);
 
@@ -2529,13 +2538,16 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
     const eventos = [];
     let truncado = false;
     for (let inicio = 0; inicio < TOPE_FILAS; inicio += PAGINA) {
-      const { data, error } = await supabase
-        .from("helios_adapter_events")
-        // Solo las columnas que la suma necesita: traer message_content o
-        // contract_debug de miles de filas seria mover megabytes de datos de
-        // pacientes para contar tokens.
-        .select("created_at, status, safe_to_send, input_tokens, output_tokens, cache_read_tokens, model")
-        .gte("created_at", desde.toISOString())
+      const { data, error } = await filtrarPorCuenta(
+        supabase
+          .from("helios_adapter_events")
+          // Solo las columnas que la suma necesita: traer message_content o
+          // contract_debug de miles de filas seria mover megabytes de datos de
+          // pacientes para contar tokens.
+          .select("created_at, status, safe_to_send, input_tokens, output_tokens, cache_read_tokens, model")
+          .gte("created_at", desde.toISOString()),
+        cuenta
+      )
         .order("created_at", { ascending: false })
         .range(inicio, inicio + PAGINA - 1);
 
@@ -2561,10 +2573,15 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
     try {
       const filasDeMedia = [];
       for (let inicio = 0; inicio < TOPE_FILAS; inicio += PAGINA) {
-        const { data, error } = await supabase
-          .from("helios_media_events")
-          .select("created_at, tipo, accion, modelo, nivel, input_tokens, output_tokens")
-          .gte("created_at", desde.toISOString())
+        // LAS DOS CONSULTAS FILTRAN. El gasto de texto y el de los archivos salen de
+        // tablas distintas; filtrar solo una daria un total mezclado con pinta de exacto.
+        const { data, error } = await filtrarPorCuenta(
+          supabase
+            .from("helios_media_events")
+            .select("created_at, tipo, accion, modelo, nivel, input_tokens, output_tokens")
+            .gte("created_at", desde.toISOString()),
+          cuenta
+        )
           .order("created_at", { ascending: false })
           .range(inicio, inicio + PAGINA - 1);
 
@@ -2629,11 +2646,38 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
   }
 });
 
+// LAS CUENTAS QUE HAY, para el desplegable del panel.
+//
+// Salen de `helios_tenants` y no de las trazas: asi aparece tambien una clinica recien
+// dada de alta que todavia no ha tenido ni un mensaje, que es justo cuando mas se mira el
+// panel para comprobar que llega algo.
+app.get("/debug/cuentas", requireDebugAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error("Supabase is not initialized.");
+    const { data, error } = await supabase
+      .from("helios_tenants")
+      .select("tenant_id, name");
+    if (error) throw error;
+    return res.json({ ok: true, cuentas: cuentasDeFilas(data) });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "cuentas_fallidas", error_code: error?.code || "CUENTAS_QUERY_FAILED" }));
+    return res.status(500).json({ error: true, error_code: "CUENTAS_QUERY_FAILED" });
+  }
+});
+
 app.get("/debug/events", requireDebugAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error("Supabase is not initialized.");
     
     const { status, trace_id, conversation_id, limit = '50' } = req.query;
+
+    // MISMO FILTRO QUE EL GASTO, y a proposito el mismo codigo: el gasto y las trazas se
+    // miran a la vez, y si uno filtrara y el otro no se compararian dos cosas distintas
+    // creyendo que son la misma, sin nada en pantalla que lo delate.
+    const filtro = leerCuenta(req.query.cuenta);
+    if (filtro.error) {
+      return res.status(400).json({ error: true, error_code: "CUENTA_INVALIDA" });
+    }
     
     const allowlistStatus = [
       'processing',
@@ -2661,6 +2705,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
+    query = filtrarPorCuenta(query, filtro.cuenta);
     if (status) query = query.eq('status', status);
     if (trace_id) query = query.eq('trace_id', trace_id);
     if (conversation_id) query = query.eq('conversation_id', conversation_id);
@@ -3319,7 +3364,13 @@ function serveDashboard(req, res) {
   <section id="metricas" style="margin: 0 0 1.5rem 0;">
     <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:0.75rem; margin-bottom:0.75rem;">
       <h2 style="font-size:1rem; margin:0; color:var(--primary);">Gasto y mensajes</h2>
-      <div id="metricas-periodos" style="display:flex; gap:0.35rem; flex-wrap:wrap;"></div>
+      <div style="display:flex; gap:0.6rem; flex-wrap:wrap; align-items:center;">
+        <div id="metricas-periodos" style="display:flex; gap:0.35rem; flex-wrap:wrap;"></div>
+        <select id="selector-cuenta" title="Que clinica se esta mirando"
+                style="background: rgba(255,255,255,0.04); color:#e6edf3; border:1px solid rgba(255,255,255,0.12); border-radius:6px; padding:0.3rem 0.6rem; font-size:0.78rem;">
+          <option value="">Todas las cuentas</option>
+        </select>
+      </div>
     </div>
     <div id="metricas-aviso" style="display:none; font-size:0.8rem; padding:0.6rem 0.8rem; border-radius:8px; margin-bottom:0.75rem;"></div>
     <!--
@@ -3496,8 +3547,57 @@ function serveDashboard(req, res) {
       ['3meses', '3 meses'], ['6meses', '6 meses'], ['ano', 'Año']
     ];
     let periodoActivo = 'dia';
+    // Vacio es «todas», que es lo que habia antes de existir el selector.
+    let cuentaActiva = '';
 
     const miles = (n) => Number(n || 0).toLocaleString('es-VE');
+
+    /**
+     * Rellena el desplegable de cuentas.
+     *
+     * SI FALLA, SE QUEDA CON «Todas» Y NO SE ROMPE NADA. El panel sin selector es el panel
+     * de antes, que funcionaba; un panel que no carga porque una consulta secundaria fallo
+     * es peor que uno sin desplegable.
+     */
+    async function cargarCuentas() {
+      const sel = document.getElementById('selector-cuenta');
+      if (!sel) return;
+      try {
+        const res = await fetch('/debug/cuentas', { credentials: 'include' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const cuentas = Array.isArray(data.cuentas) ? data.cuentas : [];
+        if (cuentas.length === 0) return;
+
+        sel.innerHTML = '<option value="">Todas las cuentas</option>'
+          + cuentas.map(function (c) {
+              return '<option value="' + escapeHtml(c.tenant_id) + '">' + escapeHtml(c.nombre) + '</option>';
+            }).join('');
+
+        // Se recuerda la ultima mirada. No es un permiso -aqui se ven todas de todas
+        // formas- es no tener que elegirla en cada visita.
+        try {
+          const guardada = localStorage.getItem('helios_cuenta_panel') || '';
+          if (guardada && cuentas.some(function (c) { return c.tenant_id === guardada; })) {
+            cuentaActiva = guardada;
+            sel.value = guardada;
+          }
+        } catch (e) { /* sin memoria: se queda en «todas» */ }
+      } catch (e) { /* el panel sigue, con «todas» */ }
+    }
+
+    function cablearSelectorDeCuenta() {
+      const sel = document.getElementById('selector-cuenta');
+      if (!sel) return;
+      sel.addEventListener('change', function () {
+        cuentaActiva = sel.value || '';
+        try { localStorage.setItem('helios_cuenta_panel', cuentaActiva); } catch (e) {}
+        // LAS DOS COSAS A LA VEZ. El gasto y las trazas se miran juntos: recargar solo una
+        // dejaria media pantalla hablando de otra clinica.
+        cargarMetricas();
+        loadData();
+      });
+    }
 
     function pintarBotonesDePeriodo() {
       const caja = document.getElementById('metricas-periodos');
@@ -3563,7 +3663,7 @@ function serveDashboard(req, res) {
         // respuesta del GET una y otra vez: David refrescaba la pagina, llegaban
         // mensajes nuevos, y las metricas seguian diciendo «2 / 2». El servidor no se
         // enteraba porque la peticion no llegaba a salir.
-        const res = await fetch('/debug/metricas?periodo=' + encodeURIComponent(periodoActivo), {
+        const res = await fetch('/debug/metricas?periodo=' + encodeURIComponent(periodoActivo) + '&cuenta=' + encodeURIComponent(cuentaActiva), {
           credentials: 'include',
           cache: 'no-store'
         });
@@ -3686,7 +3786,12 @@ function serveDashboard(req, res) {
     }
 
     pintarBotonesDePeriodo();
-    cargarMetricas();
+    // El desplegable primero: si hay una cuenta recordada, las metricas se piden ya
+    // filtradas en vez de cargar el total de todas y cambiarlo un segundo despues.
+    cargarCuentas().then(function () {
+      cablearSelectorDeCuenta();
+      cargarMetricas();
+    });
 
     function logout() {
       const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
@@ -3740,7 +3845,7 @@ function serveDashboard(req, res) {
           }
         } catch (_) {}
 
-        const eventsUrl = '/debug/events';
+        const eventsUrl = '/debug/events?cuenta=' + encodeURIComponent(cuentaActiva);
         const res = await fetch(eventsUrl, { credentials: 'include' });
 
         lastLoadStatus = res.status;
