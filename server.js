@@ -6,6 +6,8 @@ const { createHermesAgentClient } = require("./hermes-agent-client");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, formatearUsdFino, modeloConTarifa } = require("./pricing");
 const { leerCuenta, filtrarPorCuenta, cuentasDeFilas } = require("./filtro-de-cuenta");
+const { crearSesion, leerSesion, cuentaQueSeVe, cuentasQueSeVen } = require("./sesion-de-panel");
+const { verificarContrasena } = require("./contrasenas");
 const {
   PERIODOS, esPeriodoValido, inicioDelPeriodo, resumirEventos, resumirMedia
 } = require("./metricas");
@@ -566,8 +568,24 @@ function getBasicAuthCredentials(req) {
   }
 }
 
+/**
+ * Quien entra, si es alguien de la tabla de clinicas.
+ *
+ * Se cuelga de `req` para que los endpoints no tengan que volver a leer la cookie, y sobre
+ * todo para que no puedan OLVIDARSE: `req.sesionPanel` en null significa «puerta de
+ * servicio», que es una respuesta, no una ausencia.
+ */
+function sesionDelPanel(req) {
+  if (req.sesionPanel !== undefined) return req.sesionPanel;
+  req.sesionPanel = leerSesion(getCookie(req, "panel_token"), sessionSecret);
+  return req.sesionPanel;
+}
+
 function isDebugAuthorized(req) {
-  // A) Verificar cookie de sesión personalizada
+  // A) LA SESION DE LA TABLA DE CLINICAS, que es la misma que el panel del gateway.
+  if (sesionDelPanel(req)) return true;
+
+  // B) La puerta de servicio: contraseña de entorno.
   if (DEBUG_USERNAME && DEBUG_PASSWORD) {
     const cookieToken = getCookie(req, "debug_token");
     const expectedToken = crypto.createHmac('sha256', sessionSecret)
@@ -2174,28 +2192,86 @@ app.get("/health", async (req, res) => {
 
 // Endpoint para procesar el Login (POST)
 app.post("/debug/logout", (req, res) => {
-    res.setHeader('Set-Cookie', 'debug_token=; Path=/; HttpOnly; Max-Age=0');
+    // LAS DOS COOKIES. Hay dos puertas de entrada -la tabla de clinicas y la contraseña de
+    // entorno- y borrar solo una deja dentro a quien entro por la otra. Un boton de salir
+    // que no saca es peor que no tenerlo, porque quien lo pulsa se cree fuera.
+    res.setHeader('Set-Cookie', [
+      'debug_token=; Path=/; HttpOnly; Max-Age=0',
+      'panel_token=; Path=/; HttpOnly; Max-Age=0'
+    ]);
     res.json({ ok: true });
 });
 
-app.post("/login", (req, res) => {
+/**
+ * Entrar al panel.
+ *
+ * DOS PUERTAS, Y EL ORDEN IMPORTA:
+ *
+ *   1. LA TABLA DE CLINICAS, que es la misma que el panel del gateway. Asi un usuario
+ *      entra en los dos sitios con la misma contraseña, y un operador ve todas las cuentas
+ *      mientras que una clinica ve la suya.
+ *
+ *   2. LA CONTRASEÑA DE ENTORNO, que sigue valiendo. Es la puerta de servicio: si Supabase
+ *      no responde o la tabla esta a medias, el equipo tecnico tiene que poder entrar a
+ *      mirar POR QUE. Quitarla dejaria el diagnostico dependiendo de lo que se diagnostica.
+ *
+ * SE INTENTA LA TABLA PRIMERO. Si se hiciera al reves, un usuario que existiera en los dos
+ * sitios entraria siempre por la puerta de servicio y nunca veria su cuenta.
+ */
+app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
-  
-  if (!DEBUG_USERNAME || !DEBUG_PASSWORD) {
-    return res.status(403).json({ ok: false, error: "Servicio no configurado para autenticación." });
+  const usuario = String(username || "").trim();
+  const clave = String(password || "");
+
+  if (usuario && clave && supabase) {
+    try {
+      const { data, error } = await supabase
+        .from("helios_tenants")
+        .select("tenant_id, username, password_hash, es_operador")
+        .eq("username", usuario)
+        .maybeSingle();
+
+      if (!error && data && verificarContrasena(clave, data.password_hash)) {
+        const token = crearSesion({
+          tenantId: data.tenant_id,
+          operador: data.es_operador === true,
+          secreto: sessionSecret
+        });
+        const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+        res.setHeader("Set-Cookie", `panel_token=${token}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=28800`);
+        console.log(JSON.stringify({
+          event: "panel_login",
+          via: "clinicas",
+          tenant_id: data.tenant_id,
+          operador: data.es_operador === true
+        }));
+        return res.json({ ok: true, operador: data.es_operador === true });
+      }
+    } catch (error) {
+      // NO SE CORTA AQUI. Si la tabla no responde, todavia queda la puerta de servicio, y
+      // es precisamente el momento en que hace falta.
+      console.error(JSON.stringify({ event: "panel_login_tabla_fallida", error_code: error?.code || "LOGIN_QUERY_FAILED" }));
+    }
   }
 
-  if (safeCompare(username, DEBUG_USERNAME) && safeCompare(password, DEBUG_PASSWORD)) {
+  if (DEBUG_USERNAME && DEBUG_PASSWORD
+      && safeCompare(usuario, DEBUG_USERNAME) && safeCompare(clave, DEBUG_PASSWORD)) {
     const expectedToken = crypto.createHmac('sha256', sessionSecret)
       .update(`${DEBUG_USERNAME}:${DEBUG_PASSWORD}`)
       .digest('hex');
-    
+
     const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
     res.setHeader("Set-Cookie", `debug_token=${expectedToken}; Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=28800`);
-    
-    return res.json({ ok: true });
+    console.log(JSON.stringify({ event: "panel_login", via: "puerta_de_servicio" }));
+    return res.json({ ok: true, operador: true });
   }
 
+  if (!DEBUG_USERNAME && !DEBUG_PASSWORD && !supabase) {
+    return res.status(403).json({ ok: false, error: "Servicio no configurado para autenticación." });
+  }
+
+  // EL MISMO MENSAJE PARA LAS DOS PUERTAS. Distinguir «ese usuario no existe» de «esa
+  // contraseña no es» dice cuales existen.
   return res.status(401).json({ ok: false, error: "Usuario o contraseña incorrectos." });
 });
 
@@ -2525,7 +2601,9 @@ app.get("/debug/metricas", requireDebugAuth, async (req, res) => {
     if (filtro.error) {
       return res.status(400).json({ error: true, error_code: "CUENTA_INVALIDA" });
     }
-    const cuenta = filtro.cuenta;
+    // LA CUENTA LA DECIDE LA SESION, NO LA URL. A una clinica se le ignora el parametro:
+    // rechazarlo con un error distinto segun la cuenta existiera o no le diria cuales hay.
+    const cuenta = cuentaQueSeVe(sesionDelPanel(req), filtro.cuenta);
 
     const ahora = new Date();
     const desde = inicioDelPeriodo(periodo, ahora);
@@ -2658,7 +2736,15 @@ app.get("/debug/cuentas", requireDebugAuth, async (req, res) => {
       .from("helios_tenants")
       .select("tenant_id, name");
     if (error) throw error;
-    return res.json({ ok: true, cuentas: cuentasDeFilas(data) });
+
+    // A UNA CLINICA, LA SUYA Y NADA MAS. Enseñarle los nombres de las demas ya seria
+    // contarle quienes son los otros clientes.
+    const sesion = sesionDelPanel(req);
+    return res.json({
+      ok: true,
+      operador: !sesion || sesion.operador === true,
+      cuentas: cuentasQueSeVen(sesion, cuentasDeFilas(data))
+    });
   } catch (error) {
     console.error(JSON.stringify({ event: "cuentas_fallidas", error_code: error?.code || "CUENTAS_QUERY_FAILED" }));
     return res.status(500).json({ error: true, error_code: "CUENTAS_QUERY_FAILED" });
@@ -2705,7 +2791,7 @@ app.get("/debug/events", requireDebugAuth, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(queryLimit);
 
-    query = filtrarPorCuenta(query, filtro.cuenta);
+    query = filtrarPorCuenta(query, cuentaQueSeVe(sesionDelPanel(req), filtro.cuenta));
     if (status) query = query.eq('status', status);
     if (trace_id) query = query.eq('trace_id', trace_id);
     if (conversation_id) query = query.eq('conversation_id', conversation_id);
@@ -3796,7 +3882,11 @@ function serveDashboard(req, res) {
     function logout() {
       const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
       const cookieOptions = isSecure ? '; Path=/; Secure; SameSite=Lax' : '; Path=/; SameSite=Lax';
+      // LAS DOS COOKIES. Hay dos puertas -la tabla de clinicas y la contraseña de
+      // entorno- y borrar solo una deja a quien entro por la otra dentro despues de darle
+      // a «salir». Un boton de salir que no saca es peor que no tenerlo.
       document.cookie = 'debug_token=; Expires=Thu, 01 Jan 1970 00:00:01 GMT' + cookieOptions;
+      document.cookie = 'panel_token=; Expires=Thu, 01 Jan 1970 00:00:01 GMT' + cookieOptions;
       
       fetch('/logout', { credentials: 'include' }).catch(() => {}).finally(() => {
         window.location.replace('/');
