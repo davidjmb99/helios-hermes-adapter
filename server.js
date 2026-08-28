@@ -2734,8 +2734,13 @@ app.get("/debug/cuentas", requireDebugAuth, async (req, res) => {
     if (!supabase) throw new Error("Supabase is not initialized.");
     const { data, error } = await supabase
       .from("helios_tenants")
-      .select("tenant_id, name");
+      .select("tenant_id, name, es_operador");
     if (error) throw error;
+
+    // UNA CUENTA DE OPERADOR NO ES UNA CLINICA. Es la de quien mira el panel -Escala365-
+    // y no tiene pacientes, asi que elegirla enseña ceros y confunde. El total de la
+    // empresa YA es «Todas las cuentas»: es literalmente la suma de todas.
+    const clinicas = (data || []).filter(fila => fila && fila.es_operador !== true);
 
     // A UNA CLINICA, LA SUYA Y NADA MAS. Enseñarle los nombres de las demas ya seria
     // contarle quienes son los otros clientes.
@@ -2743,7 +2748,7 @@ app.get("/debug/cuentas", requireDebugAuth, async (req, res) => {
     return res.json({
       ok: true,
       operador: !sesion || sesion.operador === true,
-      cuentas: cuentasQueSeVen(sesion, cuentasDeFilas(data))
+      cuentas: cuentasQueSeVen(sesion, cuentasDeFilas(clinicas))
     });
   } catch (error) {
     console.error(JSON.stringify({ event: "cuentas_fallidas", error_code: error?.code || "CUENTAS_QUERY_FAILED" }));
@@ -3082,6 +3087,21 @@ function serveDashboard(req, res) {
     .controls {
       display: flex;
       gap: 0.75rem;
+    }
+
+    /*
+     * LA LISTA DESPLEGABLE SE PINTA APARTE.
+     *
+     * Estaba pintado solo el elemento select, y en Windows la lista de opciones la dibuja
+     * el sistema con fondo blanco: con el texto en claro no se leia nada. El select y sus
+     * option son dos superficies distintas aunque parezcan una.
+     *
+     * (Y este comentario no lleva comillas invertidas a proposito: vive dentro de una
+     * plantilla de JavaScript, donde una sola cierra la cadena y rompe el archivo entero.)
+     */
+    #selector-cuenta option {
+      background: #0f172a;
+      color: #e6edf3;
     }
 
     .btn {
@@ -3456,6 +3476,8 @@ function serveDashboard(req, res) {
                 style="background: rgba(255,255,255,0.04); color:#e6edf3; border:1px solid rgba(255,255,255,0.12); border-radius:6px; padding:0.3rem 0.6rem; font-size:0.78rem;">
           <option value="">Todas las cuentas</option>
         </select>
+        <!-- El texto de la primera opcion lo pone cargarCuentas: para un operador es el
+             total de Escala365, y para una clinica no tiene sentido y no aparece. -->
       </div>
     </div>
     <div id="metricas-aviso" style="display:none; font-size:0.8rem; padding:0.6rem 0.8rem; border-radius:8px; margin-bottom:0.75rem;"></div>
@@ -3655,10 +3677,26 @@ function serveDashboard(req, res) {
         const cuentas = Array.isArray(data.cuentas) ? data.cuentas : [];
         if (cuentas.length === 0) return;
 
-        sel.innerHTML = '<option value="">Todas las cuentas</option>'
+        // «TODAS» ES EL TOTAL DE LA EMPRESA, y para un operador conviene que lo diga: es
+        // el numero que contesta «cuanto gasto y cuanto trafico tengo como proveedor».
+        //
+        // A UNA CLINICA NO SE LE OFRECE. Para ella «todas» es la suya, asi que la opcion
+        // seria una segunda forma de elegir lo mismo, y ademas insinuaria que hay otras.
+        const esOperador = data.operador === true;
+        const primera = esOperador
+          ? '<option value="">Todas las cuentas · Escala365</option>'
+          : '';
+
+        sel.innerHTML = primera
           + cuentas.map(function (c) {
               return '<option value="' + escapeHtml(c.tenant_id) + '">' + escapeHtml(c.nombre) + '</option>';
             }).join('');
+
+        // Y si solo hay una, el desplegable no pinta nada: se esconde y se fija esa.
+        if (!esOperador && cuentas.length === 1) {
+          cuentaActiva = cuentas[0].tenant_id;
+          sel.style.display = 'none';
+        }
 
         // Se recuerda la ultima mirada. No es un permiso -aqui se ven todas de todas
         // formas- es no tener que elegirla en cada visita.

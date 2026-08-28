@@ -222,4 +222,43 @@ const clinica = crearSesion({ tenantId: "lapaz", operador: false, secreto: SECRE
   assert.ok(cuerpoLogout.includes("panel_token="), "el logout del navegador borra las dos");
 }
 
+
+// --- EL DESPLEGABLE, TAL COMO SE VE ---------------------------------------
+
+{
+  const fs = require("fs");
+  const fuente = fs.readFileSync("server.js", "utf8");
+
+  // 1. LAS OPCIONES SE PINTAN APARTE DEL SELECT. En Windows la lista la dibuja el sistema
+  //    con fondo blanco: con solo el select pintado, el texto claro no se leia.
+  assert.ok(
+    /#selector-cuenta option\s*\{/.test(fuente),
+    "las option necesitan su propio color: el select y su lista son dos superficies"
+  );
+
+  // 2. UN OPERADOR NO ES UNA CLINICA. Su fila no tiene pacientes: elegirla enseña ceros.
+  const cuentas = fuente.slice(
+    fuente.indexOf('app.get("/debug/cuentas"'),
+    fuente.indexOf('app.get("/debug/events"')
+  );
+  assert.ok(
+    cuentas.includes("es_operador !== true"),
+    "las cuentas de operador no salen en la lista de clinicas"
+  );
+
+  // 3. «Todas» SOLO PARA UN OPERADOR. Para una clinica, «todas» es la suya: ofrecerlo
+  //    seria una segunda forma de elegir lo mismo, e insinuaria que hay otras.
+  const cargar = fuente.indexOf("async function cargarCuentas()");
+  const cuerpo = fuente.slice(cargar, cargar + 2200);
+  assert.ok(cuerpo.includes("data.operador === true"), "mira si quien pregunta es operador");
+  assert.ok(
+    cuerpo.includes("Todas las cuentas · Escala365"),
+    "y para el, «todas» se llama por su nombre: el total de la empresa"
+  );
+  assert.ok(
+    /esOperador\s*\?/.test(cuerpo),
+    "la primera opcion depende de eso, no sale siempre"
+  );
+}
+
 console.log("test_sesion_de_panel: OK");
