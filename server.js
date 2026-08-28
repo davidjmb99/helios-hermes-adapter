@@ -4714,6 +4714,22 @@ app.post("/helios/message", async (req, res) => {
     rawResponseText = result.answer || "";
     processingStage = "hermes_response_received";
 
+    // TITULAR LA SESION AQUI, EN CUANTO SE SABE CUAL ES, y no solo al final.
+    //
+    // Antes solo se hacia despues de persistir el turno, o sea unicamente cuando todo
+    // salia bien. Un turno que revienta antes -un contrato vetado, una excepcion- se
+    // quedaba con el nombre que Hermes le pone por defecto: la primera linea del prompt.
+    // En el WebUI salian varias sesiones llamadas «OUTPUT CONTRACT (REQUIRED)»,
+    // indistinguibles entre si.
+    //
+    // Y son justo las que hay que encontrar. Una sesion que fallo es la que alguien va a
+    // ir a buscar; la que salio bien no la mira nadie.
+    //
+    // Se vuelve a llamar mas abajo con la respuesta ya normalizada, para cambiar
+    // «Helios · Conversacion 84» por «David Mercado · Conversacion 84» en cuanto se
+    // conoce el nombre. La segunda llamada no repite trabajo: hay un guard por titulo.
+    ensureHermesSessionTitle(sessionId, normalized, null).catch(() => {});
+
     debugEvent.hermes_session_id = sessionId;
     debugEvent.hermes_stream_id = streamId;
     if (result.tokenUsage) {
