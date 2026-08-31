@@ -92,6 +92,23 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const TOKEN_ESTIMATION_ENABLED = process.env.TOKEN_ESTIMATION_ENABLED === "true";
 const HELIOS_ADMIN_SHOW_PII = process.env.HELIOS_ADMIN_SHOW_PII === "true";
 const ADAPTER_EXECUTION_LEASE_MS_CONFIGURED = Number(process.env.ADAPTER_EXECUTION_LEASE_MS || 180000);
+
+// CUANTAS VECES SE VUELVE A LLAMAR A HERMES cuando un turno quedo guardado como
+// «completed» pero su resultado fue un fallo que nunca llego al paciente.
+//
+// EN CERO -EL VALOR POR DEFECTO- NO SE REABRE NADA y el Adapter se comporta exactamente
+// como antes: devuelve el resultado guardado y el reintento se abandona. Se entrega asi a
+// proposito, para que desplegar esto no cambie el comportamiento de ninguna clinica.
+//
+// EN UNO O DOS, un fallo pasajero -el guard de salida vetando una respuesta buena, un
+// tropiezo de Hermes- deja de perder el mensaje del paciente.
+//
+// NO SE SUBE MAS DE AHI. Si el fallo es permanente, re-ejecutar solo gasta tokens, y cada
+// re-ejecucion vuelve a correr las herramientas del turno.
+const ADAPTER_MAX_REINTENTOS_DE_FALLO = Math.max(
+  0,
+  Math.min(3, Number(process.env.ADAPTER_MAX_REINTENTOS_DE_FALLO || 0) || 0)
+);
 const TOKEN_ESTIMATION_CHARS_PER_TOKEN = Number(process.env.TOKEN_ESTIMATION_CHARS_PER_TOKEN || 4);
 
 const sessionSecret = crypto.randomBytes(32).toString('hex');
@@ -1576,6 +1593,46 @@ async function sendMessageToHermesAgentApi(payload) {
     error.exceptionStage = "durable_lookup";
     error.executionRequestKey = requestIdentity.key;
     throw error;
+  }
+
+  // ¿ESTE «completed» ES UN EXITO O UN FALLO GUARDADO?
+  //
+  // Un turno puede terminar -status «completed»- y aun asi haber fallado: Hermes contesta,
+  // el guard de salida veta la respuesta, y lo que se persiste es un resultado con
+  // `ok: false`. El paciente no recibio nada.
+  //
+  // Hasta hoy eso se devolvia tal cual y el reintento se abandonaba, asi que ese mensaje se
+  // perdia para siempre por un fallo que pudo ser de un momento. Aqui se le da otra
+  // oportunidad de verdad: se devuelve la ejecucion a `failed_recoverable` y se vuelve a
+  // pedir, con lo que el `claim` la deja en «execute» y SI se llama a Hermes.
+  //
+  // LAS CONDICIONES DE SEGURIDAD ESTAN EN POSTGRES, no aqui: un exito no se reabre nunca, y
+  // solo se reabre lo que demostradamente no llego al paciente.
+  if (executionClaim.action === "completed" && ADAPTER_MAX_REINTENTOS_DE_FALLO > 0) {
+    let reabierta = false;
+    try {
+      reabierta = await executionStore.reabrirSiFallo(
+        requestIdentity.key,
+        ADAPTER_MAX_REINTENTOS_DE_FALLO
+      );
+    } catch (error) {
+      // QUE NO SE PUEDA REABRIR NO PUEDE TUMBAR EL TURNO. En el peor caso se sigue por el
+      // camino de siempre, que es el que ya funcionaba.
+      console.warn(JSON.stringify({
+        event: "adapter_reabrir_fallo",
+        request_key: requestIdentity.key,
+        error: error?.message || String(error)
+      }));
+    }
+    if (reabierta) {
+      console.warn(JSON.stringify({
+        event: "adapter_ejecucion_reabierta",
+        request_key: requestIdentity.key,
+        error_code_original: executionClaim.execution?.normalized_result?.error_code || null,
+        intentos_previos: executionClaim.execution?.attempt_count ?? null
+      }));
+      executionClaim = await executionStore.claim(executionIdentity);
+    }
   }
 
   if (executionClaim.action === "completed") {

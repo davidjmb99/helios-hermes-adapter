@@ -48,6 +48,45 @@ function createExecutionStore({ supabase, leaseMs = 180000, ownerId } = {}) {
     return result.data;
   }
 
+  /**
+   * Devuelve a `failed_recoverable` una ejecucion que se guardo como `completed` pero cuyo
+   * resultado fue un fallo que NUNCA LLEGO AL PACIENTE.
+   *
+   * ES LO QUE HACE QUE UN REINTENTO VUELVA A LLAMAR A HERMES. Sin esto, la misma clave ya
+   * `completed` devuelve el resultado guardado y el modelo no se toca: se repite el mismo
+   * fallo, o -desde el 18 de agosto- se abandona. En los dos casos el mensaje de ese
+   * paciente se pierde por un fallo que pudo ser pasajero.
+   *
+   * LAS CONDICIONES ESTAN EN EL `WHERE` DE LA FUNCION DE POSTGRES, no aqui, para que dos
+   * peticiones simultaneas no puedan reabrir la misma ejecucion las dos. Comprobar en JS y
+   * actualizar despues abriria el hueco por el que se le contesta dos veces al mismo
+   * paciente.
+   *
+   * Devuelve `true` solo si esta llamada fue la que la reabrio.
+   */
+  async function reabrirSiFallo(requestKey, maxIntentos) {
+    if (!Number.isInteger(maxIntentos) || maxIntentos < 1) return false;
+
+    if (!supabase) {
+      const existing = memory.get(requestKey);
+      const r = existing?.normalized_result;
+      if (!existing || existing.status !== "completed") return false;
+      if ((existing.attempt_count || 1) > maxIntentos) return false;
+      if (r?.ok !== false) return false;
+      if (r?.safe_to_send !== false) return false;
+      if (r?.response_sent !== false) return false;
+      memory.set(requestKey, { ...existing, status: "failed_recoverable" });
+      return true;
+    }
+
+    const result = await supabase.rpc("reabrir_helios_adapter_execution", {
+      p_request_key: requestKey,
+      p_max_intentos: maxIntentos
+    });
+    assertSupabaseSuccess(result, "adapter_execution.reabrir", { row_id: requestKey });
+    return result.data?.reabierta === true;
+  }
+
   async function complete(requestKey, data) {
     const payload = {
       status: "completed",
@@ -108,7 +147,9 @@ function createExecutionStore({ supabase, leaseMs = 180000, ownerId } = {}) {
     assertSupabaseSuccess(result, "adapter_execution.fail", { row_id: requestKey });
   }
 
-  return { claim, complete, fail, mode: supabase ? "supabase" : "memory_test" };
+  return { claim, complete, fail, mode: supabase ? "supabase" : "memory_test",
+    reabrirSiFallo
+  };
 }
 
 module.exports = { createExecutionStore };
