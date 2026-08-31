@@ -1779,6 +1779,32 @@ function nombrarAlCulpable(result, normalizedResponse, errorCode, crudo) {
     };
   }
 
+  // UN REINTENTO NO LLAMA A HERMES: REPITE LO QUE HABIA GUARDADO. Y hay que decirlo antes
+  // que nada, porque sin esto el diagnostico culpa a Hermes de algo que nunca le llego.
+  //
+  // Cuando el gateway reintenta un turno, los mensajes de origen son los mismos, asi que la
+  // clave de ejecucion tambien: el almacen durable responde `completed` y el Adapter
+  // devuelve el resultado guardado con `answer: ""`. El diagnostico veia esa cadena vacia y
+  // escribia «Hermes no devolvio texto», que es literalmente cierto y completamente
+  // engañoso: no hubo llamada.
+  //
+  // LO IMPORTANTE NO ES EL NOMBRE, ES LA CONSECUENCIA: si lo guardado era un fallo,
+  // REINTENTAR NO PUEDE ARREGLARLO. Se repite el mismo fallo tantas veces como reintentos
+  // haya, y cada vuelta solo gasta minutos de espera del paciente.
+  if (result?.idempotencyStatus === "deduplicated") {
+    return {
+      culpable: "resultado_reutilizado",
+      nombre: "Esto es un reintento: se repitio el resultado guardado, no se llamo a Hermes",
+      explicacion: "Los mensajes de origen son los mismos que los de un turno anterior, "
+        + "asi que el almacen durable devolvio lo que aquel produjo. Si aquel fallo, este "
+        + "falla igual: reintentar no puede cambiarlo. Y los tokens de esta fila son los "
+        + "de aquel turno, copiados: no se han gastado otra vez.",
+      donde_mirar: "El turno ORIGINAL de esta misma conversacion, el primero con estos "
+        + "mismos mensajes. Ahi esta la causa; aqui solo esta el eco.",
+      seguro: true
+    };
+  }
+
   if (!crudo) {
     return {
       culpable: "sin_respuesta",

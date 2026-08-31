@@ -74,6 +74,8 @@ function resumirEventos(eventos, modeloDeRespaldo = null) {
     salientes: 0,
     fallidos: 0,
     deduplicados: 0,
+    /** Turnos que repitieron un resultado guardado: existen, pero no gastaron. */
+    reutilizados: 0,
 
     input_tokens: 0,
     output_tokens: 0,
@@ -103,6 +105,26 @@ function resumirEventos(eventos, modeloDeRespaldo = null) {
     // puede completarse y no enviarse -contrato inválido, respuesta reciclada-, y
     // contar eso como mensaje saliente pintaría un sistema más sano de lo que es.
     if (estado === "completed" && ev?.safe_to_send === true) resumen.salientes += 1;
+
+    // UN RESULTADO REUTILIZADO NO GASTA TOKENS, Y SUS CIFRAS SON PRESTADAS.
+    //
+    // Cuando el gateway reintenta un turno, los mensajes de origen son los mismos y el
+    // almacen durable devuelve lo que produjo el turno ORIGINAL, sin llamar a Hermes. Y con
+    // ello COPIA sus contadores de tokens. Sumarlos aqui es contar dos veces algo que se
+    // gasto una.
+    //
+    // NO ES TEORICO: la noche del 28-ago un turno se reintento dos veces y el panel apunto
+    // 125.442 tokens de entrada por cada reintento —los mismos del original—, en llamadas
+    // que duraron 221 y 261 milisegundos. Doscientos cincuenta mil tokens que nunca se
+    // gastaron, en la cifra que se usa para decidir.
+    //
+    // SE CUENTAN COMO TURNO Y NO COMO GASTO. La fila existe, el reintento ocurrio y hay que
+    // verlo; lo que no puede es sumar dinero.
+    const reutilizado = String(ev?.idempotency_status ?? "") === "deduplicated";
+    if (reutilizado) {
+      resumen.reutilizados = (resumen.reutilizados || 0) + 1;
+      continue;
+    }
 
     const entrada = numero(ev?.input_tokens);
     const salida = numero(ev?.output_tokens);

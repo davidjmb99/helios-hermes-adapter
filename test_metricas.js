@@ -242,4 +242,63 @@ const turno = (over = {}) => ({
   ok('y aguanta basura', resumirMedia(null).archivos === 0);
 }
 
+
+// --- UN RESULTADO REUTILIZADO NO SE COBRA DOS VECES -----------------------
+//
+// LA NOCHE DEL 28-ago-2026 pasó de verdad. Un turno de la conversacion 84 se reintento dos
+// veces y el panel apunto 125.442 tokens de entrada POR CADA REINTENTO -exactamente los
+// mismos del original- en llamadas que duraron 221 y 261 milisegundos.
+//
+// Una llamada de 221 ms no consume 125.000 tokens. Lo que pasa es que cuando el gateway
+// reintenta, los mensajes de origen son los mismos, el almacen durable responde `completed`
+// y el Adapter devuelve lo que produjo el turno ORIGINAL... copiando sus contadores.
+//
+// Doscientos cincuenta mil tokens que nunca se gastaron, en la cifra que se usa para
+// decidir cuanto cuesta el producto.
+
+{
+  const original = {
+    status: "completed", safe_to_send: true, idempotency_status: "new",
+    input_tokens: 125442, output_tokens: 877, cache_read_tokens: 123000,
+    model: "deepseek-v4-flash", created_at: "2026-08-28T02:04:18Z"
+  };
+  // Los dos reintentos: mismas cifras, prestadas.
+  const eco = {
+    ...original, status: "failed_recoverable", safe_to_send: false,
+    idempotency_status: "deduplicated", cache_read_tokens: null
+  };
+
+  const soloUno = resumirEventos([original], "deepseek-v4-flash");
+  const conEcos = resumirEventos([original, { ...eco }, { ...eco }], "deepseek-v4-flash");
+
+  assert.equal(
+    conEcos.input_tokens, soloUno.input_tokens,
+    "los reintentos NO añaden tokens de entrada: son los mismos, copiados"
+  );
+  assert.equal(conEcos.output_tokens, soloUno.output_tokens);
+  assert.equal(
+    conEcos.coste_usd, soloUno.coste_usd,
+    "ni un centimo de mas por repetir un resultado guardado"
+  );
+
+  // PERO LOS TURNOS SE VEN. La fila existe y el reintento ocurrio: esconderlo seria pintar
+  // un sistema mas sano de lo que es. Lo que no puede es sumar dinero.
+  assert.equal(conEcos.entrantes, 3, "los tres turnos se cuentan");
+  assert.equal(conEcos.reutilizados, 2, "y dos de ellos se declaran como lo que son");
+}
+
+{
+  // Y UN TURNO NORMAL SIGUE CONTANDO. Sin esto, la prueba de arriba pasaria igual con un
+  // resumen que no cuente nada.
+  const uno = {
+    status: "completed", safe_to_send: true, idempotency_status: "new",
+    input_tokens: 50000, output_tokens: 500, cache_read_tokens: 40000,
+    model: "deepseek-v4-flash", created_at: "2026-08-28T02:04:18Z"
+  };
+  const r = resumirEventos([uno, { ...uno }], "deepseek-v4-flash");
+  assert.equal(r.input_tokens, 100000, "dos turnos de verdad suman los dos");
+  assert.ok(r.coste_usd > 0, "y cuestan dinero");
+  assert.equal(r.reutilizados, 0);
+}
+
 console.log('test_metricas: ' + pasados + ' comprobaciones OK');
