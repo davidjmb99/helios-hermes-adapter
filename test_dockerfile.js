@@ -89,3 +89,36 @@ for (const archivo of copiados) {
 }
 
 console.log("test_dockerfile: PASS (" + visitados.size + " modulos alcanzables, todos en la imagen)");
+
+// --- Y QUE EL HEALTHCHECK PUEDA EJECUTARSE -----------------------------------
+//
+// COOLIFY COMPRUEBA LA SALUD PIDIENDO /health CON `curl` DESDE DENTRO DEL CONTENEDOR. En
+// una imagen alpine curl no viene incluido, y entonces pasa lo peor que puede pasar con
+// una comprobacion: no falla, MIENTE.
+//
+//     Healthcheck logs: /bin/sh: curl: not found | Return code: 0
+//     New container is healthy.
+//
+// El comando no existe, devuelve codigo 0 -«todo bien»- y Coolify concluye «healthy» pase
+// lo que pase. Si el Adapter se cuelga, nadie lo reinicia y nadie avisa: se descubre
+// porque un paciente no recibe respuesta.
+//
+// ESTUVO ASI MESES Y SE VEIA EN CADA DESPLIEGUE, en esa misma linea del log. Nadie la
+// leyo porque terminaba en «healthy».
+
+{
+  assert.ok(
+    /apk add[^\n]*\bcurl\b/.test(dockerfile),
+    "la imagen no instala curl: el healthcheck de Coolify dira «healthy» siempre, "
+    + "aunque el Adapter este colgado"
+  );
+
+  // Y ANTES DEL COPY DEL CODIGO, para que un cambio de codigo no invalide esa capa y
+  // reinstale paquetes en cada despliegue.
+  assert.ok(
+    dockerfile.indexOf("apk add") < dockerfile.indexOf("COPY server.js"),
+    "instalar curl despues de copiar el codigo rehace esa capa en cada despliegue"
+  );
+}
+
+console.log("test_dockerfile: el healthcheck puede ejecutarse OK");

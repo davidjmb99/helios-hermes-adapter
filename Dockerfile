@@ -1,5 +1,19 @@
 FROM node:22-alpine
 
+# CURL, PARA EL HEALTHCHECK DE COOLIFY.
+#
+# SIN ESTO EL HEALTHCHECK NO COMPRUEBA NADA Y NADIE SE ENTERA. Coolify pide
+# http://localhost:3000/health con curl desde dentro del contenedor; en una imagen alpine
+# curl no viene, asi que el comando falla con «/bin/sh: curl: not found» Y DEVUELVE CODIGO
+# 0 -que significa «todo bien»-. Coolify concluye «healthy» pase lo que pase.
+#
+# O sea: un detector de humo con la pila quitada. Si el Adapter se cuelga -sigue en pie
+# pero deja de responder- Coolify no lo reinicia y no avisa; se descubre porque un paciente
+# no recibe respuesta.
+#
+# El Gateway ya lo tenia; aqui se olvido. Son unos 2 MB.
+RUN apk add --no-cache curl
+
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
