@@ -159,9 +159,17 @@ function resumirEventos(eventos, modeloDeRespaldo = null) {
     }
   }
 
-  // El acierto de caché explica el coste mejor que ninguna otra cifra: con el 97% que
-  // tiene Helios, la entrada cuesta cincuenta veces menos que sin ella. Si baja, el
-  // gasto se dispara sin que cambie nada del uso, y hay que poder verlo.
+  // El acierto de caché explica el coste mejor que ninguna otra cifra: un token cacheado
+  // cuesta unas treinta veces menos que uno nuevo. Si baja, el gasto sube sin que cambie
+  // nada del uso, y hay que poder verlo.
+  //
+  // AQUI DECIA «el 97% que tiene Helios». ESO NUNCA SE MIDIO: salio de una estimación. El
+  // 1-sep-2026, con datos reales de un año, el panel marcaba 69,79%.
+  //
+  // Y LA CIFRA DEPENDE DEL PERIODO QUE SE MIRE, porque cada cambio del SOUL invalida el
+  // prefijo cacheado entero. Un dia con tres ediciones del SOUL -como ese mismo 1 de
+  // septiembre- hunde el porcentaje y luego se recupera solo. Comparar «Dia» con «Mes»
+  // antes de preocuparse.
   if (resumen.input_tokens > 0) {
     resumen.acierto_cache_pct = Math.round((resumen.cached_tokens / resumen.input_tokens) * 10000) / 100;
   }
