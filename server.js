@@ -3,6 +3,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { validateTenantContext } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
+const { crearDirectorioDePerfiles } = require("./perfiles-de-hermes");
 const { createStableRequestIdentity } = require("./request-identity");
 const { calcularCoste, formatearUsd, formatearUsdFino, modeloConTarifa } = require("./pricing");
 const { leerCuenta, filtrarPorCuenta, cuentasDeFilas } = require("./filtro-de-cuenta");
@@ -219,6 +220,32 @@ const hermesAgentClient = createHermesAgentClient({
   model: HERMES_AGENT_MODEL,
   timeoutMs: HERMES_TIMEOUT_MS
 });
+
+// A QUE HERMES LE HABLA CADA CLINICA. Ver perfiles-de-hermes.js para el porque.
+//
+// SIN HERMES_AGENT_PROFILES_JSON, `clienteDe()` devuelve el de arriba para el perfil
+// del Adapter y NO ATIENDE a ningun otro. O sea: desplegar esto no le cambia nada a la
+// clinica que ya funciona, y una clinica nueva no puede acabar hablando con su Hermes
+// por accidente.
+const directorioDePerfiles = crearDirectorioDePerfiles({
+  perfilDelAdapter: HERMES_PROFILE,
+  clientePorDefecto: hermesAgentClient,
+  crearCliente: createHermesAgentClient,
+  mapaCrudo: process.env.HERMES_AGENT_PROFILES_JSON,
+  timeoutMs: HERMES_TIMEOUT_MS
+});
+
+if (directorioDePerfiles.aviso) {
+  console.error(JSON.stringify({
+    event: "perfiles_de_hermes_mal_configurados",
+    aviso: directorioDePerfiles.aviso
+  }));
+}
+console.log(JSON.stringify({
+  event: "perfiles_de_hermes",
+  perfil_del_adapter: HERMES_PROFILE,
+  con_destino_propio: directorioDePerfiles.perfilesConDestino
+}));
 const executionStore = createExecutionStore({
   supabase,
   leaseMs: ADAPTER_EXECUTION_LEASE_MS
@@ -1701,7 +1728,10 @@ async function sendMessageToHermesAgentApi(payload) {
 
   let result;
   try {
-    result = await hermesAgentClient.sendMessage({
+    // EL PERFIL DE LA CLINICA DECIDE A QUE HERMES SE LLAMA. Antes se usaba siempre el
+    // cliente global: el Adapter validaba el perfil del tenant y despues lo ignoraba.
+    const clienteDeEstaClinica = directorioDePerfiles.clienteDe(tenantContext.hermes_profile);
+    result = await clienteDeEstaClinica.sendMessage({
       input: buildHermesMessage(normalized),
       conversation,
       idempotencyKey: requestIdentity.key,
