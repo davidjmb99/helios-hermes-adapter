@@ -2390,7 +2390,26 @@ app.post("/login", async (req, res) => {
 
 // Endpoint para cerrar sesión (GET)
 app.get("/logout", (req, res) => {
-  res.setHeader("Set-Cookie", "debug_token=; Path=/; HttpOnly; Max-Age=0");
+  // LAS DOS COOKIES, Y CON LOS MISMOS ATRIBUTOS CON LOS QUE SE PUSIERON.
+  //
+  // AQUI SE BORRABA SOLO `debug_token`. Quien entraba por la tabla de clinicas recibe
+  // `panel_token`, asi que le daba a «Cerrar sesion», la pagina se recargaba, y seguia
+  // dentro. Comprobado en una ventana de incognito, o sea que no era el navegador.
+  //
+  // Y EL BORRADO DESDE JAVASCRIPT NO PODIA SALVARLO: las dos cookies son `HttpOnly`, y
+  // eso significa exactamente que el JavaScript de la pagina NO PUEDE TOCARLAS. El
+  // `document.cookie = ...` del boton no hace absolutamente nada; solo el servidor puede
+  // borrarlas. Se dejo ahi creyendo que cubria el caso y lo que hacia era taparlo.
+  //
+  // UNA COOKIE SOLO SE BORRA SI EL BORRADO COINCIDE EN Path -y en Secure y SameSite si
+  // los llevaba-. Con `Path=/; HttpOnly; Max-Age=0` a secas, un navegador puede
+  // conservar la que se puso con `Secure; SameSite=Lax` y dejar al usuario dentro.
+  const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+  const atributos = `Path=/; HttpOnly; ${isHttps ? "Secure;" : ""} SameSite=Lax; Max-Age=0`;
+  res.setHeader("Set-Cookie", [
+    `panel_token=; ${atributos}`,
+    `debug_token=; ${atributos}`
+  ]);
   res.json({ ok: true });
 });
 
@@ -4031,17 +4050,23 @@ function serveDashboard(req, res) {
     });
 
     function logout() {
-      const isSecure = window.location.protocol === 'https:' || window.location.hostname === 'localhost';
-      const cookieOptions = isSecure ? '; Path=/; Secure; SameSite=Lax' : '; Path=/; SameSite=Lax';
-      // LAS DOS COOKIES. Hay dos puertas -la tabla de clinicas y la contraseña de
-      // entorno- y borrar solo una deja a quien entro por la otra dentro despues de darle
-      // a «salir». Un boton de salir que no saca es peor que no tenerlo.
-      document.cookie = 'debug_token=; Expires=Thu, 01 Jan 1970 00:00:01 GMT' + cookieOptions;
-      document.cookie = 'panel_token=; Expires=Thu, 01 Jan 1970 00:00:01 GMT' + cookieOptions;
-      
-      fetch('/logout', { credentials: 'include' }).catch(() => {}).finally(() => {
-        window.location.replace('/');
-      });
+      // AQUI SE BORRABAN LAS COOKIES CON document.cookie Y NO SERVIA DE NADA: las dos son
+      // HttpOnly, y eso significa que el JavaScript de la pagina no puede tocarlas.
+      // Parecia que el boton hacia su trabajo y lo unico que hacia era tapar que no.
+      //
+      // (Sin comillas invertidas en este comentario A PROPOSITO: todo esto vive dentro de
+      // una plantilla de JavaScript, y una comilla invertida aqui la corta por la mitad.
+      // Ya rompio el servidor una vez.)
+      //
+      // BORRARLAS ES COSA DEL SERVIDOR, y por eso ahora se espera a que conteste antes de
+      // ir a la pagina de entrada. Si se navegara sin esperar, el navegador podria
+      // cancelar la peticion a medio camino y dejar la sesion viva.
+      fetch('/logout', { credentials: 'include' })
+        .catch(() => {})
+        .finally(() => {
+          // Se usa replace y no href: asi «atras» no vuelve al panel ya cerrado.
+          window.location.replace('/');
+        });
     }
 
     function showDiagnosticPanel() {

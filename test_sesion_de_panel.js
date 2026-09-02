@@ -216,10 +216,44 @@ const clinica = crearSesion({ tenantId: "lapaz", operador: false, secreto: SECRE
   assert.ok(logout.includes("debug_token="), "borra la de la puerta de servicio");
   assert.ok(logout.includes("panel_token="), "y la de la tabla de clinicas");
 
-  // Y en el panel, el logout del navegador tambien.
-  const enElPanel = fuente.indexOf("function logout()");
-  const cuerpoLogout = fuente.slice(enElPanel, enElPanel + 800);
-  assert.ok(cuerpoLogout.includes("panel_token="), "el logout del navegador borra las dos");
+  // Y EL GET /logout, QUE ES EL QUE DE VERDAD LAS BORRA.
+  //
+  // AQUI SE COMPROBABA QUE EL JAVASCRIPT DEL BOTON BORRABA LAS DOS COOKIES, y esa
+  // comprobacion estuvo VERDE mientras el boton no funcionaba. Comprobaba lo que no era.
+  //
+  // LAS DOS COOKIES SON HttpOnly, y eso significa exactamente que el JavaScript de la
+  // pagina NO PUEDE TOCARLAS. El `document.cookie = ...` del boton no hacia nada: quien
+  // entraba por la tabla de clinicas pulsaba «Cerrar sesion», la pagina se recargaba y
+  // seguia dentro. Se vio en una ventana de incognito, o sea que no era el navegador
+  // guardando nada.
+  //
+  // ASI QUE LO QUE HAY QUE COMPROBAR ES EL SERVIDOR, que es el unico que puede.
+  const getLogout = fuente.slice(
+    fuente.indexOf('app.get("/logout"'),
+    fuente.indexOf('app.get("/logout"') + 1400
+  );
+  assert.ok(
+    getLogout.includes("panel_token="),
+    "GET /logout no borra panel_token: quien entra por la tabla de clinicas no sale nunca"
+  );
+  assert.ok(getLogout.includes("debug_token="), "y tiene que borrar la de la puerta de servicio");
+
+  // Y CON LOS MISMOS ATRIBUTOS CON LOS QUE SE PUSIERON. Una cookie solo se borra si el
+  // borrado coincide; con `Path=/; HttpOnly; Max-Age=0` a secas, un navegador puede
+  // conservar la que se puso con Secure y SameSite y dejar al usuario dentro.
+  //
+  // SOLO LA LINEA DE LOS ATRIBUTOS. Un trozo mas ancho coge los `Set-Cookie` de los
+  // logins de al lado, que si llevan Secure y SameSite, y la comprobacion pasaria sola.
+  // Se vio inyectando el fallo: quitando los atributos del borrado, la prueba seguia
+  // verde porque los encontraba en la funcion vecina.
+  const lineaAtributos = getLogout.slice(
+    getLogout.indexOf("const atributos"),
+    getLogout.indexOf("\n", getLogout.indexOf("const atributos"))
+  );
+  assert.ok(lineaAtributos.includes("Secure"), "el borrado tiene que llevar Secure cuando toca");
+  assert.ok(lineaAtributos.includes("SameSite=Lax"), "y SameSite, igual que al ponerlas");
+  assert.ok(lineaAtributos.includes("Max-Age=0"), "y caducarlas");
+  assert.ok(lineaAtributos.includes("Path=/"), "y el mismo Path");
 }
 
 
