@@ -205,13 +205,60 @@ const MAPA = JSON.stringify({
     "server.js no elige el cliente por el perfil de la clinica: el arreglo no esta puesto"
   );
 
-  // Y QUE NO QUEDE NINGUNA LLAMADA AL CLIENTE GLOBAL EN EL CAMINO DEL TURNO. Si
-  // sobrevive una, esa es la que manda a la clinica equivocada.
-  const llamadasGlobales = [...fuente.matchAll(/hermesAgentClient\.sendMessage/g)];
+  // NINGUN METODO DEL CLIENTE GLOBAL SE LLAMA DIRECTAMENTE. Ojo a la forma de esta
+  // comprobacion, porque la primera version estaba mal y costo un fallo real:
+  //
+  //     mal    /hermesAgentClient\.sendMessage/     <- vigila UN metodo
+  //     bien   /hermesAgentClient\s*\.\s*(\w+)/     <- vigila la propiedad
+  //
+  // La version mala pasaba en verde mientras `hermesAgentClient.renameSession` seguia
+  // ahi: el mensaje salia por el cliente de la clinica y el titulo de la sesion se
+  // pedia al Hermes de COI. Todas las conversaciones de la clinica nueva aparecian en
+  // el WebUI como "OUTPUT CONTRACT (REQUIRED)".
+  //
+  // ES EL MISMO ERROR QUE LA PRUEBA DEL BOTON DE SALIR: comprobar el caso que se te
+  // ocurrio en vez de la propiedad que importa. La propiedad es «el cliente global no
+  // se llama», no «no se llama a sendMessage», y asi cubre tambien lo que se añada
+  // manana sin que nadie se acuerde de este fichero.
+  const llamadasGlobales = [...fuente.matchAll(/hermesAgentClient\s*\.\s*(\w+)/g)];
   assert.equal(
     llamadasGlobales.length, 0,
-    `quedan ${llamadasGlobales.length} llamadas directas a hermesAgentClient.sendMessage`
+    "el cliente global se sigue llamando directamente en server.js, y esas llamadas "
+      + "van al Hermes de la clinica del Adapter sea cual sea el tenant. Metodos: "
+      + llamadasGlobales.map((m) => m[1]).join(", ")
   );
+
+  // Y SIGUE EXISTIENDO COMO VALOR, que es su unico papel legitimo: ser el
+  // `clientePorDefecto` del directorio. Sin esta comprobacion, borrarlo del todo
+  // tambien pasaria la de arriba.
+  assert.ok(
+    fuente.includes("clientePorDefecto: hermesAgentClient"),
+    "el cliente global tiene que seguir pasandose como clientePorDefecto"
+  );
+
+  // EL TITULO DE LA SESION SE PIDE AL HERMES DE SU PERFIL. Es la mitad que faltaba.
+  assert.ok(
+    /directorioDePerfiles\.clienteDe\(perfil\)/.test(fuente),
+    "ensureHermesSessionTitle no resuelve el cliente por el perfil de la clinica"
+  );
+
+  // Y LA CACHE DE TITULOS ESTA INDEXADA POR PERFIL. Los identificadores de sesion los
+  // acuña cada Hermes por su cuenta: dos clinicas pueden coincidir, y este Map lo
+  // comparten todas. Con la clave sin perfil, la segunda se creeria ya renombrada.
+  assert.ok(
+    /hermesSessionTitles\.(get|set|delete)\(claveDeCache\)/.test(fuente),
+    "la cache de titulos se indexa solo por sessionId: dos clinicas pueden colisionar"
+  );
+  for (const suelto of [
+    "hermesSessionTitles.get(sessionId)",
+    "hermesSessionTitles.set(sessionId",
+    "hermesSessionTitles.delete(sessionId)"
+  ]) {
+    assert.ok(
+      !fuente.includes(suelto),
+      `queda un acceso a la cache de titulos sin el perfil en la clave: ${suelto}`
+    );
+  }
 
   // El cliente global sigue existiendo -es el de la clinica del Adapter- pero solo
   // como `clientePorDefecto` del directorio.

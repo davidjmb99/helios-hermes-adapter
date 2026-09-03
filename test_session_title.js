@@ -60,10 +60,13 @@ for (const i of [...antes, ...despues]) {
 
 // --- 3. EL TITULO LLEVA LA CONVERSACION, QUE ES POR LO QUE SE BUSCA --------
 
-const cuerpo = fuente.slice(
-  fuente.indexOf("async function ensureHermesSessionTitle("),
-  fuente.indexOf("async function ensureHermesSessionTitle(") + 1200
-);
+// EL CUERPO SE DELIMITA POR LA SIGUIENTE FUNCION, no cortando 1200 caracteres. Con el
+// corte fijo, cualquier comentario que se añada arriba empuja lo que se comprueba fuera
+// de la ventana y la prueba falla por una razon que no tiene nada que ver.
+const inicioCuerpo = fuente.indexOf("async function ensureHermesSessionTitle(");
+assert.ok(inicioCuerpo > 0, "se encontro ensureHermesSessionTitle");
+const finCuerpo = fuente.indexOf("\nfunction ", inicioCuerpo);
+const cuerpo = fuente.slice(inicioCuerpo, finCuerpo > inicioCuerpo ? finCuerpo : undefined);
 // LAS DOS RAMAS LLEVAN EL NUMERO DE CONVERSACION, y hay que comprobarlas por separado:
 // mirar solo si aparece «Conversación ${conversationId}» en algun sitio lo daba por bueno
 // aunque la rama del nombre lo hubiera perdido -la otra rama lo tapaba-.
@@ -75,9 +78,43 @@ assert.ok(
   cuerpo.includes("Helios · Conversación ${conversationId}"),
   "y sin nombre todavia: «Helios · Conversación 84», que ya sirve para encontrarla"
 );
+// EL GUARD, COMPROBADO POR LA FORMA Y NO POR EL NOMBRE DE LA VARIABLE. Esta linea
+// decia `hermesSessionTitles.get(sessionId) === title` tal cual, y al cambiar la clave
+// de la cache para meterle el perfil, la prueba se puso roja sin que el guard hubiera
+// dejado de existir. Una prueba que se rompe al renombrar una variable local no esta
+// protegiendo la propiedad, esta copiando el codigo.
 assert.ok(
-  cuerpo.includes("hermesSessionTitles.get(sessionId) === title"),
+  /if \(hermesSessionTitles\.get\(\w+\) === title\) return;/.test(cuerpo),
   "con guard: la segunda llamada no debe repetir el PATCH si el titulo no cambio"
+);
+
+// --- 4. EL PATCH VA AL HERMES DE ESTA CLINICA ------------------------------
+//
+// Se rompio al meter el enrutado por perfil: el mensaje ya salia por el cliente de la
+// clinica, pero el titulo se le pedia al cliente global -el de la clinica del Adapter-.
+// La sesion solo existe en el Hermes de su propio perfil, asi que el PATCH fallaba y
+// el WebUI volvia a titular con la primera linea: «OUTPUT CONTRACT (REQUIRED)» otra vez,
+// que es exactamente lo que esta funcion existe para evitar.
+//
+// EN LA CLINICA DEL ADAPTER NO SE NOTABA, porque para ella el cliente global si es el
+// correcto. Por eso hacen falta las dos comprobaciones y no solo «que titule».
+
+assert.ok(
+  !/hermesAgentClient\s*\.\s*renameSession/.test(cuerpo),
+  "el titulo se le pide al cliente global: en cualquier clinica que no sea la del "
+    + "Adapter, ese PATCH va al Hermes equivocado y la sesion se queda sin nombre"
+);
+assert.ok(
+  /clienteDe\(/.test(cuerpo) && /\.renameSession\(/.test(cuerpo),
+  "el titulo tiene que pedirse al cliente que corresponde al perfil de la clinica"
+);
+
+// Y LA CLAVE DE LA CACHE LLEVA EL PERFIL. Cada Hermes acuña sus identificadores de
+// sesion sin saber de los demas, y este Map lo comparten todas las clinicas: dos
+// sesiones con el mismo id harian que la segunda se creyera ya renombrada.
+assert.ok(
+  /hermes_profile|perfil/.test(cuerpo.slice(0, cuerpo.indexOf("hermesSessionTitles.get"))),
+  "la clave de la cache de titulos tiene que incorporar el perfil, no solo el sessionId"
 );
 
 console.log("test_session_title: OK");

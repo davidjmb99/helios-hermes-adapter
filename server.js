@@ -278,10 +278,27 @@ function resolveEventIdentity(normalized, normalizedResponse) {
 // como "Api_Server Session", indistinguibles entre si. Les ponemos el numero de
 // conversacion de Chatwoot, y el nombre del paciente en cuanto se conoce.
 // Nunca lanza ni bloquea: si falla, se registra y el paciente recibe su respuesta.
+//
+// Y EL RENOMBRADO VA AL HERMES DE ESTA CLINICA, NO AL GLOBAL. Esto se rompio al
+// meter el enrutado por perfil: el mensaje ya salia por el cliente de la clinica
+// -clienteDe(hermes_profile)- pero el PATCH del titulo seguia yendo al cliente por
+// defecto, que es el de COI. La sesion solo existe en el Hermes de su propio perfil,
+// asi que era pedirle a COI que renombrase una sesion que no tiene.
+//
+// COMO SE VEIA: el renombrado fallaba y el WebUI caia a su titulo por defecto, que
+// es la primera linea del mensaje. O sea TODAS las conversaciones de la clinica
+// nueva aparecian en la lista como "OUTPUT CONTRACT (REQUIRED)", indistinguibles
+// -exactamente el problema que esta funcion existe para resolver-.
+//
+// Para la clinica cuyo perfil es el del Adapter no cambia nada: clienteDe() devuelve
+// el cliente por defecto, que para ella siempre fue el correcto. Nunca estuvo roto
+// en COI, y por eso paso desapercibido.
 async function ensureHermesSessionTitle(sessionId, normalized, normalizedResponse) {
   if (HERMES_TRANSPORT !== "agent_api") return;
   const conversationId = normalized?.conversation_id;
   if (!sessionId || !conversationId) return;
+
+  const perfil = normalized?.hermes_profile || null;
 
   const identity = resolveEventIdentity(normalized, normalizedResponse);
   const fullName = [identity.first_name, identity.last_name]
@@ -292,16 +309,39 @@ async function ensureHermesSessionTitle(sessionId, normalized, normalizedRespons
     ? `${fullName} · Conversación ${conversationId}`
     : `Helios · Conversación ${conversationId}`;
 
-  if (hermesSessionTitles.get(sessionId) === title) return;
-  hermesSessionTitles.set(sessionId, title);
+  // LA CACHE SE INDEXA POR PERFIL, NO SOLO POR SESION. Cada Hermes acuña sus
+  // identificadores de sesion por su cuenta y sin saber de los demas, asi que dos
+  // clinicas pueden coincidir; este Map lo comparten todas. Una coincidencia haria
+  // que la segunda clinica se creyera ya renombrada y se quedara sin titulo.
+  const claveDeCache = `${perfil || "propio"}::${sessionId}`;
+  if (hermesSessionTitles.get(claveDeCache) === title) return;
+  hermesSessionTitles.set(claveDeCache, title);
 
-  const outcome = await hermesAgentClient.renameSession({ sessionId, title });
+  // clienteDe() LANZA si el perfil no tiene destino, y aqui eso no puede tumbar el
+  // turno: el titulo es cosmetico y el paciente ya tiene su respuesta.
+  let cliente;
+  try {
+    cliente = directorioDePerfiles.clienteDe(perfil);
+  } catch (error) {
+    hermesSessionTitles.delete(claveDeCache);
+    console.warn(JSON.stringify({
+      event: "hermes_session_title_sin_destino",
+      conversation_id: String(conversationId),
+      session_id: sessionId,
+      hermes_profile: perfil,
+      error_code: error?.code || null
+    }));
+    return;
+  }
+
+  const outcome = await cliente.renameSession({ sessionId, title });
 
   if (outcome.ok) {
     console.log(JSON.stringify({
       event: "hermes_session_title_updated",
       conversation_id: String(conversationId),
       session_id: sessionId,
+      hermes_profile: perfil,
       named: Boolean(fullName),
       http_status: outcome.status
     }));
@@ -309,11 +349,12 @@ async function ensureHermesSessionTitle(sessionId, normalized, normalizedRespons
   }
 
   // Permitir que el siguiente turno lo reintente.
-  hermesSessionTitles.delete(sessionId);
+  hermesSessionTitles.delete(claveDeCache);
   console.warn(JSON.stringify({
     event: "hermes_session_title_update_failed",
     conversation_id: String(conversationId),
     session_id: sessionId,
+    hermes_profile: perfil,
     http_status: outcome.status,
     error_code: outcome.errorCode
   }));
