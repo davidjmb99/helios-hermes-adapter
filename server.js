@@ -1,7 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
-const { validateTenantContext } = require("./tenant-context");
+const { validateTenantContext, arrancarRefrescoDelMapa, estadoDelMapa } = require("./tenant-context");
 const { createHermesAgentClient } = require("./hermes-agent-client");
 const { crearDirectorioDePerfiles } = require("./perfiles-de-hermes");
 const { createStableRequestIdentity } = require("./request-identity");
@@ -2322,6 +2322,11 @@ app.get("/health", async (req, res) => {
     runtime: `Node.js ${process.version}`,
     profile: HERMES_PROFILE,
     hermes_profile: HERMES_PROFILE,
+    // DE DONDE SALE EL MAPA AQUI: "entorno" o "tabla". Tiene que decir LO MISMO que el
+    // /health del Gateway. Si uno dijera "tabla" y el otro "entorno", los dos estarian
+    // mirando sitios distintos y `validateTenantContext` empezaria a rechazar mensajes
+    // buenos. Es la primera cosa que hay que mirar ante un TENANT_CONTEXT_MISMATCH.
+    mapa_de_clinicas: estadoDelMapa(),
     mode: HERMES_TRANSPORT === "agent_api"
       ? "HERMES_AGENT_RESPONSES_API"
       : "HERMES_WEBUI_STREAM_API",
@@ -5856,4 +5861,15 @@ app.post("/helios/message", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`helios-hermes-adapter v2.5.1 listening on port ${PORT}`);
+
+  // EL MAPA DE CLINICAS, REFRESCADO DESDE LA TABLA.
+  //
+  // Tiene que arrancar TAMBIEN aqui, y no solo en el Gateway: `validateTenantContext`
+  // compara lo que manda el Gateway contra el mapa de ESTE proceso. Si uno leyera la
+  // tabla y el otro la variable, la comprobacion pasaria de proteger a rechazar mensajes
+  // buenos con TENANT_CONTEXT_MISMATCH.
+  //
+  // Si no arrancara, no se rompe nada: se sigue leyendo la variable de entorno, que es
+  // como funcionaba hasta hoy.
+  arrancarRefrescoDelMapa();
 });
