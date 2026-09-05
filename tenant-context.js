@@ -58,6 +58,12 @@ function requiredString(value, field, accountId) {
 
 /** Para mirar desde fuera que mapa esta vivo sin tener que deducirlo. */
 function estadoDelMapa() {
+  // El mapa del entorno se carga perezosamente, en la primera lectura de verdad. Sin
+  // esto, /health diria «0 clinicas» en un sistema sano mientras no llegara un mensaje, y
+  // un cero ahi es justo la señal engañosa que este campo venia a evitar.
+  if (cachedByAccount.size === 0 && fuente === "entorno") {
+    try { loadTenantContexts(); } catch (_) { /* sin mapa; el recuento lo dice */ }
+  }
   return {
     fuente,
     clinicas: cachedByAccount.size,

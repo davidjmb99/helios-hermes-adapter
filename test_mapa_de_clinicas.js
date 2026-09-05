@@ -45,8 +45,27 @@ console.warn = (...args) => { avisos.push(String(args[0])); };
 // ---------------------------------------------------------------------------
 
 ctx.reiniciarMapaParaPruebas();
+
+// ANTES DE QUE NADIE LEA NADA. El mapa del entorno se carga perezosamente, asi que recien
+// arrancado el proceso no hay nada en memoria. Si `estadoDelMapa` no forzara la carga,
+// /health diria «0 clinicas» en un sistema sano mientras no llegara un mensaje — y eso se
+// mira JUSTO al desplegar, que es cuando todavia no ha escrito nadie.
+assert.strictEqual(ctx.estadoDelMapa().clinicas, 1,
+  "/health tiene que contar las clinicas aunque no haya llegado ningun mensaje");
+
 assert.strictEqual(ctx.resolveTenantContext("2").hermes_profile, "helios-por-entorno");
 assert.strictEqual(ctx.estadoDelMapa().fuente, "entorno");
+
+// Y CON LA VARIABLE ROTA NO PUEDE LANZAR: /health es lo que se mira cuando algo va mal.
+{
+  const anterior = process.env.CHATWOOT_TENANT_CONTEXTS_JSON;
+  ctx.reiniciarMapaParaPruebas();
+  process.env.CHATWOOT_TENANT_CONTEXTS_JSON = "{ esto no es JSON";
+  assert.strictEqual(ctx.estadoDelMapa().clinicas, 0,
+    "sin mapa, el recuento lo dice en vez de reventar");
+  process.env.CHATWOOT_TENANT_CONTEXTS_JSON = anterior;
+  ctx.reiniciarMapaParaPruebas();
+}
 
 // ---------------------------------------------------------------------------
 // 2. CON TABLA, MANDA LA TABLA
